@@ -14,6 +14,7 @@ export class AgentService {
     this.events = new EventEmitter();
     this.executions = new Map();
     this.interruptingTurns = new Set();
+    this.closed = false;
     this.db.exec(`
       PRAGMA foreign_keys = ON;
       CREATE TABLE IF NOT EXISTS agents (
@@ -42,7 +43,17 @@ export class AgentService {
     this.db.prepare("UPDATE turns SET status = 'interrupted', finished_at = ? WHERE status = 'running'").run(now());
   }
 
-  close() { this.db.close(); }
+  close() {
+    if (this.closed) return;
+    // Running Pi children belong to this service lifetime. Their persisted
+    // Turns remain running until the next service reconciles them; no work is
+    // adopted or replayed by this instance after its database closes.
+    this.closed = true;
+    for (const execution of this.executions.values()) execution.close?.();
+    this.executions.clear();
+    this.interruptingTurns.clear();
+    this.db.close();
+  }
 
   createAgent({ name = "Agent", workspace }) {
     if (typeof workspace !== "string" || !workspace.trim()) throw new Error("workspace is required");
@@ -74,6 +85,7 @@ export class AgentService {
   }
 
   sendMessage(agentId, message) {
+    if (this.closed) throw new Error("service is closed");
     const agent = this.db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
     if (!agent) throw new Error("agent not found");
     const active = this.db.prepare("SELECT id FROM turns WHERE agent_id = ? AND status = 'running'").get(agentId);
@@ -115,6 +127,7 @@ export class AgentService {
   }
 
   handlePiEvent(agentId, turnId, event) {
+    if (this.closed) return;
     const turn = this.db.prepare("SELECT status FROM turns WHERE id = ? AND agent_id = ?").get(turnId, agentId);
     if (!turn || turn.status !== "running") return;
     if (event.type === "session" && event.id) this.db.prepare("UPDATE turns SET pi_session_id = ? WHERE id = ?").run(event.id, turnId);
@@ -133,6 +146,7 @@ export class AgentService {
   }
 
   handlePiClose(agentId, turnId, { code = null, signal = null, error } = {}) {
+    if (this.closed) return;
     const turn = this.db.prepare("SELECT status FROM turns WHERE id = ?").get(turnId);
     if (turn?.status !== "running") return;
     const detail = error
