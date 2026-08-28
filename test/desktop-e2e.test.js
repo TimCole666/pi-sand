@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
@@ -109,6 +109,55 @@ test("Desktop HTTP/SSE journey closes during work and reconnects to one canonica
     assert.deepEqual(completed.messages.map((message) => message.content), ["Keep working while I close the Desktop", "Completed after Desktop reconnect."]);
     assert.equal(new Set(completed.messages.map((message) => message.id)).size, completed.messages.length);
   } finally {
+    service.close();
+    await new Promise((resolve) => server.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("two Desktop connections reconnect independently while their separate workspace Turns run concurrently", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-sand-desktop-parallel-e2e-"));
+  const workspaceA = join(directory, "workspace-a");
+  const workspaceB = join(directory, "workspace-b");
+  await Promise.all([mkdir(workspaceA), mkdir(workspaceB)]);
+  const service = new AgentService({ dbPath: join(directory, "state.sqlite"), piFactory: delayedPi });
+  const server = createAgentServer(service);
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const base = `http://127.0.0.1:${server.address().port}`;
+  let firstA;
+  let firstB;
+  let reopenedA;
+  let reopenedB;
+  try {
+    const agentA = await json(base, "/api/agents", { method: "POST", body: JSON.stringify({ name: "A", workspace: workspaceA }) });
+    const agentB = await json(base, "/api/agents", { method: "POST", body: JSON.stringify({ name: "B", workspace: workspaceB }) });
+    firstA = await openEvents(base, `/api/agents/${agentA.agent.id}/events`);
+    firstB = await openEvents(base, `/api/agents/${agentB.agent.id}/events`);
+    const turnA = await json(base, `/api/agents/${agentA.agent.id}/turns`, { method: "POST", body: JSON.stringify({ message: "A keeps working" }) });
+    const turnB = await json(base, `/api/agents/${agentB.agent.id}/turns`, { method: "POST", body: JSON.stringify({ message: "B keeps working" }) });
+    await eventually(() => firstA.events.some((event) => event.type === "assistant_delta") && firstB.events.some((event) => event.type === "assistant_delta"), "both Desktops did not observe their independent active Turns");
+
+    await Promise.all([firstA.close(), firstB.close()]);
+    assert.equal((await json(base, `/api/agents/${agentA.agent.id}`)).activeTurnId, turnA.id);
+    assert.equal((await json(base, `/api/agents/${agentB.agent.id}`)).activeTurnId, turnB.id);
+
+    reopenedA = await openEvents(base, `/api/agents/${agentA.agent.id}/events`);
+    reopenedB = await openEvents(base, `/api/agents/${agentB.agent.id}/events`);
+    await eventually(
+      () => reopenedA.events.some((event) => event.type === "snapshot" && event.snapshot.activeTurnId === turnA.id)
+        && reopenedB.events.some((event) => event.type === "snapshot" && event.snapshot.activeTurnId === turnB.id),
+      "each reconnected Desktop did not receive its own active Turn",
+    );
+
+    service.executions.get(turnA.id).release();
+    await eventually(() => reopenedA.events.some((event) => event.type === "turn_finished"), "reconnected Desktop A did not observe completion");
+    assert.equal((await json(base, `/api/agents/${agentB.agent.id}`)).activeTurnId, turnB.id);
+
+    service.executions.get(turnB.id).release();
+    await eventually(() => reopenedB.events.some((event) => event.type === "turn_finished"), "reconnected Desktop B did not observe completion");
+  } finally {
+    await Promise.allSettled([firstA?.close(), firstB?.close(), reopenedA?.close(), reopenedB?.close()]);
     service.close();
     await new Promise((resolve) => server.close(resolve));
     await rm(directory, { recursive: true, force: true });

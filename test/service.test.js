@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, stat } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { basename, join, relative } from "node:path";
 import { AgentService, defaultDatabasePath } from "../src/service.js";
 
 function fakePi({ onEvent, onClose }) {
@@ -71,7 +71,7 @@ test("defaults local persistence to XDG data and honors PI_SAND_DB", async () =>
 });
 
 test("creates an Agent and persists a complete user/assistant conversation", async () => withService(async (service, path) => {
-  const created = service.createAgent({ name: "Project", workspace: "/tmp/project" });
+  const created = service.createAgent({ name: "Project", workspace: "/tmp" });
   assert.equal(created.agent.name, "Project");
   const turn = service.sendMessage(created.agent.id, "Fix the failing tests");
   assert.equal(turn.status, "running");
@@ -86,7 +86,7 @@ test("creates an Agent and persists a complete user/assistant conversation", asy
 }));
 
 test("streams updates through the semantic service subscription", async () => withService(async (service) => {
-  const created = service.createAgent({ workspace: "/tmp/project" });
+  const created = service.createAgent({ workspace: "/tmp" });
   const updates = [];
   const unsubscribe = service.subscribe(created.agent.id, (event) => updates.push(event));
   service.sendMessage(created.agent.id, "Inspect the project");
@@ -119,7 +119,7 @@ test("agent_end leaves a Turn running until agent_settled and then finishes exac
     return execution;
   };
   await withService(async (service) => {
-    const agent = service.createAgent({ workspace: "/tmp/project" });
+    const agent = service.createAgent({ workspace: "/tmp" });
     const updates = [];
     const unsubscribe = service.subscribe(agent.agent.id, (event) => updates.push(event));
     const turn = service.sendMessage(agent.agent.id, "Continue if Pi decides to retry");
@@ -148,7 +148,7 @@ test("a rejected Pi prompt fails one Turn without waiting for process close", as
     abort() {}, close() {},
   });
   await withService(async (service) => {
-    const agent = service.createAgent({ workspace: "/tmp/project" });
+    const agent = service.createAgent({ workspace: "/tmp" });
     const updates = [];
     const unsubscribe = service.subscribe(agent.agent.id, (event) => updates.push(event));
     service.sendMessage(agent.agent.id, "Start work");
@@ -174,7 +174,7 @@ test("a settled final assistant error fails one Turn and preserves its final tex
     abort() {}, close() {},
   });
   await withService(async (service) => {
-    const agent = service.createAgent({ workspace: "/tmp/project" });
+    const agent = service.createAgent({ workspace: "/tmp" });
     const updates = [];
     const unsubscribe = service.subscribe(agent.agent.id, (event) => updates.push(event));
     service.sendMessage(agent.agent.id, "Start work");
@@ -195,7 +195,7 @@ test("a reconnect observes the same active Turn and later completion without tra
     return execution;
   };
   await withService(async (service) => {
-    const created = service.createAgent({ name: "Long task", workspace: "/tmp/project" });
+    const created = service.createAgent({ name: "Long task", workspace: "/tmp" });
     const firstUpdates = [];
     const unsubscribe = service.subscribe(created.agent.id, (event) => firstUpdates.push(event));
     const turn = service.sendMessage(created.agent.id, "Work while the desktop is closed");
@@ -234,7 +234,7 @@ test("interrupt preserves the durable transcript and settles a running Turn once
   const path = join(directory, "state.sqlite");
   try {
     const first = new AgentService({ dbPath: path, piFactory: fakePi });
-    const agent = first.createAgent({ name: "Interruptible", workspace: "/tmp/project" });
+    const agent = first.createAgent({ name: "Interruptible", workspace: "/tmp" });
     const updates = [];
     const unsubscribe = first.subscribe(agent.agent.id, (event) => updates.push(event));
     const turn = first.sendMessage(agent.agent.id, "Stop this work");
@@ -273,7 +273,7 @@ test("Pi close before interrupted settlement fails once and ignores a late settl
     return execution;
   };
   await withService(async (service) => {
-    const agent = service.createAgent({ workspace: "/tmp/project" });
+    const agent = service.createAgent({ workspace: "/tmp" });
     const updates = [];
     const unsubscribe = service.subscribe(agent.agent.id, (event) => updates.push(event));
     const turn = service.sendMessage(agent.agent.id, "Do work");
@@ -316,7 +316,7 @@ test("an unexpected Pi exit during streaming fails one Turn and preserves its tr
   const path = join(directory, "state.sqlite");
   try {
     const first = new AgentService({ dbPath: path, piFactory });
-    const agent = first.createAgent({ name: "Failure case", workspace: "/tmp/project" });
+    const agent = first.createAgent({ name: "Failure case", workspace: "/tmp" });
     const updates = [];
     const unsubscribe = first.subscribe(agent.agent.id, (event) => updates.push(event));
     const turn = first.sendMessage(agent.agent.id, "Start a long task");
@@ -354,13 +354,13 @@ test("reopening the service restores completed Agent, Turn, and transcript", asy
   const path = join(directory, "state.sqlite");
   try {
     const first = new AgentService({ dbPath: path, piFactory: fakePi });
-    const agent = first.createAgent({ name: "Persisted", workspace: "/tmp/project" });
+    const agent = first.createAgent({ name: "Persisted", workspace: "/tmp" });
     first.sendMessage(agent.agent.id, "Make a change");
     await new Promise((resolve) => setTimeout(resolve, 20));
     first.close();
     const second = new AgentService({ dbPath: path, piFactory: fakePi });
     const restored = second.getAgent(agent.agent.id);
-    assert.equal(restored.agent.workspace, "/tmp/project");
+    assert.equal(restored.agent.workspace, "/tmp");
     assert.equal(restored.turns[0].status, "completed");
     assert.equal(restored.messages.length, 2);
     second.close();
@@ -374,7 +374,7 @@ test("service restart interrupts persisted running work without replay and accep
   const dormantPi = () => ({ prompt() { starts += 1; }, abort() {}, close() {} });
   try {
     const first = new AgentService({ dbPath: path, piFactory: dormantPi });
-    const agent = first.createAgent({ name: "Restarted", workspace: "/tmp/project" });
+    const agent = first.createAgent({ name: "Restarted", workspace: "/tmp" });
     const unfinished = first.sendMessage(agent.agent.id, "Do not replay this request");
     assert.equal(starts, 1);
     first.close();
@@ -382,7 +382,7 @@ test("service restart interrupts persisted running work without replay and accep
     const second = new AgentService({ dbPath: path, piFactory: fakePi });
     const restored = second.getAgent(agent.agent.id);
     assert.equal(starts, 1, "restart must not adopt or replay the previous execution");
-    assert.equal(restored.agent.workspace, "/tmp/project");
+    assert.equal(restored.agent.workspace, "/tmp");
     assert.equal(restored.state, "idle");
     assert.equal(restored.activeTurnId, null);
     assert.equal(restored.turns[0].id, unfinished.id);
@@ -401,19 +401,101 @@ test("service restart interrupts persisted running work without replay and accep
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test("v0.1 permits only one active workflow across durable Agents", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-sand-single-workflow-"));
+test("Agent creation persists a canonical workspace and rejects missing or non-directory paths", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-sand-workspace-validation-"));
   const path = join(directory, "state.sqlite");
-  const dormantPi = ({ onClose }) => ({ prompt() {}, abort() { onClose({ code: 0, signal: null }); }, close() {} });
+  const file = join(directory, "not-a-workspace");
+  await writeFile(file, "not a directory");
+  const service = new AgentService({ dbPath: path, piFactory: fakePi });
+  try {
+    const agent = service.createAgent({ workspace: relative(process.cwd(), directory) });
+    assert.equal(agent.agent.workspace, directory);
+    assert.throws(() => service.createAgent({ workspace: join(directory, "missing") }), /workspace must exist and be a directory/);
+    assert.throws(() => service.createAgent({ workspace: file }), /workspace must exist and be a directory/);
+  } finally {
+    service.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("tilde and filesystem aliases persist one canonical workspace and cannot bypass its lock", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-sand-workspace-alias-"));
+  const path = join(directory, "state.sqlite");
+  const home = homedir();
+  const homeWorkspace = await mkdtemp(join(home, ".pi-sand-workspace-"));
+  const link = join(directory, "workspace-alias");
+  await symlink(homeWorkspace, link, "dir");
+  const dormantPi = () => ({ prompt() {}, abort() {}, close() {} });
   const service = new AgentService({ dbPath: path, piFactory: dormantPi });
   try {
-    const first = service.createAgent({ name: "First", workspace: "/tmp/one" });
-    const second = service.createAgent({ name: "Second", workspace: "/tmp/two" });
-    service.sendMessage(first.agent.id, "Run the only active workflow");
-    assert.throws(() => service.sendMessage(second.agent.id, "This must wait"), /only one active workflow/);
-    service.interrupt(first.agent.id, service.getAgent(first.agent.id).activeTurnId);
-    service.sendMessage(second.agent.id, "This can start after interruption");
-    assert.equal(service.getAgent(second.agent.id).state, "active");
+    const homeAgent = service.createAgent({ name: "Home", workspace: "~" });
+    const tilde = service.createAgent({ name: "Tilde", workspace: `~/${basename(homeWorkspace)}` });
+    const normalized = service.createAgent({ name: "Normalized", workspace: join(homeWorkspace, "..", basename(homeWorkspace)) });
+    const symlinked = service.createAgent({ name: "Symlinked", workspace: link });
+    assert.equal(homeAgent.agent.workspace, home);
+    assert.equal(tilde.agent.workspace, homeWorkspace);
+    assert.equal(normalized.agent.workspace, homeWorkspace);
+    assert.equal(symlinked.agent.workspace, homeWorkspace);
+
+    service.sendMessage(tilde.agent.id, "Lock this workspace");
+    assert.throws(() => service.sendMessage(normalized.agent.id, "Do not bypass the lock"), /workspace already has a running Turn/);
+    assert.throws(() => service.sendMessage(symlinked.agent.id, "Do not bypass the lock either"), /workspace already has a running Turn/);
+  } finally {
+    service.close();
+    await Promise.all([rm(directory, { recursive: true, force: true }), rm(homeWorkspace, { recursive: true, force: true })]);
+  }
+});
+
+test("independent Agents run concurrently while completion, failure, and interruption stay isolated", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-sand-parallel-turns-"));
+  const path = join(directory, "state.sqlite");
+  const workspaceA = await mkdtemp(join(directory, "workspace-a-"));
+  const workspaceB = await mkdtemp(join(directory, "workspace-b-"));
+  const controls = new Map();
+  const piFactory = ({ onEvent, onClose }) => {
+    let settled = false;
+    const settle = (stopReason = "stop") => {
+      if (settled) return;
+      settled = true;
+      onEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: `${stopReason} result` }], stopReason } });
+      onEvent({ type: "agent_end" });
+      onEvent({ type: "agent_settled" });
+      onClose({ code: 0, signal: null });
+    };
+    return {
+      prompt({ message }) {
+        onEvent({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: `Working: ${message}` } });
+        controls.set(message, { complete: () => settle(), fail: () => onClose({ code: null, signal: "SIGKILL" }) });
+      },
+      abort() { settle("aborted"); },
+      close() {},
+    };
+  };
+  const service = new AgentService({ dbPath: path, piFactory });
+  try {
+    const agentA = service.createAgent({ name: "A", workspace: workspaceA });
+    const agentB = service.createAgent({ name: "B", workspace: workspaceB });
+    const sameWorkspaceAsA = service.createAgent({ name: "A duplicate", workspace: `${workspaceA}/.` });
+    const firstA = service.sendMessage(agentA.agent.id, "A completes");
+    const turnB = service.sendMessage(agentB.agent.id, "B remains running");
+    assert.equal(service.getAgent(agentA.agent.id).state, "active");
+    assert.equal(service.getAgent(agentB.agent.id).activeTurnId, turnB.id);
+    assert.throws(() => service.sendMessage(agentA.agent.id, "A must not overlap"), /Agent already has a running Turn/);
+    assert.throws(() => service.sendMessage(sameWorkspaceAsA.agent.id, "Shared workspace must not overlap"), /workspace already has a running Turn/);
+
+    controls.get("A completes").complete();
+    assert.equal(service.getAgent(agentA.agent.id).turns.find((turn) => turn.id === firstA.id).status, "completed");
+    assert.equal(service.getAgent(agentB.agent.id).activeTurnId, turnB.id);
+
+    const failedA = service.sendMessage(agentA.agent.id, "A fails");
+    controls.get("A fails").fail();
+    assert.equal(service.getAgent(agentA.agent.id).turns.find((turn) => turn.id === failedA.id).status, "failed");
+    assert.equal(service.getAgent(agentB.agent.id).activeTurnId, turnB.id);
+
+    const interruptedA = service.sendMessage(agentA.agent.id, "A interrupts");
+    service.interrupt(agentA.agent.id, interruptedA.id);
+    assert.equal(service.getAgent(agentA.agent.id).turns.find((turn) => turn.id === interruptedA.id).status, "interrupted");
+    assert.equal(service.getAgent(agentB.agent.id).activeTurnId, turnB.id);
   } finally {
     service.close();
     await rm(directory, { recursive: true, force: true });
