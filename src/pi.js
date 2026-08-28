@@ -1,6 +1,9 @@
 import { spawn } from "node:child_process";
 
-const commonArgs = ["--mode", "rpc", "--no-session", "--no-extensions", "--no-skills", "--approve", "--tools", "read,write,bash"];
+// The product invokes Pi with the user's normal installed tools, extensions, and skills.
+// The isolated spike keeps its restrictive flags because it intentionally probes a
+// controlled contract; those flags are not product behavior.
+const commonArgs = ["--mode", "rpc", "--no-session", "--approve"];
 
 /** Spawn the installed Pi RPC process using the concrete contract proven by the spike. */
 export function spawnPi({ cwd, onEvent, onClose, command = process.env.PI_BIN ?? "pi" }) {

@@ -131,6 +131,7 @@ test("interrupt preserves the durable transcript and settles a running Turn once
     const interrupted = first.getAgent(agent.agent.id);
     assert.equal(interrupted.state, "idle");
     assert.equal(interrupted.turns[0].status, "interrupted");
+    assert.equal(interrupted.turns[0].terminalDetail, "The Turn was interrupted by the user.");
     assert.deepEqual(interrupted.messages.map((message) => message.role), ["user", "assistant"]);
     assert.equal(interrupted.messages[1].content, "Stopped.");
     assert.equal(updates.filter((event) => event.type === "turn_finished").length, 1);
@@ -140,6 +141,7 @@ test("interrupt preserves the durable transcript and settles a running Turn once
     const reopened = new AgentService({ dbPath: path, piFactory: fakePi });
     const restored = reopened.getAgent(agent.agent.id);
     assert.equal(restored.turns[0].status, "interrupted");
+    assert.equal(restored.turns[0].terminalDetail, "The Turn was interrupted by the user.");
     assert.equal(restored.messages.length, 2);
     reopened.close();
   } finally { await rm(directory, { recursive: true, force: true }); }
@@ -210,6 +212,7 @@ test("an unexpected Pi exit during streaming fails one Turn and preserves its tr
     assert.equal(failed.state, "idle");
     assert.equal(failed.activeTurnId, null);
     assert.equal(failed.turns[0].status, "failed");
+    assert.equal(failed.turns[0].terminalDetail, "Pi exited with SIGKILL");
     assert.ok(failed.turns[0].finishedAt);
     assert.deepEqual(failed.messages.map((message) => message.content), ["Start a long task", "Partial answer"]);
     assert.equal(updates.filter((event) => event.type === "turn_finished").length, 1);
@@ -219,6 +222,7 @@ test("an unexpected Pi exit during streaming fails one Turn and preserves its tr
     const reopened = new AgentService({ dbPath: path, piFactory });
     const restored = reopened.getAgent(agent.agent.id);
     assert.equal(restored.turns[0].status, "failed");
+    assert.equal(restored.turns[0].terminalDetail, "Pi exited with SIGKILL");
     assert.deepEqual(restored.messages.map((message) => message.content), ["Start a long task", "Partial answer"]);
 
     const nextTurn = reopened.sendMessage(agent.agent.id, "Try again");
@@ -268,6 +272,7 @@ test("service restart interrupts persisted running work without replay and accep
     assert.equal(restored.activeTurnId, null);
     assert.equal(restored.turns[0].id, unfinished.id);
     assert.equal(restored.turns[0].status, "interrupted");
+    assert.equal(restored.turns[0].terminalDetail, "The Local Agent Service restarted before Pi finished. The unfinished work was not resumed.");
     assert.ok(restored.turns[0].finishedAt);
     assert.deepEqual(restored.messages.map((message) => message.content), ["Do not replay this request"]);
 
@@ -279,4 +284,23 @@ test("service restart interrupts persisted running work without replay and accep
     assert.equal(new Set(afterNewTurn.messages.map((message) => message.id)).size, afterNewTurn.messages.length);
     second.close();
   } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("v0.1 permits only one active workflow across durable Agents", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-sand-single-workflow-"));
+  const path = join(directory, "state.sqlite");
+  const dormantPi = ({ onClose }) => ({ prompt() {}, abort() { onClose({ code: 0, signal: null }); }, close() {} });
+  const service = new AgentService({ dbPath: path, piFactory: dormantPi });
+  try {
+    const first = service.createAgent({ name: "First", workspace: "/tmp/one" });
+    const second = service.createAgent({ name: "Second", workspace: "/tmp/two" });
+    service.sendMessage(first.agent.id, "Run the only active workflow");
+    assert.throws(() => service.sendMessage(second.agent.id, "This must wait"), /only one active workflow/);
+    service.interrupt(first.agent.id, service.getAgent(first.agent.id).activeTurnId);
+    service.sendMessage(second.agent.id, "This can start after interruption");
+    assert.equal(service.getAgent(second.agent.id).state, "active");
+  } finally {
+    service.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });

@@ -24,7 +24,7 @@ export class AgentService {
       CREATE TABLE IF NOT EXISTS turns (
         id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id),
         user_message TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('running','completed','failed','interrupted')),
-        started_at TEXT NOT NULL, finished_at TEXT, pi_session_id TEXT
+        started_at TEXT NOT NULL, finished_at TEXT, pi_session_id TEXT, terminal_detail TEXT
       );
       CREATE TABLE IF NOT EXISTS messages (
         id TEXT UNIQUE NOT NULL, agent_id TEXT NOT NULL REFERENCES agents(id), turn_id TEXT REFERENCES turns(id),
@@ -34,13 +34,20 @@ export class AgentService {
       CREATE INDEX IF NOT EXISTS messages_agent_sequence ON messages(agent_id, sequence);
       CREATE INDEX IF NOT EXISTS turns_agent_started ON turns(agent_id, started_at);
     `);
+    this.ensureTerminalDetailColumn();
     this.reconcileUnfinishedTurns();
+  }
+
+  ensureTerminalDetailColumn() {
+    const columns = this.db.prepare("PRAGMA table_info(turns)").all();
+    if (!columns.some((column) => column.name === "terminal_detail")) this.db.exec("ALTER TABLE turns ADD COLUMN terminal_detail TEXT");
   }
 
   // Pi execution cannot safely be resumed or adopted after this service starts.
   // Every persisted running Turn therefore becomes a durable interruption.
   reconcileUnfinishedTurns() {
-    this.db.prepare("UPDATE turns SET status = 'interrupted', finished_at = ? WHERE status = 'running'").run(now());
+    const detail = "The Local Agent Service restarted before Pi finished. The unfinished work was not resumed.";
+    this.db.prepare("UPDATE turns SET status = 'interrupted', finished_at = ?, terminal_detail = COALESCE(terminal_detail, ?) WHERE status = 'running'").run(now(), detail);
   }
 
   close() {
@@ -72,7 +79,7 @@ export class AgentService {
 
   snapshot(id, agent = this.db.prepare("SELECT id, name, workspace, created_at AS createdAt, updated_at AS updatedAt FROM agents WHERE id = ?").get(id)) {
     if (!agent) return null;
-    const turns = this.db.prepare("SELECT id, agent_id AS agentId, user_message AS userMessage, status, started_at AS startedAt, finished_at AS finishedAt, pi_session_id AS piSessionId FROM turns WHERE agent_id = ? ORDER BY started_at").all(id);
+    const turns = this.db.prepare("SELECT id, agent_id AS agentId, user_message AS userMessage, status, started_at AS startedAt, finished_at AS finishedAt, pi_session_id AS piSessionId, terminal_detail AS terminalDetail FROM turns WHERE agent_id = ? ORDER BY started_at").all(id);
     const messages = this.db.prepare("SELECT id, turn_id AS turnId, role, content, created_at AS createdAt, updated_at AS updatedAt FROM messages WHERE agent_id = ? ORDER BY sequence").all(id);
     const activeTurn = turns.find((turn) => turn.status === "running") ?? null;
     return { agent, turns, messages, state: activeTurn ? "active" : "idle", activeTurnId: activeTurn?.id ?? null };
@@ -88,8 +95,8 @@ export class AgentService {
     if (this.closed) throw new Error("service is closed");
     const agent = this.db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
     if (!agent) throw new Error("agent not found");
-    const active = this.db.prepare("SELECT id FROM turns WHERE agent_id = ? AND status = 'running'").get(agentId);
-    if (active) throw new Error("agent already has an active turn");
+    const active = this.db.prepare("SELECT id FROM turns WHERE status = 'running'").get();
+    if (active) throw new Error("v0.1 supports only one active workflow at a time");
     if (typeof message !== "string" || !message.trim()) throw new Error("message is required");
     const turnId = randomUUID(); const timestamp = now(); const messageId = randomUUID();
     this.db.exec("BEGIN");
@@ -107,7 +114,7 @@ export class AgentService {
     });
     this.executions.set(turnId, execution);
     try { execution.prompt(message); } catch (error) { this.finishTurn(agentId, turnId, "failed", error.message); }
-    return this.db.prepare("SELECT id, agent_id AS agentId, user_message AS userMessage, status, started_at AS startedAt, finished_at AS finishedAt, pi_session_id AS piSessionId FROM turns WHERE id = ?").get(turnId);
+    return this.db.prepare("SELECT id, agent_id AS agentId, user_message AS userMessage, status, started_at AS startedAt, finished_at AS finishedAt, pi_session_id AS piSessionId, terminal_detail AS terminalDetail FROM turns WHERE id = ?").get(turnId);
   }
 
   interrupt(agentId, turnId) {
@@ -141,7 +148,8 @@ export class AgentService {
     }
     if (event.type === "agent_end" || event.type === "agent_settled") {
       const assistant = this.db.prepare("SELECT content FROM messages WHERE turn_id = ? AND role = 'assistant'").get(turnId);
-      this.finishTurn(agentId, turnId, this.interruptingTurns.has(turnId) ? "interrupted" : "completed", assistant?.content || "");
+      const interrupted = this.interruptingTurns.has(turnId);
+      this.finishTurn(agentId, turnId, interrupted ? "interrupted" : "completed", interrupted ? "The Turn was interrupted by the user." : assistant?.content || "");
     }
   }
 
@@ -154,7 +162,7 @@ export class AgentService {
       : signal
         ? `Pi exited with ${signal}`
         : `Pi exited with code ${code}`;
-    this.finishTurn(agentId, turnId, this.interruptingTurns.has(turnId) ? "interrupted" : "failed", detail);
+    this.finishTurn(agentId, turnId, this.interruptingTurns.has(turnId) ? "interrupted" : "failed", this.interruptingTurns.has(turnId) ? "The Turn was interrupted by the user." : detail);
   }
 
   upsertAssistant(agentId, turnId, delta) {
@@ -176,7 +184,8 @@ export class AgentService {
     const turn = this.db.prepare("SELECT status FROM turns WHERE id = ? AND agent_id = ?").get(turnId, agentId);
     if (!turn || TERMINAL.has(turn.status)) return;
     const finishedAt = now();
-    this.db.prepare("UPDATE turns SET status = ?, finished_at = ? WHERE id = ?").run(status, finishedAt, turnId);
+    const terminalDetail = detail || (status === "interrupted" ? "The Turn was interrupted by the user." : "");
+    this.db.prepare("UPDATE turns SET status = ?, finished_at = ?, terminal_detail = ? WHERE id = ?").run(status, finishedAt, terminalDetail, turnId);
     const execution = this.executions.get(turnId);
     this.executions.delete(turnId);
     this.interruptingTurns.delete(turnId);

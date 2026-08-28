@@ -18,7 +18,7 @@ async function body(req) {
 }
 
 function route(pathname) { return pathname.split("/").filter(Boolean); }
-function pathnameIsStatic(pathname) { return pathname === "/" || pathname.startsWith("/index.html"); }
+function pathnameIsStatic(pathname) { return pathname === "/" || pathname === "/index.html" || pathname === "/app.js"; }
 
 /**
  * The semantic local Desktop boundary. Tests inject a deterministic service;
@@ -33,7 +33,7 @@ export function createAgentServer(service) {
         const path = url.pathname === "/" ? "/index.html" : url.pathname;
         const file = join(root, "../public", path);
         const content = await readFile(file);
-        res.writeHead(200, { "content-type": path.endsWith(".html") ? "text/html; charset=utf-8" : "text/plain" });
+        res.writeHead(200, { "content-type": path.endsWith(".html") ? "text/html; charset=utf-8" : path.endsWith(".js") ? "text/javascript; charset=utf-8" : "text/plain" });
         res.end(content);
         return;
       }
