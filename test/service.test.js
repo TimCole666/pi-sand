@@ -247,3 +247,36 @@ test("reopening the service restores completed Agent, Turn, and transcript", asy
     second.close();
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
+
+test("service restart interrupts persisted running work without replay and accepts a later Turn", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-sand-unfinished-restart-"));
+  const path = join(directory, "state.sqlite");
+  let starts = 0;
+  const dormantPi = () => ({ prompt() { starts += 1; }, abort() {}, close() {} });
+  try {
+    const first = new AgentService({ dbPath: path, piFactory: dormantPi });
+    const agent = first.createAgent({ name: "Restarted", workspace: "/tmp/project" });
+    const unfinished = first.sendMessage(agent.agent.id, "Do not replay this request");
+    assert.equal(starts, 1);
+    first.close();
+
+    const second = new AgentService({ dbPath: path, piFactory: fakePi });
+    const restored = second.getAgent(agent.agent.id);
+    assert.equal(starts, 1, "restart must not adopt or replay the previous execution");
+    assert.equal(restored.agent.workspace, "/tmp/project");
+    assert.equal(restored.state, "idle");
+    assert.equal(restored.activeTurnId, null);
+    assert.equal(restored.turns[0].id, unfinished.id);
+    assert.equal(restored.turns[0].status, "interrupted");
+    assert.ok(restored.turns[0].finishedAt);
+    assert.deepEqual(restored.messages.map((message) => message.content), ["Do not replay this request"]);
+
+    second.sendMessage(agent.agent.id, "Start a new request");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const afterNewTurn = second.getAgent(agent.agent.id);
+    assert.deepEqual(afterNewTurn.turns.map((turn) => turn.status), ["interrupted", "completed"]);
+    assert.deepEqual(afterNewTurn.messages.map((message) => message.content), ["Do not replay this request", "Start a new request", "Done."]);
+    assert.equal(new Set(afterNewTurn.messages.map((message) => message.id)).size, afterNewTurn.messages.length);
+    second.close();
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});

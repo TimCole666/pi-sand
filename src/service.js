@@ -33,6 +33,13 @@ export class AgentService {
       CREATE INDEX IF NOT EXISTS messages_agent_sequence ON messages(agent_id, sequence);
       CREATE INDEX IF NOT EXISTS turns_agent_started ON turns(agent_id, started_at);
     `);
+    this.reconcileUnfinishedTurns();
+  }
+
+  // Pi execution cannot safely be resumed or adopted after this service starts.
+  // Every persisted running Turn therefore becomes a durable interruption.
+  reconcileUnfinishedTurns() {
+    this.db.prepare("UPDATE turns SET status = 'interrupted', finished_at = ? WHERE status = 'running'").run(now());
   }
 
   close() { this.db.close(); }
