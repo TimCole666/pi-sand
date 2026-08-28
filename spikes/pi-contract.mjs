@@ -159,8 +159,8 @@ async function run(options) {
     const output = `${JSON.stringify(report, null, 2)}\n`;
     if (options.output) await writeFile(options.output, output);
     process.stdout.write(output);
-    // A crash is expected to be signalled; a normal probe must produce agent_end.
-    if (options.mode === "run" && (result.code !== 0 || !result.summary.terminalEvents.includes("agent_end"))) process.exitCode = 1;
+    // A crash is expected to be signalled; a normal probe is complete only once Pi settles.
+    if (options.mode === "run" && (result.code !== 0 || !result.summary.terminalEvents.includes("agent_settled"))) process.exitCode = 1;
     if (options.mode === "interrupt" && !result.summary.assistantEnds.some((message) => message.stopReason === "aborted")) process.exitCode = 1;
     if (options.mode === "crash" && result.signal !== "SIGKILL") process.exitCode = 1;
   } finally {
@@ -175,12 +175,14 @@ function selfTest() {
     '{"type":"tool_execution_start","toolCallId":"call-1","toolName":"read","args":{"path":"fixture.txt"}}',
     '{"type":"message_end","message":{"role":"assistant","stopReason":"stop"}}',
     '{"type":"agent_end","messages":[]}',
+    '{"type":"agent_settled"}',
   ].join("\n"));
   const summary = eventSummary(events);
   if (summary.session.id !== "session-1") throw new Error("session header was not parsed");
   if (summary.textDeltas !== "hello") throw new Error("text deltas were not assembled");
   if (summary.toolExecutions[0].name !== "read") throw new Error("tool event was not captured");
-  if (!summary.terminalEvents.includes("agent_end")) throw new Error("agent completion was not captured");
+  if (!summary.terminalEvents.includes("agent_end")) throw new Error("agent end was not captured");
+  if (!summary.terminalEvents.includes("agent_settled")) throw new Error("agent settlement was not captured");
   console.log("self-test passed");
 }
 

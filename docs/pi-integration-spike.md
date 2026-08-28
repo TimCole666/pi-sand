@@ -70,7 +70,7 @@ The smallest proven subprocess seam is:
 1. spawn `pi --mode rpc` in the Agent workspace;
 2. send one `prompt` command;
 3. translate `message_update` text deltas and selected tool lifecycle events to service updates;
-4. treat `agent_end`/`agent_settled` plus the final assistant message as normal completion;
+4. treat `agent_end` as non-terminal and wait for `agent_settled` plus the final assistant message before normal or interrupted completion;
 5. send `abort` for an interrupt and wait for the resulting `stopReason: "aborted"`;
 6. classify a child close with no terminal event as failure.
 
@@ -78,7 +78,7 @@ This is a concrete Pi CLI contract, not a generic `AgentRuntime` interface. Sess
 
 ## Evidence classification
 
-- **Observed:** JSONL framing, session header in JSON mode, RPC prompt/get_state/abort commands, streamed text deltas, tool execution lifecycle, completion lifecycle, aborted stop reason, and SIGKILL child-close behavior.
+- **Observed:** JSONL framing, session header in JSON mode, RPC prompt/get_state/abort commands, streamed text deltas, tool execution lifecycle, `agent_end` followed by authoritative `agent_settled` completion lifecycle, aborted stop reason, and SIGKILL child-close behavior.
 - **Evidence-backed:** Pi documentation explicitly defines these event and command shapes in its installed `docs/json.md`, `docs/rpc.md`, and `docs/sdk.md`.
 - **Inferred:** A service can own a Pi subprocess independently of a desktop process; the service can classify abnormal child close as failed when no terminal event exists.
 - **Unknown:** Safe continuation after process/service crash, whether all providers emit identical tool payload details, and which activity records users ultimately need.

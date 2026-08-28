@@ -24,7 +24,7 @@ export function spawnPi({ cwd, onEvent, onClose, command = process.env.PI_BIN ??
   child.once("error", (error) => { if (!closed) onClose({ code: null, signal: null, error }); });
   child.once("close", (code, signal) => { closed = true; onClose({ code, signal }); });
   return {
-    prompt(message) { send({ id: `prompt-${Date.now()}`, type: "prompt", message }); },
+    prompt({ id, message }) { send({ id, type: "prompt", message }); },
     abort() { send({ id: `abort-${Date.now()}`, type: "abort" }); },
     close() { if (!closed) { closed = true; child.kill("SIGTERM"); } },
   };

@@ -1,0 +1,5 @@
+# Local SQLite databases may contain Agent transcripts and workspace paths.
+*.sqlite*
+*.sqlite3*
+*.db
+*.db-*

@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { spawnPi } from "./pi.js";
 
@@ -7,12 +10,20 @@ const TERMINAL = new Set(["completed", "failed", "interrupted"]);
 
 function now() { return new Date().toISOString(); }
 
+export function defaultDatabasePath() {
+  const dataHome = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
+  return join(dataHome, "pi-sand", "pi-sand.sqlite");
+}
+
 export class AgentService {
-  constructor({ dbPath = "./pi-sand.sqlite", piFactory = spawnPi } = {}) {
+  constructor({ dbPath = process.env.PI_SAND_DB ?? defaultDatabasePath(), piFactory = spawnPi } = {}) {
+    if (dbPath !== ":memory:") mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
     this.piFactory = piFactory;
     this.events = new EventEmitter();
     this.executions = new Map();
+    this.promptRequestIds = new Map();
+    this.assistantOutcomes = new Map();
     this.interruptingTurns = new Set();
     this.closed = false;
     this.db.exec(`
@@ -58,6 +69,8 @@ export class AgentService {
     this.closed = true;
     for (const execution of this.executions.values()) execution.close?.();
     this.executions.clear();
+    this.promptRequestIds.clear();
+    this.assistantOutcomes.clear();
     this.interruptingTurns.clear();
     this.db.close();
   }
@@ -107,13 +120,15 @@ export class AgentService {
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     this.publish(agentId, "turn_started", { turnId });
+    const promptRequestId = `prompt-${randomUUID()}`;
     const execution = this.piFactory({
       cwd: agent.workspace,
       onEvent: (event) => this.handlePiEvent(agentId, turnId, event),
       onClose: (result) => this.handlePiClose(agentId, turnId, result),
     });
     this.executions.set(turnId, execution);
-    try { execution.prompt(message); } catch (error) { this.finishTurn(agentId, turnId, "failed", error.message); }
+    this.promptRequestIds.set(turnId, promptRequestId);
+    try { execution.prompt({ id: promptRequestId, message }); } catch (error) { this.finishTurn(agentId, turnId, "failed", error.message); }
     return this.db.prepare("SELECT id, agent_id AS agentId, user_message AS userMessage, status, started_at AS startedAt, finished_at AS finishedAt, pi_session_id AS piSessionId, terminal_detail AS terminalDetail FROM turns WHERE id = ?").get(turnId);
   }
 
@@ -142,14 +157,28 @@ export class AgentService {
       this.upsertAssistant(agentId, turnId, event.assistantMessageEvent.delta);
       this.publish(agentId, "assistant_delta", { turnId, delta: event.assistantMessageEvent.delta });
     }
+    if (event.type === "response" && event.command === "prompt" && event.id === this.promptRequestIds.get(turnId) && event.success === false) {
+      this.finishTurn(agentId, turnId, "failed", promptRejectionDetail(event));
+      return;
+    }
     if (event.type === "message_end" && event.message?.role === "assistant") {
       const content = assistantText(event.message);
+      this.assistantOutcomes.set(turnId, { stopReason: event.message.stopReason, errorMessage: event.message.errorMessage });
       if (content) this.setAssistant(agentId, turnId, content);
     }
-    if (event.type === "agent_end" || event.type === "agent_settled") {
+    // agent_end can precede a retry, compaction retry, or queued continuation.
+    // agent_settled is the point at which Pi's autonomous loop is truly done.
+    if (event.type === "agent_settled") {
       const assistant = this.db.prepare("SELECT content FROM messages WHERE turn_id = ? AND role = 'assistant'").get(turnId);
       const interrupted = this.interruptingTurns.has(turnId);
-      this.finishTurn(agentId, turnId, interrupted ? "interrupted" : "completed", interrupted ? "The Turn was interrupted by the user." : assistant?.content || "");
+      const outcome = this.assistantOutcomes.get(turnId);
+      const failed = outcome?.stopReason === "error";
+      this.finishTurn(
+        agentId,
+        turnId,
+        interrupted ? "interrupted" : failed ? "failed" : "completed",
+        interrupted ? "The Turn was interrupted by the user." : failed ? assistantErrorDetail(outcome) : assistant?.content || "",
+      );
     }
   }
 
@@ -188,6 +217,8 @@ export class AgentService {
     this.db.prepare("UPDATE turns SET status = ?, finished_at = ?, terminal_detail = ? WHERE id = ?").run(status, finishedAt, terminalDetail, turnId);
     const execution = this.executions.get(turnId);
     this.executions.delete(turnId);
+    this.promptRequestIds.delete(turnId);
+    this.assistantOutcomes.delete(turnId);
     this.interruptingTurns.delete(turnId);
     if (execution?.close) execution.close();
     this.publish(agentId, "turn_finished", { turnId, status, detail });
@@ -200,4 +231,13 @@ function assistantText(message) {
   if (typeof message.content === "string") return message.content;
   if (!Array.isArray(message.content)) return "";
   return message.content.filter((part) => part?.type === "text").map((part) => part.text ?? "").join("");
+}
+
+function promptRejectionDetail(event) {
+  const detail = event.error?.message ?? event.error ?? event.message;
+  return detail ? `Pi rejected the prompt: ${detail}` : "Pi rejected the prompt before starting work.";
+}
+
+function assistantErrorDetail(outcome) {
+  return outcome?.errorMessage ? `Pi assistant error: ${outcome.errorMessage}` : "Pi assistant ended with an error.";
 }

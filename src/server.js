@@ -73,7 +73,7 @@ export function createAgentServer(service) {
 
 export function startServer({
   port = Number(process.env.PORT ?? 4317),
-  service = new AgentService({ dbPath: process.env.PI_SAND_DB ?? join(root, "..", "pi-sand.sqlite") }),
+  service = new AgentService(),
 } = {}) {
   const server = createAgentServer(service);
   server.listen(port, "127.0.0.1", () => console.log(`pi-sand listening on http://127.0.0.1:${port}`));

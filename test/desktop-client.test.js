@@ -52,11 +52,12 @@ function desktop({ base, storage = new Map() }) {
 
 function completedPi({ onEvent, onClose }) {
   return {
-    prompt(message) {
+    prompt({ message }) {
       onEvent({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: `Working: ${message}` } });
       setTimeout(() => {
-        onEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Done." }] } });
+        onEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Done." }], stopReason: "stop" } });
         onEvent({ type: "agent_end" });
+        onEvent({ type: "agent_settled" });
         onClose({ code: 0, signal: null });
       }, 5);
     },
@@ -67,8 +68,8 @@ function completedPi({ onEvent, onClose }) {
 function controlledPi({ onEvent, onClose }) {
   let release;
   return {
-    prompt(message) { onEvent({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: `Working: ${message}` } }); release = () => { onEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Done later." }] } }); onEvent({ type: "agent_end" }); onClose({ code: 0, signal: null }); }; },
-    abort() { onClose({ code: 0, signal: null }); }, close() {}, release() { release?.(); },
+    prompt({ message }) { onEvent({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: `Working: ${message}` } }); release = () => { onEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Done later." }], stopReason: "stop" } }); onEvent({ type: "agent_end" }); onEvent({ type: "agent_settled" }); onClose({ code: 0, signal: null }); }; },
+    abort() { onEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Stopped." }], stopReason: "aborted" } }); onEvent({ type: "agent_end" }); onEvent({ type: "agent_settled" }); onClose({ code: 0, signal: null }); }, close() {}, release() { release?.(); },
   };
 }
 

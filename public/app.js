@@ -88,7 +88,12 @@ export function mountDesktop({
     }
   }).catch((error) => alertImpl(error.message));
 
-  return { openAgent, render, ready };
+  function destroy() {
+    source?.close();
+    source = null;
+  }
+
+  return { openAgent, render, destroy, ready };
 }
 
 if (typeof window !== "undefined") mountDesktop();

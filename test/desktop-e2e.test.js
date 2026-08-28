@@ -10,12 +10,13 @@ import { createAgentServer } from "../src/server.js";
 function delayedPi({ onEvent, onClose }) {
   let release;
   return {
-    prompt(message) {
+    prompt({ message }) {
       onEvent({ type: "session", id: "desktop-e2e-session" });
       onEvent({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: `Started: ${message}` } });
       release = () => {
-        onEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Completed after Desktop reconnect." }] } });
+        onEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Completed after Desktop reconnect." }], stopReason: "stop" } });
         onEvent({ type: "agent_end" });
+        onEvent({ type: "agent_settled" });
         onClose({ code: 0, signal: null });
       };
     },
