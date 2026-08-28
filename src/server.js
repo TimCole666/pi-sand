@@ -40,9 +40,18 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && parts[3] === "interrupt" && parts.length === 4) return json(res, 200, service.interrupt(agentId, (await body(req)).turnId));
     if (req.method === "GET" && parts[3] === "events" && parts.length === 4) {
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-      const send = (event) => res.write(`data: ${JSON.stringify(event)}\n\n`);
-      send({ type: "snapshot", snapshot: service.getAgent(agentId) });
+      // Subscribe before taking the snapshot so a turn update cannot land in the
+      // gap between reconnect's snapshot request and event subscription. The
+      // snapshot is authoritative; the desktop replaces its view with each
+      // snapshot rather than appending replayed events.
+      const send = (event) => {
+        if (!res.writableEnded) {
+          if (event.id) res.write(`id: ${event.id}\n`);
+          res.write(`data: ${JSON.stringify(event)}\n\n`);
+        }
+      };
       const unsubscribe = service.subscribe(agentId, send);
+      send({ type: "snapshot", snapshot: service.getAgent(agentId) });
       req.on("close", () => unsubscribe());
       return;
     }

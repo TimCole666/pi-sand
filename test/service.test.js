@@ -19,10 +19,31 @@ function fakePi({ onEvent, onClose }) {
   };
 }
 
-async function withService(fn) {
+function longRunningFakePi({ onEvent, onClose }) {
+  let stopped = false;
+  let release;
+  return {
+    prompt(message) {
+      onEvent({ type: "session", id: "long-running-session" });
+      onEvent({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: `Started: ${message}` } });
+      release = () => {
+        if (stopped) return;
+        stopped = true;
+        onEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Finished after reconnect." }] } });
+        onEvent({ type: "agent_end" });
+        onClose({ code: 0, signal: null });
+      };
+    },
+    abort() { stopped = true; onClose({ code: 0, signal: null }); },
+    close() { stopped = true; },
+    release() { release?.(); },
+  };
+}
+
+async function withService(fn, piFactory = fakePi) {
   const directory = await mkdtemp(join(tmpdir(), "pi-sand-test-"));
   const path = join(directory, "state.sqlite");
-  const service = new AgentService({ dbPath: path, piFactory: fakePi });
+  const service = new AgentService({ dbPath: path, piFactory });
   try { await fn(service, path); } finally { service.close(); await rm(directory, { recursive: true, force: true }); }
 }
 
@@ -52,6 +73,47 @@ test("streams updates through the semantic service subscription", async () => wi
   assert.ok(updates.some((event) => event.type === "turn_finished" && event.status === "completed"));
   assert.equal(new Set(updates.flatMap((e) => e.snapshot.messages.map((m) => m.id))).size, updates.at(-1).snapshot.messages.length);
 }));
+
+test("a reconnect observes the same active Turn and later completion without transcript duplication", async () => {
+  let execution;
+  const piFactory = (options) => {
+    execution = longRunningFakePi(options);
+    return execution;
+  };
+  await withService(async (service) => {
+    const created = service.createAgent({ name: "Long task", workspace: "/tmp/project" });
+    const firstUpdates = [];
+    const unsubscribe = service.subscribe(created.agent.id, (event) => firstUpdates.push(event));
+    const turn = service.sendMessage(created.agent.id, "Work while the desktop is closed");
+    await new Promise((resolve) => setImmediate(resolve));
+    unsubscribe();
+
+    const disconnected = service.getAgent(created.agent.id);
+    assert.equal(disconnected.activeTurnId, turn.id);
+    assert.equal(disconnected.state, "active");
+    assert.deepEqual(disconnected.messages.map((message) => message.role), ["user", "assistant"]);
+
+    // A reopened desktop takes this authoritative snapshot, then subscribes
+    // for updates. The service-owned execution was never interrupted.
+    const reopened = service.getAgent(created.agent.id);
+    const reconnectUpdates = [];
+    const unsubscribeReconnect = service.subscribe(created.agent.id, (event) => reconnectUpdates.push(event));
+    assert.equal(reopened.activeTurnId, turn.id);
+    assert.equal(reopened.messages.length, 2);
+    execution.release();
+    await new Promise((resolve) => setImmediate(resolve));
+    unsubscribeReconnect();
+
+    const completed = service.getAgent(created.agent.id);
+    assert.equal(completed.state, "idle");
+    assert.equal(completed.turns[0].status, "completed");
+    assert.equal(completed.messages.length, 2);
+    assert.equal(completed.messages[1].content, "Finished after reconnect.");
+    assert.ok(firstUpdates.some((event) => event.type === "turn_started"));
+    assert.ok(reconnectUpdates.some((event) => event.type === "turn_finished"));
+    assert.equal(new Set(completed.messages.map((message) => message.id)).size, completed.messages.length);
+  }, piFactory);
+});
 
 test("reopening the service restores completed Agent, Turn, and transcript", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-sand-restart-"));
