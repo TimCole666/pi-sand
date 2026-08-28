@@ -123,6 +123,9 @@ test("Desktop close during work reconnects to the same active Turn and one resul
   const storage = new Map();
   const first = desktop({ base, storage });
   const agentId = await createAndSend(first, directory, "Keep working");
+  first.sources[0].deliver(service.getAgent(agentId));
+  assert.match(first.elements.messages.innerHTML, /Working: Keep working/);
+  assert.equal(first.elements.status.textContent, "Pi is working…");
   first.sources[0].close();
   assert.equal(service.getAgent(agentId).state, "active");
   const reopened = desktop({ base, storage });
@@ -132,6 +135,8 @@ test("Desktop close during work reconnects to the same active Turn and one resul
   service.executions.get(service.getAgent(agentId).activeTurnId).release();
   reopened.sources[0].deliver(service.getAgent(agentId));
   assert.equal(reopened.elements.status.textContent, "Turn completed.");
+  assert.match(reopened.elements.messages.innerHTML, /Done later\./);
+  assert.equal((reopened.elements.messages.innerHTML.match(/Done later\./g) ?? []).length, 1);
   assert.equal((reopened.elements.messages.innerHTML.match(/class="message/g) ?? []).length, 2);
 }, controlledPi));
 
