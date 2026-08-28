@@ -261,7 +261,7 @@ test("interrupt preserves the durable transcript and settles a running Turn once
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test("interrupt wins its completion race without a second terminal update", async () => {
+test("Pi close before interrupted settlement fails once and ignores a late settlement", async () => {
   let execution;
   const piFactory = ({ onEvent, onClose }) => {
     execution = {
@@ -282,7 +282,8 @@ test("interrupt wins its completion race without a second terminal update", asyn
     unsubscribe();
 
     const snapshot = service.getAgent(agent.agent.id);
-    assert.equal(snapshot.turns[0].status, "interrupted");
+    assert.equal(snapshot.turns[0].status, "failed");
+    assert.equal(snapshot.turns[0].terminalDetail, "Pi exited with code 0 after interruption was requested before Pi settled.");
     assert.equal(snapshot.messages[1].content, "Working");
     assert.equal(updates.filter((event) => event.type === "turn_finished").length, 1);
   }, piFactory);

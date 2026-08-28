@@ -191,7 +191,13 @@ export class AgentService {
       : signal
         ? `Pi exited with ${signal}`
         : `Pi exited with code ${code}`;
-    this.finishTurn(agentId, turnId, this.interruptingTurns.has(turnId) ? "interrupted" : "failed", this.interruptingTurns.has(turnId) ? "The Turn was interrupted by the user." : detail);
+    const interruptedBeforeSettlement = this.interruptingTurns.has(turnId);
+    this.finishTurn(
+      agentId,
+      turnId,
+      "failed",
+      interruptedBeforeSettlement ? `${detail} after interruption was requested before Pi settled.` : detail,
+    );
   }
 
   upsertAssistant(agentId, turnId, delta) {
