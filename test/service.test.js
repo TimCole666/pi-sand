@@ -172,6 +172,64 @@ test("interrupt wins its completion race without a second terminal update", asyn
   }, piFactory);
 });
 
+test("an unexpected Pi exit during streaming fails one Turn and preserves its transcript", async () => {
+  let factoryCalls = 0;
+  const piFactory = (options) => {
+    factoryCalls += 1;
+    if (factoryCalls > 1) return fakePi(options);
+    const { onEvent, onClose } = options;
+    let closed = false;
+    return {
+      prompt() {
+        onEvent({ type: "session", id: "crashing-session" });
+        onEvent({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Partial answer" } });
+        setImmediate(() => {
+          onClose({ code: null, signal: "SIGKILL" });
+          // A child can surface more than one close-adjacent notification. The
+          // service must keep the first terminal outcome authoritative.
+          onClose({ code: null, signal: "SIGKILL" });
+        });
+      },
+      abort() {},
+      close() { closed = true; },
+      get closed() { return closed; },
+    };
+  };
+  const directory = await mkdtemp(join(tmpdir(), "pi-sand-failure-"));
+  const path = join(directory, "state.sqlite");
+  try {
+    const first = new AgentService({ dbPath: path, piFactory });
+    const agent = first.createAgent({ name: "Failure case", workspace: "/tmp/project" });
+    const updates = [];
+    const unsubscribe = first.subscribe(agent.agent.id, (event) => updates.push(event));
+    const turn = first.sendMessage(agent.agent.id, "Start a long task");
+    await new Promise((resolve) => setImmediate(resolve));
+    unsubscribe();
+
+    const failed = first.getAgent(agent.agent.id);
+    assert.equal(failed.state, "idle");
+    assert.equal(failed.activeTurnId, null);
+    assert.equal(failed.turns[0].status, "failed");
+    assert.ok(failed.turns[0].finishedAt);
+    assert.deepEqual(failed.messages.map((message) => message.content), ["Start a long task", "Partial answer"]);
+    assert.equal(updates.filter((event) => event.type === "turn_finished").length, 1);
+    assert.equal(updates.find((event) => event.type === "turn_finished")?.status, "failed");
+    first.close();
+
+    const reopened = new AgentService({ dbPath: path, piFactory });
+    const restored = reopened.getAgent(agent.agent.id);
+    assert.equal(restored.turns[0].status, "failed");
+    assert.deepEqual(restored.messages.map((message) => message.content), ["Start a long task", "Partial answer"]);
+
+    const nextTurn = reopened.sendMessage(agent.agent.id, "Try again");
+    assert.equal(nextTurn.status, "running");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(reopened.getAgent(agent.agent.id).turns.map((savedTurn) => savedTurn.status), ["failed", "completed"]);
+    reopened.close();
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+
 test("reopening the service restores completed Agent, Turn, and transcript", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-sand-restart-"));
   const path = join(directory, "state.sqlite");

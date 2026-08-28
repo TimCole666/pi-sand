@@ -125,11 +125,15 @@ export class AgentService {
     }
   }
 
-  handlePiClose(agentId, turnId, { code = null, signal = null } = {}) {
+  handlePiClose(agentId, turnId, { code = null, signal = null, error } = {}) {
     const turn = this.db.prepare("SELECT status FROM turns WHERE id = ?").get(turnId);
-    if (turn?.status === "running") {
-      this.finishTurn(agentId, turnId, this.interruptingTurns.has(turnId) ? "interrupted" : "failed", signal ? `Pi exited with ${signal}` : `Pi exited with code ${code}`);
-    }
+    if (turn?.status !== "running") return;
+    const detail = error
+      ? `Pi failed to start: ${error.message}`
+      : signal
+        ? `Pi exited with ${signal}`
+        : `Pi exited with code ${code}`;
+    this.finishTurn(agentId, turnId, this.interruptingTurns.has(turnId) ? "interrupted" : "failed", detail);
   }
 
   upsertAssistant(agentId, turnId, delta) {
