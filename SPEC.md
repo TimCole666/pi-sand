@@ -2,654 +2,829 @@
 
 ## Problem Statement
 
-We want to build an independent desktop agent application that reproduces the core product experience and observable behavior of Grok Bot 0.18 as closely as practical.
+`pi-sand` is a Linux-first desktop agent application built around Pi.
 
-The project must be implemented from scratch rather than forked from the public reconstructed repository.
+The product goal is to reproduce the parts of the Grok Bot 0.18 experience that matter to the user without copying or depending on Grok Bot's internal implementation.
 
-The target is not recovery of Anysphere's original source code. The target is a compatible product experience:
+The core user need is simple:
 
-- persistent agents rather than disposable chat sessions
-- natural-language interaction without requiring workflow commands
-- long-running autonomous work
-- background execution independent of the desktop window
-- durable conversations
-- recoverable worker and coordinator failures
-- multiple agents that can operate independently
-- rich visibility into agent activity
-- a polished desktop experience
-- Pi as the primary agent runtime
+> Give a persistent Agent a natural-language task, leave, and come back later to the same Agent with the correct conversation state and result.
 
-The user should be able to open the application, select an agent, send a message such as:
+A normal task should not require the user to understand process supervision, model contexts, workflow engines, Ralph loops, or specific skills. The user sends a message; Pi decides how to work, uses its normal tools and skills, and reports the result.
 
-> Fix the failing tests in this repository and tell me when you're done.
+The first useful version must prove one vertical slice:
 
-and then leave.
+**Desktop → persistent Agent → Pi → work → durable transcript → close Desktop → work continues → reopen → correct state/result**
 
-The agent should be able to inspect the project, use tools, modify files, run commands, continue working, and eventually return a result without requiring the user to manually operate an agent workflow.
+The project is a clean-room implementation. Public Grok Bot artifacts and reconstruction work may be used to learn user-observable behavior, but they do not define the internal architecture of `pi-sand`.
 
-The application must continue to behave correctly when the user:
+### Product compatibility target
 
-- switches to another agent
-- closes or reopens the desktop UI
-- temporarily disconnects
-- allows work to continue for an extended period
-- encounters a recoverable runtime failure
+When practical, `pi-sand` should reproduce Grok Bot 0.18 behavior that users can actually observe, including:
 
-The reference Grok Bot 0.18 application and publicly available evidence may be used to determine observable behavior.
+- the interaction model
+- Agent persistence semantics
+- foreground/background lifecycle behavior
+- status and activity visibility
+- desktop interaction patterns
+- relevant failure and reconnect behavior
 
-The public reconstruction is explicitly an unofficial reconstruction rather than the original monorepo, and its readable frontend is not claimed to be the original authored frontend. Therefore, its internal code structure must not be treated as the specification for this implementation.
+### Not a compatibility target
+
+The following have no compatibility value by themselves:
+
+- exact internal process topology
+- internal RPC structure
+- internal class/module names
+- worker supervision implementation
+- exact model context strategy
+- exact reasoning traces
+- exact assistant wording
+- recovered source organization
+
+Where Grok Bot's internal architecture and the simplest correct Pi-native implementation differ, user-observable behavior wins.
 
 ---
 
 ## Solution
 
-Build a Linux-first desktop application centered around persistent Agents.
+Build a desktop client backed by a persistent local service that owns product state and Pi execution independently of the desktop window.
 
-The system will separate four major responsibilities:
+The v0.1 runtime shape is intentionally small:
 
-**Desktop Client → Coordinator → Agent Runtime → Execution Environment**
+**Desktop Client → Local Agent Service → Pi**
 
-The Desktop Client provides the user experience.
+The Local Agent Service also owns local persistence. Pi operates in the Agent's associated local workspace.
 
-The Coordinator owns durable product state and coordinates agent lifecycles.
+The system has three important concepts:
 
-The Agent Runtime uses Pi to reason, use tools, and perform work.
+### Agent
 
-The Execution Environment gives Pi access to the local machine and project workspaces.
+A durable product identity representing the assistant/project relationship the user returns to over time.
 
-The product must treat an Agent as a durable entity whose lifetime is independent from any individual Pi process, model context, desktop window, or network connection.
+### Turn
 
-Pi is the default and primary agent runtime. The surrounding application exists to make Pi behave like a persistent desktop agent rather than a manually operated CLI session.
+One execution of one user request. A Turn may run, complete, fail, or be interrupted.
 
-The application may later support additional frontends such as Telegram, but those frontends must connect to the same persistent Agents rather than creating a separate agent system.
+### Transcript
 
-Grok Bot compatibility will be evaluated primarily through user-observable desktop behavior.
+The durable user-visible product record. It is not a replay log for Pi's internal reasoning and is not required to reproduce Pi's model context.
 
-Exact UI details will be researched and implemented incrementally. They are not all frozen in this specification.
+The desktop frontend is not the owner of active work. Closing the Desktop Client must not cancel an active Turn.
 
-The guiding rule is:
+Pi remains responsible for reasoning, planning, tool selection, skills, command use, and its autonomous inner work loop. `pi-sand` must not build a second reasoning/orchestration system around Pi.
 
-> Preserve product behavior without unnecessarily coupling the implementation to the reconstructed product's internal structure.
+The first release deliberately does not attempt automatic recovery of an in-flight Pi execution after a service or Pi crash. If Pi exits unexpectedly, the current Turn becomes visibly failed. If the Local Agent Service restarts, completed product state is restored and unfinished work is classified explicitly rather than silently resumed.
+
+This keeps the first release focused on a reliable persistent product shell around Pi rather than prematurely building a general agent platform.
 
 ---
 
 ## User Stories
 
-1. As a user, I want to create an Agent so that I can maintain a persistent assistant for a project or purpose.
-2. As a user, I want an Agent to have a stable identity so that returning to it feels like continuing with the same assistant.
-3. As a user, I want to select an existing Agent from the desktop application so that I can resume previous work.
-4. As a user, I want to send an Agent a normal natural-language message so that I do not need to learn special workflow syntax.
-5. As a user, I want Pi to automatically decide how to approach my request so that the application behaves like an autonomous agent rather than a command runner.
-6. As a user, I want Pi to use its normal tools and installed skills when useful so that the product benefits from the existing Pi ecosystem.
-7. As a user, I want optional skill packages such as Matt's Skills to work normally without becoming mandatory parts of the product.
-8. As a user, I want the Agent to inspect files and repositories so that it can understand existing projects.
-9. As a user, I want the Agent to modify files so that it can perform real development work.
-10. As a user, I want the Agent to run shell commands so that it can build, test, inspect, and operate software.
-11. As a user, I want the Agent to react to command failures and continue working when appropriate so that I do not need to manually supervise every step.
-12. As a user, I want assistant output to appear progressively while the Agent is responding so that the application feels active and responsive.
-13. As a user, I want to see that an Agent is working even before its final response is ready so that long-running activity is understandable.
-14. As a user, I want relevant tool activity to be visible so that I can understand what the Agent is doing without reading raw internal logs.
-15. As a user, I want the final response to clearly summarize what happened so that I can quickly understand the result of unattended work.
-16. As a user, I want my conversation history to persist after restarting the desktop application so that closing the application does not erase work.
-17. As a user, I want my Agent to continue working if I close the desktop window so that I can leave long-running tasks unattended.
-18. As a user, I want to switch from Agent A to Agent B while Agent A is working so that I can use multiple agents concurrently.
-19. As a user, I want Agent A's activity to remain isolated from Agent B so that messages and execution state never leak between agents.
-20. As a user, I want different Agents to be able to work concurrently when resources allow so that a long task does not block unrelated conversations.
-21. As a user, I want messages sent to one Agent to retain a deterministic order so that concurrent interaction does not corrupt its conversation.
-22. As a user, I want to interrupt an active Agent so that I can stop work that is incorrect, unnecessary, or too expensive.
-23. As a user, I want already completed conversation content to survive an interruption so that stopping a turn does not destroy useful history.
-24. As a user, I want a recoverable Pi failure to be handled automatically when practical so that a temporary runtime problem does not destroy an unattended task.
-25. As a user, I want an unrecoverable failure to be clearly visible so that the application never silently pretends work is still progressing.
-26. As a user, I want the application to recover durable Agent state after a Coordinator restart so that infrastructure restarts do not erase conversations.
-27. As a user, I want previously completed transcript entries to remain stable during recovery so that reconnecting does not duplicate or reorder messages.
-28. As a user, I want an Agent's product history to remain available even if Pi's model context is compacted or replaced so that long-lived Agents do not require infinitely growing model context.
-29. As a user, I want Pi to rediscover current project state when necessary so that stale model memory does not override the actual filesystem, Git state, or test results.
-30. As a user, I want an Agent to be associated with a workspace so that it has a clear default project environment.
-31. As a user, I want workspace configuration to survive application restarts so that I do not have to repeatedly reconfigure an Agent.
-32. As a user, I want the desktop application to reconnect to running background work so that reopening the UI shows the current real state rather than creating a new task.
-33. As a user, I want the application to distinguish idle, active, failed, interrupted, and completed states so that I can understand what each Agent is doing.
-34. As a user, I want application and worker logs to exist so that failures from unattended sessions can be diagnosed later.
-35. As a user, I want the application to work on a normal Linux laptop so that dedicated server hardware is not required for development or initial use.
-36. As a user, I want the system to eventually run under normal Linux service supervision so that the Agent runtime can stay available for long periods.
-37. As a user, I want remote frontends such as Telegram to eventually address the same Agents that exist in the desktop application so that mobile access does not create a parallel system.
-38. As a developer, I want Grok Bot behaviors to be classified by confidence so that assumptions are not accidentally treated as confirmed compatibility requirements.
-39. As a developer, I want user-visible Grok Bot behavior to outrank reconstructed internal implementation details so that the clean-room implementation remains independent.
-40. As a developer, I want compatibility tests to survive internal refactoring so that improving architecture does not require rewriting the entire test suite.
+### v0.1 Core Stories
+
+1. As a user, I want to create an Agent so that I can keep a persistent assistant for a project or purpose.
+
+2. As a user, I want an Agent to have a stable identity so that returning to it feels like continuing with the same assistant even if Pi's process or session changes later.
+
+3. As a user, I want to open an existing Agent so that I can continue from its previous conversation and workspace.
+
+4. As a user, I want to associate an Agent with a local workspace so that Pi has a clear project environment in which to work.
+
+5. As a user, I want the workspace association to persist so that I do not have to reconfigure the Agent after restarting the app.
+
+6. As a user, I want to send a normal natural-language request so that I do not need special workflow commands.
+
+7. As a user, I want Pi to decide how to approach the request so that the product behaves like an autonomous agent rather than a command launcher.
+
+8. As a user, I want Pi to use its normal tools and installed skills when useful so that existing Pi capabilities continue to work naturally.
+
+9. As a user, I want optional packages such as Matt's Skills to remain capabilities Pi may use rather than mandatory product workflows.
+
+10. As a user, I want Pi to inspect files, modify files, and run commands in the workspace so that it can perform real development work.
+
+11. As a user, I want assistant output to stream into the desktop conversation so that I can see progress without waiting for the final response.
+
+12. As a user, I want to see a simple active state while Pi is working so that I know the request is still in progress.
+
+13. As a user, I want the final assistant response to remain in the transcript so that I can return later and understand the result.
+
+14. As a user, I want conversation history to survive Desktop Client restart so that closing the UI does not erase the product record.
+
+15. As a user, I want an active Turn to continue when I close the Desktop Client so that I can leave long-running work unattended.
+
+16. As a user, I want reopening the Desktop Client to reconnect to the same Agent so that I can see whether its Turn is still running or has completed.
+
+17. As a user, I want reconnecting to avoid duplicate or reordered visible messages so that the transcript remains trustworthy.
+
+18. As a user, I want to interrupt an active Turn so that I can stop work that is incorrect or no longer wanted.
+
+19. As a user, I want already persisted conversation content to remain intact after interruption so that stopping a Turn does not destroy useful history.
+
+20. As a user, I want an unexpected Pi exit to produce a visible failed Turn instead of leaving the application pretending that work is still running.
+
+21. As a user, I want a restarted Local Agent Service to restore completed Agent and transcript state so that product history is durable.
+
+22. As a user, I want unfinished work after a Local Agent Service restart to be visibly classified as interrupted or failed rather than silently replayed.
+
+23. As a user, I want the application to work on a normal Linux laptop so that I can build and use it without dedicated server hardware.
+
+### Later Product Stories
+
+24. As a user, I want multiple durable Agents so that I can keep separate project contexts.
+
+25. As a user, I want to switch between Agents while preserving their state so that I can work across projects.
+
+26. As a user, I eventually want Agents in different workspaces to run concurrently when it is safe to do so.
+
+27. As a user, I eventually want richer tool/activity presentation so that I can inspect what an Agent did without reading raw logs.
+
+28. As a user, I eventually want a remote frontend such as Telegram to address the same durable Agents so that mobile access does not create a separate agent system.
 
 ---
 
 ## Implementation Decisions
 
-### Persistent Agent as the primary domain object
+### 1. Agent is the primary durable product entity
 
-The primary product object is an Agent.
+An Agent is not a Pi process, Pi session, model context, desktop tab, or Turn.
 
-An Agent is not equivalent to:
-
-- a Pi process
-- a single model request
-- a desktop tab
-- a model context
-- a terminal session
-
-An Agent has a durable identity and retains enough application-owned state to be reconstructed after process restart.
-
-At minimum, persistent Agent state must represent:
+At minimum, an Agent must have durable:
 
 - identity
 - user-visible metadata
-- conversation history
 - workspace association
-- current or most recent activity state
-- runtime/session references needed for continuation
-- timestamps required for ordering and recovery
+- creation/update timestamps
+- transcript relationship
 
-The exact storage schema is an implementation detail and may evolve without changing frontend behavior.
+Pi session identity must remain conceptually separate from Agent identity. One long-lived Agent may eventually use one or many Pi sessions.
 
-### Desktop as the primary product surface
+The exact database schema is not part of the public product contract.
 
-The desktop application is the primary compatibility surface.
+---
 
-The desktop client is responsible for:
+### 2. Turn is separate from Agent
 
-- presenting Agents
-- selecting and switching Agents
-- displaying conversation history
-- accepting user messages
-- rendering streaming assistant responses
-- presenting relevant activity
-- exposing interruption and required controls
-- reconnecting to durable runtime state
+A Turn represents one user request being executed.
 
-The frontend must not own the authoritative Agent lifecycle.
+At minimum, a Turn needs enough durable information to represent:
 
-Closing, refreshing, or reconnecting the desktop client must not implicitly mean destroying the Agent.
+- identity
+- Agent identity
+- initiating user message
+- current status
+- start time
+- finish time when terminal
+- optional Pi/runtime reference if the real Pi integration provides one
 
-### Coordinator as the durable control plane
+The initial terminal model is:
 
-A Coordinator sits between frontend clients and the Agent runtime.
+- `running`
+- `completed`
+- `failed`
+- `interrupted`
 
-It owns canonical application state.
+An Agent may project a simple UI state such as `idle` or `active`, but `completed`, `failed`, and `interrupted` describe a Turn, not the long-lived Agent itself.
 
-Its responsibilities include:
+This distinction must be preserved in persistence, frontend state, and application APIs.
 
-- Agent lifecycle
-- transcript ordering
-- turn lifecycle
-- frontend subscriptions
-- activity projection
-- runtime registration
-- message routing
-- recovery coordination
-- persistence
-- interruption
-- synchronization after reconnect
+---
 
-The Coordinator must not contain Pi-specific reasoning logic.
+### 3. Desktop Client and Local Agent Service are the required lifetime boundary
 
-The reconstructed Grok Bot architecture provides evidence for a similar separation of renderer, coordinator, host/inference, and local execution concerns, but our internal implementation is free to differ.
+The only process/lifetime separation required by v0.1 is:
 
-### Pi as the primary Agent Runtime
+**Desktop Client ≠ Local Agent Service**
 
-Pi is the initial production Agent Runtime.
+This boundary exists because it directly supports the product requirement:
 
-The application should integrate with Pi through a programmatically observable interface rather than relying on terminal UI scraping.
+> Closing the UI does not cancel active work.
 
-The integration must provide enough lifecycle information to support:
+The Desktop Client is responsible for:
 
-- starting work
-- supplying user input
-- receiving streamed assistant output
-- observing tool activity where Pi exposes it
-- interruption
-- clean completion
-- abnormal termination
-- continuation or restoration where supported
+- rendering Agent state
+- rendering the transcript
+- accepting user actions
+- presenting streaming updates
+- reconnecting to the Local Agent Service
 
-Pi remains responsible for its inner reasoning and tool-selection loop.
+The Desktop Client must not be the durable state authority and must not own Pi process lifetime.
 
-The Coordinator should not attempt to reproduce Pi's reasoning loop externally.
+The specification does not require the Local Agent Service, Pi adapter, and Pi process to have three independently recoverable lifecycles.
 
-### Skills remain capabilities, not application workflows
+---
 
-Pi skills are available to Pi in the normal way.
+### 4. Local Agent Service owns product state and Pi process ownership
 
-The desktop application does not require the user to invoke Matt's Skills, Ralph, TDD flows, or another workflow framework before ordinary work can begin.
+The Local Agent Service is a local application service, not a general distributed control plane.
 
-The user interacts with the Agent conversationally.
+For v0.1 it is responsible for:
 
-Skills may influence how Pi completes work, but they are not part of the core product protocol.
+- creating and loading Agents
+- writing the canonical transcript
+- creating and updating Turns
+- starting Pi work
+- translating observable Pi output into product updates
+- publishing state changes to the Desktop Client
+- accepting interrupt requests
+- detecting Pi completion and unexpected exit
+- returning authoritative state after frontend reconnect
+- reading/writing local persistence
 
-### Canonical transcript is application-owned
+It does not need in v0.1:
 
-Conversation history must exist independently from Pi's current model context.
+- generic runtime registration
+- distributed worker discovery
+- worker adoption
+- automatic task replay
+- remote scheduling
+- multi-node orchestration
+- a general workflow engine
 
-The canonical transcript represents the product conversation.
+The name `Local Agent Service` intentionally describes its product responsibility without implying a larger control-plane architecture.
 
-Pi may receive a subset, compacted form, summary, or reconstructed context when necessary.
+---
 
-The application must never delete durable transcript history solely because Pi can no longer fit all historical tokens into its active context.
+### 5. Pi owns intelligence and autonomous work
 
-Messages require stable identity so that reconnects and event replay do not create duplicates.
+Pi is the production Agent Runtime for the first release.
 
-### Context and state are separate concerns
+The first engineering spike must discover Pi's real programmatic integration contract before the surrounding architecture grows further.
 
-The system distinguishes:
+The integration should prefer a programmatic API, SDK, RPC, structured CLI/event mode, or another observable contract over terminal UI scraping.
+
+The minimum useful Pi adapter should support only what the real integration proves necessary:
+
+- start a Turn
+- receive observable streaming/events
+- interrupt active work
+- detect completion/exit
+
+Session continuation, stable session IDs, tool event schemas, or crash recovery must only be added after Pi's actual contract is verified.
+
+`pi-sand` must not implement a second system for:
+
+- planning
+- tool selection
+- skill dispatch
+- task decomposition
+- automatic self-prompting
+- generic retry-the-task loops
+- model context summarization
+- agent workflow orchestration
+
+unless later real product requirements demonstrate that Pi cannot provide the needed behavior itself.
+
+---
+
+### 6. Skills are capabilities, not product workflows
+
+Pi uses its installed skills normally.
+
+The user should not need to know that Matt's Skills, TDD skills, Ralph-style tools, or any other skill package exists in order to submit ordinary work.
+
+A message such as:
+
+> Fix the failing tests.
+
+must be a valid product interaction by itself.
+
+---
+
+### 7. Canonical transcript is application-owned product history
+
+The Local Agent Service owns the durable user-visible transcript.
+
+For v0.1, the transcript needs to represent:
+
+- user-visible user messages
+- user-visible assistant messages
+- enough Turn terminal information to explain completion, failure, or interruption
+- optional user-visible activity records only where the product actually needs them
+
+The transcript is the product record, not an execution checkpoint.
+
+It is not required to persist:
+
+- Pi's private reasoning
+- every internal tool event
+- a replayable execution log
+- the exact model context sent to Pi
+
+Stable message identities must prevent duplicate visible messages after reconnect or event replay.
+
+---
+
+### 8. Product history, Pi working context, and external ground truth are distinct concepts
+
+The design keeps three concepts separate:
 
 **Product history**
 
-The full durable conversation and relevant Agent metadata.
+The durable Agent transcript and product metadata owned by `pi-sand`.
 
-**Agent working context**
+**Pi working context**
 
-The information Pi currently needs to reason about the task.
+The context/session state Pi uses to reason during work.
 
 **External ground truth**
 
-Current filesystem contents, Git state, command output, running process state, and other environment facts.
+The current filesystem, Git state, command output, tests, and process/environment facts.
 
-External ground truth should be re-read when needed rather than permanently trusted from old model context.
+This is a conceptual boundary, not a requirement to build a custom context-management framework.
 
-The product must support long-lived Agents without requiring one infinite Pi context.
+For v0.1, Pi is responsible for its own model/session context. `pi-sand` only guarantees that the user-visible transcript does not disappear because Pi compacts or changes its context.
 
-### One active mutating turn per Agent
+If old model memory conflicts with current external state, the current external state is authoritative.
 
-By default, each Agent processes one primary mutating turn at a time.
+---
 
-This prevents concurrent turns from independently editing the same workspace or producing nondeterministic transcript ordering.
+### 9. Workspace is an associated resource, not a separate architecture layer
 
-Additional input received while the Agent is active must follow an explicit deterministic policy.
+Each Agent has a local workspace association.
 
-The initial implementation may choose either:
+In v0.1, the workspace is simply the directory/environment in which Pi is allowed to operate.
 
-- queued follow-up input
-- supported steering of the current turn
+It is not a separate `Execution Environment` service.
 
-The behavior must remain visible and predictable to the user.
+Docker, VMs, worktrees, clones, or stronger sandboxing may be added later if real safety or concurrency requirements justify them.
 
-Different Agents may operate concurrently.
+The first release must not assume root privileges.
 
-### Runtime lifetime is independent from frontend lifetime
+---
 
-The system must preserve this relationship:
+### 10. v0.1 does not automatically resume crashed in-flight work
 
-**Desktop lifetime ≠ Coordinator lifetime ≠ Agent runtime lifetime**
+Recovery is split into separate product concerns.
 
-Closing a desktop window must not automatically terminate ongoing agent work.
+#### Desktop recovery
 
-The implementation may initially keep the Coordinator and runtime inside related local processes, but component lifetimes must remain logically separable so that later service supervision does not require rewriting product semantics.
+Required.
 
-### Execution environment
+Restarting/reopening the Desktop Client must reconnect to the Local Agent Service and restore the current Agent/transcript view.
 
-Pi must be able to operate within an explicitly associated workspace.
+#### Local Agent Service state recovery
 
-The execution environment initially targets the local Linux machine.
+Required for completed product state.
 
-The architecture should allow stronger isolation later, but Docker or VM isolation is not required for the first release.
+After service restart, completed Agents, Messages, and terminal Turns must restore from persistence.
 
-The product must not assume root privileges.
+An unfinished Turn must be classified explicitly as interrupted or failed unless the real Pi contract later proves safe continuation semantics.
 
-### Worker supervision and failure handling
+#### In-flight execution recovery
 
-Runtime workers must have observable lifecycle state.
+Not required for v0.1.
 
-The system must detect unexpected termination.
+The first release will not attempt to automatically resume, replay, or adopt a partially executed Pi Turn after process/service failure.
 
-Recoverable failures may trigger bounded recovery.
+This avoids unsafe replay of filesystem mutations or tool calls and prevents `pi-sand` from becoming a second orchestration engine before Pi's real continuation semantics are known.
 
-Repeated failures must eventually stop automatic recovery and expose a visible failure state rather than creating an infinite restart loop.
+---
 
-If an existing worker is ever adopted after Coordinator restart, adoption must require sufficient identity evidence to avoid attaching to the wrong process.
+### 11. Pi failure semantics are simple and explicit
 
-The exact identity mechanism is an internal implementation decision.
+If the Pi process for the current Turn exits unexpectedly in v0.1:
 
-The public reconstruction includes explicit supervisor and local-execution lifecycle behavior, which supports treating failure recovery as a first-class requirement rather than an incidental detail.
+`running → failed`
 
-### Persistence
+The transcript and already durable product state remain available.
 
-Application state must be persisted locally.
+The user can manually submit a new request afterward.
 
-SQLite is an acceptable initial choice.
+Automatic retry, bounded task recovery, worker adoption, and semantic replay are future reliability features, not first-release requirements.
 
-The persistence implementation must support crash-safe writes for canonical data.
+---
 
-Frontend components must not read the database directly.
+### 12. Persistence is local and simple
 
-All product behavior goes through application-level interfaces.
+SQLite is the default persistence choice for the first release.
 
-### Frontend communication
+The persistence layer stores product state, not a universal agent event log.
 
-The desktop frontend communicates with the Coordinator through a versioned application protocol.
+The Desktop Client must not read or write SQLite directly.
 
-The protocol should describe semantic operations rather than UI component implementation.
+All product behavior flows through the Local Agent Service.
 
-Examples include:
+Event sourcing is not required.
 
-- creating an Agent
-- listing Agents
-- selecting/retrieving Agent state
-- sending a message
-- interrupting an Agent
-- subscribing to Agent updates
-- receiving transcript updates
-- receiving activity changes
+---
 
-The same semantic protocol should be reusable by future clients such as Telegram.
+### 13. Frontend communication is semantic but not prematurely versioned
 
-### Observable Agent states
+The Desktop Client communicates with the Local Agent Service through a local semantic interface.
 
-The application must expose enough state to distinguish at least:
+The exact IPC mechanism remains open until implementation needs are clearer.
 
-- idle
-- active
-- interrupted
-- failed
+The interface should express product operations such as:
 
-Internally, more detailed states may exist.
+- create/open Agent
+- retrieve Agent snapshot
+- send message/start Turn
+- subscribe to updates
+- interrupt Turn
 
-The UI may also project states such as thinking, executing a tool, reconnecting, or completing when supported by runtime evidence.
+The interface should support request/response, streamed updates, and reconnect.
 
-Exact Grok Bot labels, icons, and animations are determined through later reference capture rather than frozen in this spec.
+It does not need v0.1 protocol version negotiation, backward-compatibility policy, or abstractions designed specifically for future Telegram support.
 
-### Compatibility strategy
+A future remote frontend can be designed around the product model after the local vertical slice is proven.
 
-Compatibility targets user-observable behavior.
+---
+
+### 14. Multiple Agents are a later capability; concurrency is not a v0.1 requirement
+
+The data model should not make future multiple Agents impossible, but v0.1 only needs one active Agent workflow to prove the product.
+
+Concurrent mutating work is explicitly deferred.
+
+When concurrency is eventually introduced, safety must consider workspace ownership, not only per-Agent serialization.
+
+A likely initial rule is:
+
+- at most one active mutating Turn per Agent
+- at most one active mutating owner per workspace
+
+Stronger isolation such as Git worktrees or containers may later relax that rule.
+
+---
+
+### 15. Grok compatibility creates behavioral requirements, not internal components
 
 Reference behavior is classified as:
 
-- Observed
-- Evidence-backed
-- Inferred
-- Unknown
-- Extension
+- **Observed**
+- **Evidence-backed**
+- **Inferred**
+- **Unknown**
+- **Extension**
 
-Only behavior that has sufficient evidence should be treated as a strict Grok Bot compatibility requirement.
+Only sufficiently supported behavior should become a strict compatibility expectation.
 
-Unknown behavior should remain open until investigated.
+Most importantly:
 
-Pi-specific configuration and future Telegram support are extensions rather than claims about original Grok Bot behavior.
+> Compatibility evidence may create a behavioral test, but must not by itself create an internal component.
 
-### UI fidelity strategy
+For example, observing that Grok Bot continues work after its window closes may justify:
 
-The product should eventually approach Grok Bot 0.18 visual and interaction fidelity.
+> Closing the Desktop Client does not cancel an active Turn.
 
-However, the main specification does not freeze:
+It does not justify requiring the same internal Coordinator/Host/Supervisor process topology as Grok Bot.
 
-- component hierarchy
+Pi-specific configuration and future remote frontends are product extensions, not claims about original Grok Bot behavior.
+
+---
+
+### 16. UI fidelity is incremental
+
+The long-term product should approach Grok Bot 0.18 visual and interaction fidelity where practical.
+
+The main specification intentionally does not freeze:
+
+- recovered React/component structure
 - CSS selectors
-- exact recovered component names
-- pixel measurements
-- menu contents that have not yet been observed
-- obscure feature behavior inferred only from recovered symbols
+- internal feature names
+- exact pixel measurements
+- unobserved menus
+- behavior inferred only from symbol names
 
-These details belong in targeted reference investigations when the corresponding surface is implemented.
-
-This prevents the architecture from being prematurely coupled to incomplete reverse-engineering evidence.
+When a UI surface is implemented, its relevant reference behavior should be researched, recorded, implemented, and tested at that time.
 
 ---
 
 ## Testing Decisions
 
-### Primary testing seam
+### Desktop E2E is the compatibility authority, not the dominant test layer
 
-The primary compatibility seam is the desktop application observed as a user would observe it.
+The desktop user experience is the final authority for Grok Bot behavioral compatibility.
 
-The most important tests exercise the real desktop frontend together with the real Coordinator and persistence layers.
+However, most automated tests should run below the full desktop E2E seam because they are faster, more deterministic, and easier to diagnose.
 
-Pi may be replaced by a deterministic test implementation for most automated compatibility scenarios.
+The intended hierarchy is:
 
-The test should ask:
+1. a small number of Desktop E2E compatibility tests
+2. substantial Local Agent Service integration tests with a deterministic Pi fake
+3. targeted unit tests for genuinely rule-heavy logic
+4. a very small real-Pi smoke suite
 
-> Given this visible initial state and this user action, does the application produce the expected visible result?
+Internal tests support development. They do not override verified user-visible behavior.
 
-This keeps compatibility focused on product behavior rather than implementation structure.
+---
 
-### Core desktop E2E scenarios
+### Core v0.1 Desktop E2E scenarios
 
-The first E2E suite must establish a small set of high-value behaviors.
+The initial E2E suite should stay small and cover product-defining behavior.
 
-#### Create and use an Agent
+#### 1. Create/open Agent → send task → stream → complete
 
-A user can create or select an Agent, send a message, observe activity, and receive an assistant response.
+The user can create/open an Agent, submit a task, see a visible running state and streamed assistant output, and reach a completed Turn with one canonical assistant result.
 
-#### Streaming
+#### 2. Transcript survives Desktop restart
 
-A response can update progressively and converge into one canonical final transcript entry.
+After a completed interaction, closing and reopening the Desktop Client restores the same Agent and durable visible transcript.
 
-Reconnect or state synchronization must not duplicate the message.
+#### 3. Close Desktop during work → reopen → same active work/result
 
-#### Agent switching
+A deterministic long-running fake Pi Turn continues while the Desktop Client is closed. Reopening reconnects to the same Agent and shows either the same running Turn or its completed result without duplicate transcript entries.
 
-Agent A may remain active while the user switches to Agent B.
+#### 4. Interrupt → stable interrupted Turn
 
-Events from A must never appear inside B.
+The user interrupts an active Turn and eventually observes a stable interrupted state while already persisted transcript content remains available.
 
-Returning to A shows its latest state.
+#### 5. Pi exits unexpectedly → visible failure
 
-#### Frontend restart
+A controlled Pi failure causes the active Turn to become visibly failed while the Agent and transcript remain usable.
 
-After conversation state exists, closing and reopening the desktop application restores the Agent and its conversation.
+Agent switching/isolation E2E tests belong to the version that introduces multiple Agents rather than v0.1.
 
-#### Background execution
+---
 
-An active Agent does not stop merely because its desktop UI is no longer visible.
+### Local Agent Service integration tests carry most behavioral coverage
 
-#### Coordinator recovery
+Using a deterministic narrow Pi fake, integration tests should cover behavior such as:
 
-Persisted Agents and completed conversation state survive Coordinator restart.
+- Agent creation/persistence
+- Turn creation and state transitions
+- user message persistence before execution starts
+- streamed assistant update/finalization
+- stable message identity
+- reconnect without duplicate messages
+- transcript ordering
+- interrupt races
+- unexpected Pi exit
+- completed state restoration after service restart
+- unfinished Turn classification after service restart
+- workspace association persistence
 
-The desktop application eventually converges to the restored canonical state.
+These tests should use the public Local Agent Service interface rather than internal implementation details where practical.
 
-#### Runtime failure
+---
 
-When a controlled Pi runtime fails, the user observes either successful recovery or an explicit failure state.
+### Deterministic Pi fake must stay narrow
 
-Conversation history remains intact.
+The deterministic test runtime exists to test the Local Agent Service against the same small contract used for Pi.
 
-#### Interruption
+It should simulate only behavior the real Pi integration actually exposes and the product actually needs, such as:
 
-The user can interrupt an active Agent and eventually observe a stable non-running state.
+- streamed output
+- completion
+- delay/long-running work
+- interrupt
+- abnormal exit
 
-### Deterministic Agent Runtime for tests
+It must not become a speculative universal `AgentRuntime` abstraction for hypothetical future providers.
 
-Most E2E tests should not depend on a live language model.
+---
 
-A deterministic Pi-compatible test runtime should simulate:
+### Unit tests are targeted
 
-- immediate completion
-- streaming
-- long-running activity
-- tool activity
-- failure
-- interruption
-- worker termination
-- recovery
+Unit tests are appropriate for compact logic whose behavior is difficult to diagnose through integration tests, such as:
 
-This keeps CI reliable while preserving the real application boundary.
+- storage invariants
+- Turn state-transition validation
+- Pi-event-to-product-event translation
+- message deduplication rules
 
-A smaller smoke suite should exercise the real Pi integration.
+Trivial implementation details do not require extensive unit coverage.
 
-### Reference-based compatibility testing
+---
 
-When implementing a Grok Bot surface, reference behavior should be captured before declaring fidelity complete.
+### Real Pi smoke tests are small and outcome-focused
 
-A reference case should record:
+A small smoke suite should prove the production Pi integration works end to end.
 
-- initial state
+Tests should avoid asserting exact assistant language.
+
+A useful smoke scenario is a controlled fixture repository where Pi receives a concrete task and produces an externally verifiable result, such as modifying a known file or making a known test pass, followed by a terminal Turn state.
+
+---
+
+### Reference-based compatibility testing is incremental
+
+When implementing a Grok-compatible desktop interaction, capture only the relevant behavior needed for that feature.
+
+A reference record may contain:
+
+- initial visible state
 - user action
 - observed result
 - confidence classification
-- relevant screenshot or recording where useful
+- screenshot/recording when useful
 
-Only behavior that matters to the current feature needs to be captured.
+The project does not need a complete reverse-engineered Grok UI specification before implementation begins.
 
-The project does not need a complete reverse-engineered UI specification before development can begin.
-
-### Lower-level testing
-
-Fast lower-level tests should exist where they make failures easier to diagnose.
-
-Useful areas include:
-
-- Coordinator state transitions
-- transcript ordering and deduplication
-- persistence
-- Pi adapter behavior
-- worker supervision
-- runtime recovery
-- protocol serialization
-
-These tests support implementation.
-
-They do not replace desktop behavior as the compatibility authority.
-
-### Test philosophy
-
-Tests should assert external behavior rather than private structure.
-
-Tests should not require:
-
-- specific internal class names
-- specific reconstructed module names
-- React component hierarchy
-- private database layout
-- recovered CSS selectors
-
-If the implementation can be internally redesigned while preserving the same user-visible behavior, the compatibility suite should continue to pass.
+Tests should assert external behavior, not recovered component structure, selectors, or internal process topology.
 
 ---
 
 ## Out of Scope
 
-The first major implementation does not require:
+The following are explicitly out of scope for v0.1:
 
-- recovering Anysphere's original source code
-- reproducing original source filenames, comments, or variable names
-- forking the reconstructed Grok Bot repository
-- copying reconstructed implementation code
-- exact proprietary branding
-- redistribution of proprietary application assets
-- complete pixel parity before the runtime is functional
-- every obscure Grok Bot feature before the core Agent experience works
+- multiple concurrently working Agents
+- concurrent mutation of a shared workspace
+- workspace scheduler/locking beyond what a single active workflow requires
+- automatic Pi task recovery after crash
+- automatic retry-the-task loops
+- worker adoption after Local Agent Service restart
+- execution replay/checkpointing
+- preserving an in-flight Pi execution across service crash
+- distributed workers
+- generic runtime/provider abstraction beyond the real Pi contract
+- a separate Execution Environment service
+- Docker/VM sandbox as a requirement
+- custom model-context framework
+- custom memory system
+- custom planning/orchestration layer
+- mandatory Matt's Skills
+- mandatory Ralph-style workflow
+- exhaustive tool activity UI
+- Linux service-manager integration as a product prerequisite
+- Telegram or other remote frontend
+- public/versioned remote protocol
 - macOS support
 - Windows support
 - multi-user SaaS
-- billing
-- enterprise administration
-- distributed worker clusters
-- local GPU model hosting
-- mandatory Docker isolation
-- mandatory Matt's Skills
-- mandatory Ralph-style looping
-- a custom Pi skill system
-- full Telegram support in the initial desktop milestone
-- reproducing behavior that cannot currently be established from evidence
+- billing or team administration
+- exact Grok internal process topology
+- recovery of Anysphere's original source code
+- forking or copying the reconstructed Grok Bot implementation
+- redistribution of proprietary Grok Bot assets
+- complete pixel-perfect Grok parity before the core product works
+- reproducing unknown behavior without evidence
 
-Features discovered during reference research may be added later without changing the core architecture if they fit the Agent/Coordinator model.
+Future versions may add these capabilities when a demonstrated product need justifies the complexity.
 
 ---
 
 ## Further Notes
 
-### Clean-room principle
+### v0.1 Definition of Done
 
-The reference product answers:
+v0.1 has one core promise:
 
-> What should the user observe?
+> A user can give one persistent Pi Agent a real development task, close the Desktop Client, and later return to the same Agent with the correct transcript and either the current running state or the completed result.
 
-It should not automatically answer:
+v0.1 is complete when:
 
-> How should we implement it?
+- the application runs on Linux
+- the user can create/open a durable Agent
+- the Agent has a persistent local workspace association
+- the user can send one natural-language task
+- real Pi performs the work using its normal tools and skills
+- visible assistant output can stream into the transcript
+- the active Turn has a simple visible running state
+- the transcript is durable across Desktop restart
+- closing the Desktop Client does not cancel the active Turn
+- reopening the Desktop Client reconnects to the same Agent and authoritative Turn state
+- the user can interrupt an active Turn
+- unexpected Pi exit makes the Turn visibly failed
+- completed product state survives Local Agent Service restart
+- an unfinished Turn after Local Agent Service restart becomes explicitly interrupted/failed rather than silently resumed
+- the five core Desktop E2E scenarios pass with a deterministic Pi fake
+- Local Agent Service integration tests cover persistence, streaming, reconnect, interruption, and failure semantics
+- at least one smoke scenario proves the real Pi integration
 
-Behavioral evidence may shape compatibility tests.
+This release does not need concurrent Agents, automatic recovery, remote access, or a generic agent platform.
 
-Our internal architecture remains independently designed.
-
-### Product principle
-
-The product abstraction is the Agent.
-
-The user should not have to think about:
-
-- processes
-- sessions
-- model context windows
-- orchestrators
-- supervisors
-- workflow engines
-
-Those exist only to support the experience:
-
-> Send the Agent a message and let it work.
-
-### Pi principle
-
-Pi provides the intelligence and tool-using agent behavior.
-
-The surrounding system provides persistence, lifecycle, synchronization, recovery, and product UX.
-
-A useful conceptual distinction is:
-
-**Pi does the work.**
-
-**The application makes the worker persistent and reliable.**
-
-### Fidelity principle
-
-Compatibility should be developed incrementally.
-
-When implementing an interaction:
-
-1. Determine what Grok Bot does when practical.
-2. Record the behavior.
-3. Implement the same observable semantics.
-4. Add an E2E scenario.
-5. Move on.
-
-Do not reverse-engineer the entire application before building anything.
+---
 
 ### Recommended implementation progression
 
-The expected development sequence is:
+#### Step 1 — Real Pi integration spike
 
-1. Desktop shell with deterministic fake runtime.
-2. Persistent Agent model and canonical transcript.
-3. Send, stream, and complete a basic turn.
-4. Real Pi runtime integration.
-5. Agent switching and concurrent Agents.
-6. Durable restart behavior.
-7. Background runtime lifecycle.
-8. Interruption and failure recovery.
-9. Activity/tool presentation.
-10. Iterative Grok Bot UI fidelity work.
-11. Additional compatibility surfaces.
-12. Optional Telegram frontend.
+Before building the application architecture in depth, prove the real Pi contract with a small local experiment.
 
-Each stage should leave a runnable application rather than producing disconnected infrastructure components.
+Determine what is actually available for:
 
-### First major release definition of done
+- programmatic task submission
+- streamed messages/events
+- tool activity events
+- session identity
+- interruption
+- abnormal exit
+- continuation/resume semantics
 
-The first major release is complete when:
+This real contract should shape the adapter and recovery design.
 
-- the application runs on Linux
-- the user can create and reopen persistent Agents
-- Pi is the production Agent Runtime
-- sending one natural-language message starts work without requiring workflow commands
-- responses stream into a durable transcript
-- Pi can use its normal tools and installed skills
-- switching Agents does not terminate active work
-- multiple Agents can operate independently
-- closing and reopening the frontend does not erase conversation state
-- active work can continue independently from frontend visibility
-- Coordinator restart preserves durable completed state
-- interruption works
-- runtime failure is handled visibly
-- logs are sufficient to investigate unattended failures
-- core desktop E2E scenarios pass
-- at least one smoke scenario uses real Pi
-- implemented Grok Bot compatibility behavior is supported by documented reference evidence
-- the reconstructed Grok Bot repository is not required as source code, build input, or runtime dependency
+#### Step 2 — First real product vertical slice
 
-At that point the product should already feel like a persistent Grok-style desktop Agent rather than a Pi chat wrapper.
+Build the smallest real lifetime architecture:
 
-Further releases can focus increasingly on interaction and visual fidelity.
+**Desktop Client → Local Agent Service → Pi**
+
+The Local Agent Service may initially use temporary/in-memory product state during this slice.
+
+Prove:
+
+- Desktop can send a task
+- Service owns Pi
+- output streams back to Desktop
+- closing Desktop does not kill Service/Pi
+
+#### Step 3 — Add durable Agent, Turn, and transcript
+
+Introduce SQLite and persist:
+
+- Agent
+- workspace association
+- Messages
+- Turn state
+
+Prove Desktop restart restores product history.
+
+#### Step 4 — Reconnect to background work
+
+Reopening Desktop should retrieve an authoritative snapshot and subscribe to current changes.
+
+Prove a deterministic long-running Turn survives Desktop closure and reconnection without duplicate transcript entries.
+
+At this point, the core product idea is already real.
+
+#### Step 5 — Interrupt and failure visibility
+
+Add:
+
+- user interrupt
+- unexpected Pi exit → failed Turn
+- explicit unfinished-Turn classification after service restart
+
+Do not add automatic recovery.
+
+This is the v0.1 release boundary.
+
+#### Step 6 — Multiple Agents
+
+After v0.1 is useful, add multiple durable Agents and Agent switching.
+
+Concurrency can remain globally restricted initially.
+
+#### Step 7 — Safe concurrency
+
+If concurrency becomes valuable, introduce workspace ownership rules and then consider isolation mechanisms such as worktrees or containers.
+
+#### Step 8 — Service restart/recovery research
+
+Only after observing the real Pi integration and real failure modes should the project decide whether it needs:
+
+- resumable Pi sessions
+- bounded process restart
+- automatic continuation
+- worker adoption
+
+These are reliability hardening decisions, not assumptions embedded in v0.1.
+
+#### Step 9 — Additional Grok fidelity and remote access
+
+Once the persistent local Agent product is stable, expand:
+
+- richer desktop fidelity
+- tool/activity presentation
+- additional Grok reference behaviors
+- Linux service-manager integration
+- optional remote frontend such as Telegram
+
+---
+
+### Architectural principles that should remain stable
+
+The project should preserve these principles even while implementation details change:
+
+1. **Agent identity outlives Pi process/session identity.**
+
+2. **The Desktop Client does not own active work.**
+
+3. **The product transcript is durable and application-owned.**
+
+4. **Pi owns reasoning, tools, skills, and the autonomous inner work loop.**
+
+5. **Product history, Pi working context, and external ground truth are conceptually different.**
+
+6. **Frontend behavior goes through a semantic application boundary rather than direct database access.**
+
+7. **Grok compatibility is behavioral, not architectural.**
+
+8. **Compatibility evidence may justify a behavioral test but cannot, by itself, justify an internal component.**
+
+9. **Each development stage should leave a runnable product vertical slice rather than disconnected infrastructure.**
+
+These principles define `pi-sand` more strongly than any specific process topology or framework choice.
+
+---
+
+### Open implementation questions
+
+The following should remain open until real implementation evidence answers them:
+
+- What exact programmatic Pi integration mode should the Local Agent Service use?
+- Does Pi expose a stable session identity?
+- Can a Pi session be resumed safely after process interruption?
+- Which Pi tool/activity events are stable enough to expose in the product?
+- How frequently should streaming assistant content be durably checkpointed?
+- Which activity records, if any, belong permanently in the transcript?
+- Should one Agent eventually map to one long Pi session or multiple sessions over its lifetime?
+- Which local IPC mechanism best fits Desktop ↔ Local Agent Service communication?
+- When multiple Agents arrive, should shared-workspace safety use locks, worktrees, clones, containers, or another mechanism?
+- After real failure data exists, is automatic runtime recovery actually worth its complexity?
+
+These questions must not block v0.1 unless the real Pi spike proves one of them is necessary for the core vertical slice.
