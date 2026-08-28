@@ -13,6 +13,7 @@ export class AgentService {
     this.piFactory = piFactory;
     this.events = new EventEmitter();
     this.executions = new Map();
+    this.interruptingTurns = new Set();
     this.db.exec(`
       PRAGMA foreign_keys = ON;
       CREATE TABLE IF NOT EXISTS agents (
@@ -95,11 +96,20 @@ export class AgentService {
     if (!turn || turn.status !== "running") return this.getAgent(agentId);
     const execution = this.executions.get(turnId);
     if (!execution) { this.finishTurn(agentId, turnId, "interrupted"); return this.getAgent(agentId); }
-    execution.abort();
+    if (this.interruptingTurns.has(turnId)) return this.getAgent(agentId);
+    this.interruptingTurns.add(turnId);
+    try {
+      execution.abort();
+    } catch (error) {
+      this.interruptingTurns.delete(turnId);
+      throw error;
+    }
     return this.getAgent(agentId);
   }
 
   handlePiEvent(agentId, turnId, event) {
+    const turn = this.db.prepare("SELECT status FROM turns WHERE id = ? AND agent_id = ?").get(turnId, agentId);
+    if (!turn || turn.status !== "running") return;
     if (event.type === "session" && event.id) this.db.prepare("UPDATE turns SET pi_session_id = ? WHERE id = ?").run(event.id, turnId);
     if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
       this.upsertAssistant(agentId, turnId, event.assistantMessageEvent.delta);
@@ -111,13 +121,15 @@ export class AgentService {
     }
     if (event.type === "agent_end" || event.type === "agent_settled") {
       const assistant = this.db.prepare("SELECT content FROM messages WHERE turn_id = ? AND role = 'assistant'").get(turnId);
-      this.finishTurn(agentId, turnId, "completed", assistant?.content || "");
+      this.finishTurn(agentId, turnId, this.interruptingTurns.has(turnId) ? "interrupted" : "completed", assistant?.content || "");
     }
   }
 
   handlePiClose(agentId, turnId, { code = null, signal = null } = {}) {
     const turn = this.db.prepare("SELECT status FROM turns WHERE id = ?").get(turnId);
-    if (turn?.status === "running") this.finishTurn(agentId, turnId, "failed", signal ? `Pi exited with ${signal}` : `Pi exited with code ${code}`);
+    if (turn?.status === "running") {
+      this.finishTurn(agentId, turnId, this.interruptingTurns.has(turnId) ? "interrupted" : "failed", signal ? `Pi exited with ${signal}` : `Pi exited with code ${code}`);
+    }
   }
 
   upsertAssistant(agentId, turnId, delta) {
@@ -142,6 +154,7 @@ export class AgentService {
     this.db.prepare("UPDATE turns SET status = ?, finished_at = ? WHERE id = ?").run(status, finishedAt, turnId);
     const execution = this.executions.get(turnId);
     this.executions.delete(turnId);
+    this.interruptingTurns.delete(turnId);
     if (execution?.close) execution.close();
     this.publish(agentId, "turn_finished", { turnId, status, detail });
   }

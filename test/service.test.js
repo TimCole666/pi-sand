@@ -115,6 +115,63 @@ test("a reconnect observes the same active Turn and later completion without tra
   }, piFactory);
 });
 
+test("interrupt preserves the durable transcript and settles a running Turn once", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-sand-interrupt-"));
+  const path = join(directory, "state.sqlite");
+  try {
+    const first = new AgentService({ dbPath: path, piFactory: fakePi });
+    const agent = first.createAgent({ name: "Interruptible", workspace: "/tmp/project" });
+    const updates = [];
+    const unsubscribe = first.subscribe(agent.agent.id, (event) => updates.push(event));
+    const turn = first.sendMessage(agent.agent.id, "Stop this work");
+    first.interrupt(agent.agent.id, turn.id);
+    await new Promise((resolve) => setImmediate(resolve));
+    unsubscribe();
+
+    const interrupted = first.getAgent(agent.agent.id);
+    assert.equal(interrupted.state, "idle");
+    assert.equal(interrupted.turns[0].status, "interrupted");
+    assert.deepEqual(interrupted.messages.map((message) => message.role), ["user", "assistant"]);
+    assert.equal(interrupted.messages[1].content, "Stopped.");
+    assert.equal(updates.filter((event) => event.type === "turn_finished").length, 1);
+    assert.equal(updates.find((event) => event.type === "turn_finished").status, "interrupted");
+    first.close();
+
+    const reopened = new AgentService({ dbPath: path, piFactory: fakePi });
+    const restored = reopened.getAgent(agent.agent.id);
+    assert.equal(restored.turns[0].status, "interrupted");
+    assert.equal(restored.messages.length, 2);
+    reopened.close();
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("interrupt wins its completion race without a second terminal update", async () => {
+  let execution;
+  const piFactory = ({ onEvent, onClose }) => {
+    execution = {
+      prompt() { onEvent({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Working" } }); },
+      abort() { onClose({ code: 0, signal: null }); },
+      close() {},
+      completeLate() { onEvent({ type: "agent_end" }); onClose({ code: 0, signal: null }); },
+    };
+    return execution;
+  };
+  await withService(async (service) => {
+    const agent = service.createAgent({ workspace: "/tmp/project" });
+    const updates = [];
+    const unsubscribe = service.subscribe(agent.agent.id, (event) => updates.push(event));
+    const turn = service.sendMessage(agent.agent.id, "Do work");
+    service.interrupt(agent.agent.id, turn.id);
+    execution.completeLate();
+    unsubscribe();
+
+    const snapshot = service.getAgent(agent.agent.id);
+    assert.equal(snapshot.turns[0].status, "interrupted");
+    assert.equal(snapshot.messages[1].content, "Working");
+    assert.equal(updates.filter((event) => event.type === "turn_finished").length, 1);
+  }, piFactory);
+});
+
 test("reopening the service restores completed Agent, Turn, and transcript", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-sand-restart-"));
   const path = join(directory, "state.sqlite");
