@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { spawnPi } from "./pi.js";
 
@@ -13,6 +13,18 @@ function now() { return new Date().toISOString(); }
 export function defaultDatabasePath() {
   const dataHome = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
   return join(dataHome, "pi-sand", "pi-sand.sqlite");
+}
+
+function canonicalWorkspace(workspace) {
+  if (typeof workspace !== "string" || !workspace.trim()) throw new Error("workspace is required");
+  const expanded = workspace === "~" ? homedir() : workspace.startsWith("~/") ? join(homedir(), workspace.slice(2)) : workspace;
+  try {
+    const canonical = realpathSync.native(resolve(expanded));
+    if (!statSync(canonical).isDirectory()) throw new Error("not a directory");
+    return canonical;
+  } catch {
+    throw new Error("workspace must exist and be a directory");
+  }
 }
 
 export class AgentService {
@@ -46,12 +58,27 @@ export class AgentService {
       CREATE INDEX IF NOT EXISTS turns_agent_started ON turns(agent_id, started_at);
     `);
     this.ensureTerminalDetailColumn();
+    this.canonicalizeStoredWorkspaces();
     this.reconcileUnfinishedTurns();
   }
 
   ensureTerminalDetailColumn() {
     const columns = this.db.prepare("PRAGMA table_info(turns)").all();
     if (!columns.some((column) => column.name === "terminal_detail")) this.db.exec("ALTER TABLE turns ADD COLUMN terminal_detail TEXT");
+  }
+
+  // Older databases can hold a pre-canonical workspace spelling. Normalize
+  // valid paths eagerly, but leave an unavailable legacy workspace visible so
+  // its owner gets a clear error when attempting to start work.
+  canonicalizeStoredWorkspaces() {
+    const agents = this.db.prepare("SELECT id, workspace FROM agents").all();
+    const update = this.db.prepare("UPDATE agents SET workspace = ?, updated_at = ? WHERE id = ?");
+    for (const agent of agents) {
+      try {
+        const workspace = canonicalWorkspace(agent.workspace);
+        if (workspace !== agent.workspace) update.run(workspace, now(), agent.id);
+      } catch { /* A legacy association is not silently replaced or deleted. */ }
+    }
   }
 
   // Pi execution cannot safely be resumed or adopted after this service starts.
@@ -76,9 +103,9 @@ export class AgentService {
   }
 
   createAgent({ name = "Agent", workspace }) {
-    if (typeof workspace !== "string" || !workspace.trim()) throw new Error("workspace is required");
+    const canonicalWorkspacePath = canonicalWorkspace(workspace);
     const id = randomUUID(); const timestamp = now();
-    this.db.prepare("INSERT INTO agents VALUES (?, ?, ?, ?, ?)").run(id, name.trim() || "Agent", workspace, timestamp, timestamp);
+    this.db.prepare("INSERT INTO agents VALUES (?, ?, ?, ?, ?)").run(id, name.trim() || "Agent", canonicalWorkspacePath, timestamp, timestamp);
     return this.getAgent(id);
   }
 
@@ -108,8 +135,19 @@ export class AgentService {
     if (this.closed) throw new Error("service is closed");
     const agent = this.db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
     if (!agent) throw new Error("agent not found");
-    const active = this.db.prepare("SELECT id FROM turns WHERE status = 'running'").get();
-    if (active) throw new Error("v0.1 supports only one active workflow at a time");
+    const workspace = canonicalWorkspace(agent.workspace);
+    if (workspace !== agent.workspace) {
+      this.db.prepare("UPDATE agents SET workspace = ?, updated_at = ? WHERE id = ?").run(workspace, now(), agentId);
+      agent.workspace = workspace;
+    }
+    const activeForAgent = this.db.prepare("SELECT id FROM turns WHERE agent_id = ? AND status = 'running'").get(agentId);
+    if (activeForAgent) throw new Error("Agent already has a running Turn.");
+    const activeForWorkspace = this.db.prepare(`
+      SELECT turns.id FROM turns
+      JOIN agents ON agents.id = turns.agent_id
+      WHERE turns.status = 'running' AND agents.workspace = ?
+    `).get(workspace);
+    if (activeForWorkspace) throw new Error("This workspace already has a running Turn.");
     if (typeof message !== "string" || !message.trim()) throw new Error("message is required");
     const turnId = randomUUID(); const timestamp = now(); const messageId = randomUUID();
     this.db.exec("BEGIN");

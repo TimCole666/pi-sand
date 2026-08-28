@@ -130,13 +130,15 @@ This keeps the first release focused on a reliable persistent product shell arou
 
 23. As a user, I want the application to work on a normal Linux laptop so that I can build and use it without dedicated server hardware.
 
-### Later Product Stories
+### Multi-Agent Product Stories
 
 24. As a user, I want multiple durable Agents so that I can keep separate project contexts.
 
 25. As a user, I want to switch between Agents while preserving their state so that I can work across projects.
 
-26. As a user, I eventually want Agents in different workspaces to run concurrently when it is safe to do so.
+26. As a user, I want Agents in different workspaces to run concurrently while Agents sharing a workspace remain safe.
+
+### Later Product Stories
 
 27. As a user, I eventually want richer tool/activity presentation so that I can inspect what an Agent did without reading raw logs.
 
@@ -432,20 +434,17 @@ A future remote frontend can be designed around the product model after the loca
 
 ---
 
-### 14. Multiple Agents are a later capability; concurrency is not a v0.1 requirement
+### 14. Multi-Agent execution uses per-Agent and canonical-workspace exclusion
 
-The data model should not make future multiple Agents impossible, but v0.1 only needs one active Agent workflow to prove the product.
+Independent Agents in independent canonical workspaces may run concurrently. The Local Agent Service enforces these invariants without a scheduler, queue, worker pool, or second orchestration layer around Pi:
 
-Concurrent mutating work is explicitly deferred.
+- an Agent has at most one running Turn;
+- a canonical workspace has at most one running Turn; and
+- terminal handling, Desktop disconnect/reconnect, and service-restart classification are scoped to the affected Agent and Turn.
 
-When concurrency is eventually introduced, safety must consider workspace ownership, not only per-Agent serialization.
+Creating an Agent expands `~`, resolves relative and normalized paths, follows filesystem aliases, verifies the result exists and is a directory, and persists that canonical filesystem path. Consequently, paths that name the same real directory share the same workspace exclusion.
 
-A likely initial rule is:
-
-- at most one active mutating Turn per Agent
-- at most one active mutating owner per workspace
-
-Stronger isolation such as Git worktrees or containers may later relax that rule.
+Pi remains responsible for reasoning, retries, tools, skills, and its autonomous inner loop. pi-sand does not replay, adopt, or automatically recover a persisted running Turn after service restart; it explicitly classifies that Turn as interrupted or failed.
 
 ---
 
@@ -535,7 +534,7 @@ The user interrupts an active Turn and eventually observes a stable interrupted 
 
 A controlled Pi failure causes the active Turn to become visibly failed while the Agent and transcript remain usable.
 
-Agent switching/isolation E2E tests belong to the version that introduces multiple Agents rather than v0.1.
+Multi-Agent service and Desktop E2E tests cover independent concurrent workspaces, shared-workspace exclusion, and independent reconnect behavior.
 
 ---
 
@@ -621,9 +620,8 @@ Tests should assert external behavior, not recovered component structure, select
 
 The following are explicitly out of scope for v0.1:
 
-- multiple concurrently working Agents
-- concurrent mutation of a shared workspace
-- workspace scheduler/locking beyond what a single active workflow requires
+- concurrent mutation of a shared canonical workspace
+- workspace scheduler, queue, worker pool, priorities, or generic runtime abstraction
 - automatic Pi task recovery after crash
 - automatic retry-the-task loops
 - worker adoption after Local Agent Service restart
@@ -685,7 +683,7 @@ v0.1 is complete when:
 - Local Agent Service integration tests cover persistence, streaming, reconnect, interruption, and failure semantics
 - at least one smoke scenario proves the real Pi integration
 
-This release does not need concurrent Agents, automatic recovery, remote access, or a generic agent platform.
+This release supports independent concurrent Agents only when their canonical workspaces differ; it does not need automatic recovery, remote access, or a generic agent platform.
 
 ---
 
@@ -753,15 +751,13 @@ Do not add automatic recovery.
 
 This is the v0.1 release boundary.
 
-#### Step 6 — Multiple Agents
+#### Step 6 — Multiple Agents and safe concurrency
 
-After v0.1 is useful, add multiple durable Agents and Agent switching.
+Add multiple durable Agents and Agent switching with one running Turn per Agent and per canonical workspace. Independent workspaces may run concurrently; a shared workspace remains excluded. Keep this as direct service enforcement, not a scheduler or worker system.
 
-Concurrency can remain globally restricted initially.
+#### Step 7 — Stronger workspace isolation
 
-#### Step 7 — Safe concurrency
-
-If concurrency becomes valuable, introduce workspace ownership rules and then consider isolation mechanisms such as worktrees or containers.
+If later product needs require shared-project parallelism, evaluate explicit isolation mechanisms such as worktrees or containers rather than allowing same-workspace concurrent mutation.
 
 #### Step 8 — Service restart/recovery research
 
