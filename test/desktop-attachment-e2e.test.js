@@ -117,9 +117,8 @@ function attachmentPi(capture) {
   return ({ onEvent, onClose }) => ({
     prompt({ message }) {
       capture.push(message);
-      const match = message.match(/- [^:]+: (.+)$/m);
-      const path = match?.[1];
-      const contents = path && readFileSync(path, "utf8");
+      const paths = [...message.matchAll(/- [^:]+: (.+)$/gm)].map((match) => match[1]);
+      const contents = paths.map((path) => readFileSync(path, "utf8")).join(" | ");
       onEvent({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: `Read attachment: ${contents}` } });
       onEvent({ type: "message_end", message: { role: "assistant", content: `Read attachment: ${contents}`, stopReason: "stop" } });
       onEvent({ type: "agent_settled" });
@@ -136,11 +135,12 @@ async function browserState(browser) {
     chips: [...document.querySelectorAll("#attachments .attachment-chip")].map((element) => element.textContent.trim()),
     messages: [...document.querySelectorAll("#messages .message")].map((element) => element.textContent.trim()),
     status: document.querySelector("#status")?.textContent || "",
+    feedback: document.querySelector("#attachment-feedback")?.textContent || "",
     selectedAgent: localStorage.getItem("pi-sand-agent"),
   })`);
 }
 
-test("Actual Chromium Desktop picker stages, restores, sends, and reopens one attachment", { skip: !supportedDesktop || process.env.PI_SAND_RUN_ATTACHMENT_E2E !== "1" }, async () => {
+test("Actual Chromium Desktop picker, drop, and paste inputs share one durable pipeline", { skip: !supportedDesktop }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-sand-desktop-attachment-"));
   const profile = join(directory, "chromium-profile");
   const file = join(directory, "notes.txt");
@@ -162,7 +162,48 @@ test("Actual Chromium Desktop picker stages, restores, sends, and reopens one at
     await eventually(() => browser.evaluate(`localStorage.getItem("pi-sand-agent") === ${JSON.stringify(agent.id)}`), "Desktop did not select the new Agent");
 
     await browser.setFileInput(file);
-    await eventually(async () => (await browserState(browser)).chips.length === 1, "Desktop did not render staged attachment");
+    await eventually(async () => (await browserState(browser)).chips.length === 1, "Desktop did not render staged picker attachment");
+    await browser.evaluate(`(() => {
+      const target = document.querySelector("#send");
+      const transfer = new DataTransfer();
+      transfer.items.add(new File(["drop survives restart"], "drop.txt", { type: "text/plain" }));
+      const event = new Event("drop", { bubbles: true, cancelable: true });
+      Object.defineProperty(event, "dataTransfer", { value: transfer });
+      target.dispatchEvent(event);
+    })()`);
+    await eventually(async () => (await browserState(browser)).chips.length === 2, "Desktop did not render staged drop attachment");
+    await browser.evaluate(`(() => {
+      const target = document.querySelector("#send");
+      const transfer = new DataTransfer();
+      transfer.items.add(new File(["paste survives restart"], "paste.txt", { type: "text/plain" }));
+      const event = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(event, "clipboardData", { value: transfer });
+      target.dispatchEvent(event);
+    })()`);
+    await eventually(async () => (await browserState(browser)).chips.length === 3, "Desktop did not render staged pasted attachment");
+    await browser.evaluate(`(() => {
+      const target = document.querySelector("#send");
+      const transfer = new DataTransfer();
+      for (let i = 0; i < 4; i += 1) transfer.items.add(new File(["too many"], "extra-" + i + ".txt"));
+      const event = new Event("drop", { bubbles: true, cancelable: true });
+      Object.defineProperty(event, "dataTransfer", { value: transfer });
+      target.dispatchEvent(event);
+    })()`);
+    await eventually(async () => (await browserState(browser)).feedback.includes("up to 6"), "Desktop did not show deterministic attachment count feedback");
+    const beforeRemove = await browserState(browser);
+    assert.deepEqual(beforeRemove.chips, ["notes.txt ×", "drop.txt ×", "paste.txt ×"]);
+    await browser.evaluate("document.querySelector('#attachments .attachment-chip button').click()");
+    await eventually(async () => (await browserState(browser)).chips.length === 2, "Desktop did not remove the selected draft attachment");
+    assert.equal(service.db.prepare("SELECT state FROM attachments WHERE filename = 'notes.txt'").get().state, "released");
+    await browser.evaluate(`(() => {
+      const target = document.querySelector("#send");
+      const transfer = new DataTransfer();
+      transfer.items.add(new File(["replacement survives restart"], "replacement.txt", { type: "text/plain" }));
+      const event = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(event, "clipboardData", { value: transfer });
+      target.dispatchEvent(event);
+    })()`);
+    await eventually(async () => (await browserState(browser)).chips.length === 3, "Desktop did not stage a replacement pasted attachment");
     await browser.evaluate(`(() => {
       const input = document.querySelector("#message");
       input.value = "Read the attached notes";
@@ -170,32 +211,41 @@ test("Actual Chromium Desktop picker stages, restores, sends, and reopens one at
     })()`);
     const beforeClose = await browserState(browser);
     assert.equal(beforeClose.draft, "Read the attached notes");
-    assert.deepEqual(beforeClose.chips, ["notes.txt ×"]);
-    const staged = service.db.prepare("SELECT id, state, storage_path AS storagePath FROM attachments").get();
-    assert.equal(staged.state, "staged");
-    assert.equal(readFileSync(staged.storagePath, "utf8"), "attachment survives restart");
+    assert.deepEqual(beforeClose.chips, ["drop.txt ×", "paste.txt ×", "replacement.txt ×"]);
+    const staged = service.db.prepare("SELECT id, state, storage_path AS storagePath FROM attachments WHERE state = 'staged' ORDER BY filename").all();
+    assert.equal(staged.length, 3);
+    assert.ok(staged.every((attachment) => readFileSync(attachment.storagePath, "utf8").includes("survives restart")));
 
     await browser.close();
     browser = null;
     browser = await launchChromium(base, profile);
     await eventually(async () => {
       const state = await browserState(browser);
-      return state.selectedAgent === agent.id && state.draft === "Read the attached notes" && state.chips.length === 1;
+      return state.selectedAgent === agent.id && state.draft === "Read the attached notes" && state.chips.length === 3;
     }, "reopened Desktop did not restore the live attachment draft");
 
     await browser.evaluate('document.querySelector("#send").requestSubmit()');
     await eventually(() => service.getAgent(agent.id).turns[0]?.status === "completed", "attachment Turn did not complete");
     assert.equal(prompts.length, 1);
-    assert.match(prompts[0], /notes\.txt/);
+    assert.match(prompts[0], /drop\.txt/);
+    assert.match(prompts[0], /paste\.txt/);
+    assert.match(prompts[0], /replacement\.txt/);
     const committed = service.getAgent(agent.id);
-    assert.equal(committed.messages[0].attachments[0].id, staged.id);
-    assert.equal(service.attachmentSnapshot(staged.id).state, "committed");
-    await eventually(async () => (await browserState(browser)).messages.some((message) => message.includes("Read attachment: attachment survives restart")), "Desktop did not render the attachment result");
+    assert.deepEqual(committed.messages[0].attachments.map((attachment) => attachment.filename), ["drop.txt", "paste.txt", "replacement.txt"]);
+    const attachmentRows = service.db.prepare("SELECT id, state FROM attachments WHERE state = 'committed'").all();
+    assert.equal(attachmentRows.length, 3);
+    assert.ok(attachmentRows.every((attachment) => service.attachmentSnapshot(attachment.id).state === "committed"));
+    await eventually(async () => (await browserState(browser)).messages.some((message) => message.includes("Read attachment: drop survives restart")), "Desktop did not render the attachment result");
 
     await browser.close();
     browser = null;
     browser = await launchChromium(base, profile);
-    await eventually(async () => (await browserState(browser)).messages.some((message) => message.includes("📎 notes.txt")), "reopened transcript did not retain the sent attachment");
+    await eventually(async () => {
+      const messages = (await browserState(browser)).messages;
+      return messages.some((message) => message.includes("📎 drop.txt"))
+        && messages.some((message) => message.includes("📎 paste.txt"))
+        && messages.some((message) => message.includes("📎 replacement.txt"));
+    }, "reopened transcript did not retain the sent attachments");
   } finally {
     if (browser) await browser.close().catch(() => {});
     service.close();

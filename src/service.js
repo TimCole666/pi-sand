@@ -335,6 +335,16 @@ export class AgentService {
     return row ? { ...row } : null;
   }
 
+  listAttachments(agentId, { state = "staged" } = {}) {
+    if (!this.db.prepare("SELECT id FROM agents WHERE id = ?").get(agentId)) throw new Error("agent not found");
+    if (!new Set(["staged", "committed", "released"]).has(state)) throw new Error("attachment state is invalid");
+    return this.db.prepare(`
+      SELECT id, filename, content_type AS contentType, byte_size AS byteSize,
+             state, created_at AS createdAt, updated_at AS updatedAt
+      FROM attachments WHERE agent_id = ? AND state = ? ORDER BY created_at, id
+    `).all(agentId, state);
+  }
+
   attachmentForSend(agentId, id) {
     const row = this.db.prepare(`
       SELECT id, agent_id AS agentId, filename, content_type AS contentType,

@@ -133,6 +133,9 @@ export function createAgentServer(service) {
         const snapshot = service.getAgent(agentId);
         return snapshot ? json(res, 200, snapshot) : json(res, 404, { error: "agent not found" });
       }
+      if (req.method === "GET" && parts[3] === "attachments" && parts.length === 4) {
+        return json(res, 200, service.listAttachments(agentId));
+      }
       if (req.method === "POST" && parts[3] === "attachments" && parts.length === 4) {
         return json(res, 201, { attachment: service.stageAttachment(agentId, await attachmentBody(req)) });
       }

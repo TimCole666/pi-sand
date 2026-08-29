@@ -110,3 +110,22 @@ test("post-commit Pi failure preserves the durable attachment relationship", asy
     assert.equal(service.attachmentSnapshot(attachment.id).state, "committed");
   }, withAttachmentPi([], { fail: true }));
 });
+
+test("lists live draft attachments and rejects an oversized staged file deterministically", async () => {
+  await withService(async (service) => {
+    const agent = service.createAgent({ workspace: "/tmp" });
+    const attachment = service.stageAttachment(agent.agent.id, {
+      filename: "draft.txt",
+      contentType: "text/plain",
+      bytes: Buffer.from("live draft"),
+    });
+    assert.deepEqual(service.listAttachments(agent.agent.id).map(({ id, filename, state }) => ({ id, filename, state })), [
+      { id: attachment.id, filename: "draft.txt", state: "staged" },
+    ]);
+    assert.throws(
+      () => service.stageAttachment(agent.agent.id, { filename: "too-large.bin", bytes: Buffer.alloc(25 * 1024 * 1024 + 1) }),
+      /attachment exceeds the 25 MB limit/,
+    );
+    assert.equal(service.listAttachments(agent.agent.id).length, 1);
+  }, withAttachmentPi([]));
+});
