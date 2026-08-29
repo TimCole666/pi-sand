@@ -16,6 +16,12 @@ Primary reference repository:
 
 `b-nnett/grok-bot-0.18-reconstructed`
 
+Reference repository commit:
+
+`a9f633e09d49a85829b8236331b9e21f7e612634`
+
+All reconstruction file paths and source anchors in this ledger resolve against that pinned commit unless explicitly stated otherwise.
+
 Primary upstream release represented by that repository:
 
 - Product: Grok Bot
@@ -24,7 +30,7 @@ Primary upstream release represented by that repository:
 - pinned macOS DMG SHA-256: `a253ccd8aab01e083f9812a0264354c5034d8ba7f0610bbb557e82ae77d203eb`
 - pinned original `app.asar` SHA-256: `6665408168466f9cacc6087e917890c17f59d2e2e9c2404a5c4a59ad79c1de58`
 
-Source: `b-nnett/grok-bot-0.18-reconstructed/PROVENANCE.md`.
+Source: `b-nnett/grok-bot-0.18-reconstructed/PROVENANCE.md` at the pinned reference commit.
 
 The reference repository explicitly states that the shipped renderer contained optimized production bundles rather than the authored frontend source or original source maps. Its readable `frontend/` tree is therefore a partial evidence-backed reconstruction, not Anysphere's original source.
 
@@ -223,7 +229,7 @@ The reconstructed default placeholder includes `Ask anything, or drop a file.`; 
 
 **Evidence strength:** Evidence-backed
 
-The recovered draft store is explicitly client-persisted and keyed per Agent, including draft/recovery state and restoration across client lifecycle.
+The recovered draft store is explicitly client-persisted and keyed per Agent, including draft/recovery state and restoration across client lifecycle. Attachment references are part of the persisted draft object.
 
 Anchor:
 
@@ -241,7 +247,7 @@ Anchor:
 
 - `frontend/src/recovered/features/conversation/workspace/desktop.ts`
 
-The upstream flow supports the existence of a staged → committed lifecycle, but pi-sand's storage layout and Pi handoff are independent product design choices governed by `SPEC-v0.1.md`.
+The upstream flow supports the existence of a staged → committed lifecycle, but pi-sand's storage layout, staged-byte lifetime, and Pi handoff are independent product design choices governed by `SPEC-v0.1.md`.
 
 ## Working/activity evidence
 
@@ -311,11 +317,13 @@ These are reconstruction-project extensions, not Grok Bot 0.18 parity requiremen
 The following important product behaviors come from pi-sand's own product/architecture goals rather than a strict Grok parity claim:
 
 - Desktop close does not cancel active work while the Local Agent Service remains alive;
+- reconnect reconciliation preserves authoritative transcript identity/order without duplication;
 - one Agent has at most one running Turn;
 - one canonical workspace has at most one running Turn;
 - independent Agents in independent canonical workspaces may run concurrently;
 - workspace identity uses canonical real filesystem paths;
 - service restart explicitly terminalizes persisted running Turns without replay/adoption;
+- attachment durability and Pi handoff use a pi-sand-owned product contract;
 - Pi remains the reasoning/runtime owner while pi-sand owns durable product state.
 
 Whether any of these resembles upstream behavior is secondary; their release status comes from `SPEC-v0.1.md`, not this evidence ledger.
