@@ -1,281 +1,384 @@
-# pi-sand v0.1 Productization Specification
+# pi-sand v0.1 — Pi-native Grok Bot 0.18 Compatibility Specification
 
 Status: **Draft**
 
 This document defines the first release target for `pi-sand`.
 
-The current `main` branch is a **pre-v0.1 foundation**: it has already proven the Pi-native lifetime, persistence, reconnect, failure, interruption, and safe multi-Agent concurrency model, but it is still developer-operated software rather than a product that is comfortable to use every day.
+The current `main` branch is a **pre-v0.1 foundation**. It already proves durable Agent/Turn identity, SQLite persistence, Pi execution, Desktop reconnect, explicit failure/interruption semantics, canonical workspace safety, and concurrent work across independent workspaces.
 
-The first published/tagged `v0.1.0` should therefore mean **the first dogfood-ready product**, not merely the first successful architectural vertical slice.
+That foundation is necessary, but it is not yet the product target.
 
-Where older milestone wording in `SPEC.md` calls the current foundation “v0.1”, treat that as historical implementation-stage language. The stable architectural principles remain valid; this document defines the actual release boundary.
+The v0.1 product target is:
+
+> **Build a Linux-first, Pi-native reimplementation of the user-visible Grok Bot 0.18 experience.**
+
+The reference is the public `b-nnett/grok-bot-0.18-reconstructed` project and, through it, the checksum-pinned publicly shipped Grok Bot 0.18.0 application artifacts. The reconstruction is used as a behavioral/evidence oracle, not as an architecture template and not as source to copy.
+
+The first published/tagged `v0.1.0` should mean: **the first version that feels recognizably like Grok Bot for the core Agent conversation journey, while using Pi as the intelligence/runtime underneath.**
 
 ---
 
-## 1. Problem Statement
+## 1. Reference Basis and Provenance
 
-The core architecture is already real:
+### Primary reference
+
+The primary reference repository is:
+
+`b-nnett/grok-bot-0.18-reconstructed`
+
+Its `PROVENANCE.md` identifies the upstream product as Grok Bot 0.18.0 (`com.anysphere.sand`) and records checksum-pinned macOS and Windows release artifacts.
+
+The repository explicitly states that it is **not Anysphere's original monorepo**. The distributed renderer contained optimized production bundles rather than authored frontend source or original source maps. Its readable `frontend/` tree is therefore a partial evidence-backed reconstruction.
+
+The reference project's own rule is useful for pi-sand as well:
+
+> The immutable release is the product specification; recovered source may only express behavior supported by inspectable artifact evidence.
+
+For pi-sand, this becomes:
+
+> **Desktop-observable Grok Bot behavior is the compatibility authority. Reconstructed code and internal contracts are evidence supporting that behavior, not architecture requirements.**
+
+### Evidence classes
+
+Every Grok-derived compatibility claim should be classified as one of:
+
+- **Observed** — repeatably visible in the shipped application or preserved artifact.
+- **Evidence-backed** — supported by shipped strings/assets/CSS/DOM signatures, emitted code, source-path markers, IPC/RPC contracts, or a high-confidence reconstruction anchor.
+- **Inferred** — plausible from evidence but not sufficiently verified to be a strict compatibility requirement.
+- **Unknown** — evidence is currently insufficient.
+- **Extension** — intentional pi-sand behavior that is useful but is not claimed as Grok Bot 0.18 compatibility.
+
+Only **Observed** and sufficiently strong **Evidence-backed** behaviors should become strict v0.1 compatibility requirements.
+
+Inferred or Unknown behavior must not be invented merely to make the implementation look complete.
+
+### Reference repository extensions are not upstream requirements
+
+The reconstruction repository also contains experiments added by its author, including an inference router, routed Claude/Codex/OpenRouter support, local usage tracking, and an optional local Docker sandbox.
+
+Those are **not automatically Grok Bot 0.18 compatibility requirements** for pi-sand.
+
+The reference must always be read with provenance in mind: distinguish preserved/reconstructed upstream behavior from later project extensions.
+
+### Independent implementation rule
+
+pi-sand must not copy reconstructed implementation code, proprietary assets, or recovered source organization into the product.
+
+Reference evidence may produce:
+
+- a behavioral requirement;
+- a reference note;
+- a screenshot/DOM/state record;
+- an externally observable test.
+
+Reference evidence must not, by itself, produce an internal `Coordinator`, `Host`, `Supervisor`, `LocalExec`, provider router, or any other component merely because such a name exists in the reconstruction.
+
+Detailed artifact anchors belong in a dedicated reference/evidence document and focused tests. This specification defines product behavior and invariants.
+
+---
+
+## 2. Product Goal
+
+The goal is not "make the current Pi demo more operational."
+
+The goal is:
+
+> **Open pi-sand and feel like you opened Grok Bot — with Pi underneath.**
+
+A normal v0.1 journey should be:
+
+```text
+launch pi-sand
+      ↓
+see a Grok-style Agent/chat shell
+      ↓
+select or create a persistent Agent
+      ↓
+see the Agent identity + conversation workspace
+      ↓
+type a normal request in the composer
+      ↓
+send
+      ↓
+Agent visibly enters a working state
+      ↓
+assistant output/activity updates in the conversation
+      ↓
+switch to another Agent while the first continues
+      ↓
+optionally start independent work there
+      ↓
+close the Desktop
+      ↓
+work continues under the Local Agent Service
+      ↓
+reopen
+      ↓
+return to authoritative Agent state and durable result
+```
+
+The v0.1 release is not complete merely because the backend can perform this journey. The **Desktop interaction model and visible states** are part of the product contract.
+
+---
+
+## 3. Architecture and Ownership
+
+pi-sand keeps the smallest Pi-native architecture that can reproduce the required behavior:
 
 ```text
 Desktop Client
       ↓
 Local Agent Service
    ├── SQLite
-   └── Pi
-        ↓
-    Workspace
-```
-
-The current implementation proves durable Agents, Turns, transcript history, Desktop reconnect, explicit interruption/failure semantics, and concurrent work for independent canonical workspaces.
-
-What is missing is **product operability**.
-
-A normal user still has to understand details such as:
-
-- repository directories;
-- `npm start`;
-- environment variables;
-- ports;
-- Pi executable paths;
-- service/process lifetime;
-- low-level failures such as `spawn ... ENOENT`.
-
-That means the architecture is useful, but the product is still a half-finished development surface.
-
-The v0.1 goal is **not more agent intelligence**. Pi already owns intelligence. The goal is to make the existing Pi-native architecture feel like one coherent local desktop product.
-
-### v0.1 core promise
-
-> On a normal Linux laptop, the user can open pi-sand without keeping a terminal alive, open a persistent Agent, give it a natural-language task, switch away or close the Desktop, and later return to an accurate status and durable result. Independent Agents in independent workspaces may work concurrently, and common setup/runtime failures are presented as actionable product states rather than process-level accidents.
-
-The normal journey should feel like:
-
-```text
-open pi-sand
-    ↓
-choose Agent
-    ↓
-send task
-    ↓
-Pi works in background
-    ↓
-switch Agent / close UI / leave
-    ↓
-notification or later reopen
-    ↓
-correct durable result
-```
-
----
-
-## 2. Stable Architecture and Ownership
-
-v0.1 keeps the architecture intentionally small:
-
-```text
-Desktop Client
-      ↓
-Local Agent Service
-   ├── SQLite
-   ├── local product configuration
    └── Pi process(es)
-          ↓
-      Workspace(s)
+        ↓
+    Workspace(s)
 ```
 
 The following principles remain authoritative:
 
 1. **Agent identity outlives Pi process/session identity.**
-2. **Agent ≠ Turn.**
-3. **Agent ≠ Desktop window/tab.**
-4. **Transcript ≠ Pi model context.**
-5. **Desktop lifetime ≠ Local Agent Service lifetime.**
-6. **Pi owns reasoning, planning, retries inside its autonomous loop, tool selection, skills, and model context.**
-7. **pi-sand owns durable Agent identity, durable Turn state, transcript, workspace association, routing, presentation, and Pi process ownership.**
-8. **Persistent identity does not require infinite model context.**
-9. **Desktop-observable behavior is compatibility authority; internal contracts support it, not define it.**
-10. **Compatibility evidence may create a behavioral test, but must not by itself create an internal component.**
+2. **Agent ≠ Pi process/session.**
+3. **Agent ≠ Turn.**
+4. **Agent ≠ Desktop window/tab.**
+5. **Transcript ≠ Pi model context.**
+6. **Desktop lifetime ≠ Local Agent Service lifetime.**
+7. **Pi owns reasoning, planning, tool selection, skills, model context, retries inside its autonomous loop, and the autonomous inner work loop.**
+8. **pi-sand owns durable Agent identity, durable Turn/product state, transcript, workspace association, routing, presentation, reconnect, and Pi process ownership.**
+9. **Persistent identity does not require infinite model context.**
+10. **External filesystem/Git/test state is ground truth when it conflicts with stale model context.**
 
-`pi-sand` must not introduce a second planner, workflow engine, scheduler, or generic agent-runtime platform around Pi.
+Pi is the brain/worker. pi-sand is the persistent product shell and control boundary.
 
----
-
-## 3. Product Shape
-
-v0.1 is **Linux-first, local-first, and single-user**.
-
-The Desktop Client may remain a browser-served local UI. Native Electron/Tauri packaging is not required for v0.1.
-
-The product requirement is instead that opening and using pi-sand no longer requires keeping a development terminal attached to the Local Agent Service.
-
-The Local Agent Service is a long-lived per-user process. On Linux, `systemd --user` is the reference service-manager path.
-
-The service remains loopback-only by default. Remote access is a later concern.
+The reconstructed Grok Bot topology may contain Electron main, host, coordinator, local-exec, protocol, renderer, remote-box, or other boundaries. pi-sand does not reproduce those boundaries unless a user-visible requirement independently makes them necessary.
 
 ---
 
-## 4. User Stories
+## 4. v0.1 Compatibility Surface
 
-### Setup and launch
+v0.1 intentionally targets the **core Grok Bot Agent conversation experience**, not every recovered feature in the reference application.
 
-1. As a user, I want to install/start pi-sand without root so that it fits a normal Linux workstation.
-2. As a user, I want the Local Agent Service to run independently of my terminal so that closing a shell does not stop active work.
-3. As a user, I want pi-sand to remember its normal local configuration so that I do not have to export `PI_BIN`, `PI_SAND_DB`, or `PORT` every time.
-4. As a user, I want opening pi-sand to connect to or start the local service so that process supervision is not part of normal use.
-5. As a user, I want a clear setup state when Pi is unavailable or incompatible so that I know what to fix.
+### 4.1 Desktop application shell — Required
 
-### Agents and workspaces
+**Compatibility target: Observed / Evidence-backed**
 
-6. As a user, I want to create an Agent with `~`, relative, normalized, absolute, or symlinked workspace paths and have pi-sand store one canonical real directory.
-7. As a user, I want invalid, missing, or non-directory workspaces rejected before a Turn starts.
-8. As a user, I want the Agent list to show which Agents are currently working so that background work is visible without opening every conversation.
-9. As a user, I want Agents in different canonical workspaces to run concurrently.
-10. As a user, I want one Agent and one canonical workspace to have at most one running Turn so that overlapping mutation stays safe.
-11. As a user, I want switching Agents to have no effect on their active Pi work.
+The product must present a dedicated desktop application surface or equivalent installed-app window. The implementation may use web technology internally; Electron is not required simply because Grok Bot used Electron.
 
-### Turn experience
+The shell must provide two persistent conceptual areas:
 
-12. As a user, I want to submit an ordinary natural-language request without selecting a workflow or skill.
-13. As a user, I want a running Turn to show meaningful progress rather than only a frozen transcript.
-14. As a user, I want progress presentation to come from Pi's observable events rather than invented reasoning or a second orchestration layer.
-15. As a user, I want to interrupt the active Turn for one Agent without affecting other Agents.
-16. As a user, I want completion, failure, and interruption to remain durable and understandable after reopening the UI.
+```text
+Agent/chat roster | selected conversation workspace
+```
 
-### Background work
+A plain developer page with a `<select>` dropdown and transcript is not sufficient for v0.1 compatibility.
 
-17. As a user, I want closing the Desktop Client to leave active work running under the Local Agent Service.
-18. As a user, I want reopening to recover authoritative state without duplicate or reordered transcript content.
-19. As a user, I want a local notification when unattended work reaches a useful terminal state so that I do not have to poll the UI.
-20. As a user, I want notification failure to never change the Turn result.
+The roster/shell must support:
 
-### Failures
+- seeing saved Agents/chats;
+- selecting an Agent;
+- keeping selection stable while the Agent state updates;
+- a useful empty state;
+- a connecting/loading state;
+- an unreachable/error state that communicates that saved Agents have not disappeared;
+- explicit retry/reconnect behavior;
+- reconnect feedback while the product is attempting to regain the local service.
 
-21. As a user, I want missing Pi, unsupported Pi, invalid workspace, workspace contention, prompt rejection, and unexpected Pi exit to produce distinct actionable product errors.
-22. As a user, I want a service restart to restore durable state and explicitly classify every previously running Turn without replay or adoption.
-23. As a user, I want one Agent's failure to leave other independent running Agents untouched.
+The reconstructed roster contains evidence-backed states corresponding to "Connecting to your computer…", "No saved agents yet.", "Can’t reach your computer", retry, and reconnecting. pi-sand should preserve the semantics; exact wording may be adapted for a local Linux service when literal upstream copy would be misleading.
 
----
+### 4.2 Agent identity and conversation header — Required
 
-## 5. Product Requirements
+**Compatibility target: Evidence-backed**
 
-### 5.1 Background Local Agent Service
+Opening an Agent must establish a clear selected-Agent identity rather than exposing only raw workspace metadata.
 
-Normal use must not depend on an attached `npm start` terminal.
+The core header should present:
 
-The reference Linux integration is a per-user systemd service:
+- Agent identity/name;
+- an avatar or equivalent identity marker;
+- an explicit visible working state while the Agent is active;
+- space for Agent/conversation controls whose inclusion is separately evidence-backed.
 
-- no root requirement;
-- runs with the user's permissions;
-- may start automatically for the user or on demand through a small launcher/install path;
-- closing the Desktop Client or terminal does not stop the service;
-- stopping/restarting the service is explicit;
-- only one Local Agent Service instance may own a given pi-sand SQLite database at a time.
+The reconstructed `chat-header.tsx` directly projects Agent identity and shows the copy `Working` when `isRunning` is true. It also contains evidence for Agent settings/details and a Computer control. The identity + working semantics are v0.1 requirements; richer settings/Computer behavior is separately scoped below.
 
-The exact unit-file layout is an implementation detail. The user-visible invariant is that pi-sand behaves like a persistent desktop service, not a terminal child process.
+### 4.3 Conversation transcript — Required
 
-### 5.2 Product configuration
+**Compatibility target: Observed / Evidence-backed, implemented independently**
 
-Normal operation must not require repeated shell environment setup.
+The selected Agent must expose a durable, readable conversation workspace rather than a process log.
 
-pi-sand should persist user-level configuration under normal XDG locations.
+The transcript must:
 
-At minimum, the product needs durable configuration for values that cannot be discovered reliably, such as an explicitly selected Pi executable path when necessary.
+- distinguish user and assistant messages clearly;
+- stream visible assistant output during active work when Pi emits usable output;
+- preserve canonical message order;
+- preserve stable message identity across reconnect;
+- avoid duplicate transcript content after reconnect or snapshot replacement;
+- keep completed, failed, and interrupted conversation history available after reopening;
+- remain separate from Pi private reasoning, exact model context, and raw RPC/event logs.
 
-Environment variables such as `PI_BIN`, `PI_SAND_DB`, and `PORT` may remain development/override mechanisms, but they are not the primary v0.1 UX.
+Activity/tool presentation may be interleaved visually with the conversation only when it is user-visible product information. It must not turn the canonical transcript into a replayable execution journal.
 
-### 5.3 Pi health and preflight
+### 4.4 Composer — Required core, staged fidelity
 
-The Local Agent Service must remain usable enough to show product state even when Pi is unavailable.
+**Compatibility target: Evidence-backed**
 
-Before starting work, pi-sand must validate the concrete Pi integration requirements it depends on:
+The reconstructed Grok Bot composer is substantially richer than a basic textarea. Evidence in `composer.tsx`, `desktop.ts`, `draft-state.ts`, and `conversation-evidence.json` supports a structured composer with persistent draft semantics, attachments, reply context, rich-text input, send controls, drag/drop/paste behavior, and voice-input UI.
 
-- the Pi executable can be resolved and executed;
-- the Pi version supports the required RPC lifecycle contract;
-- the selected Agent workspace still exists and is a directory.
+v0.1 requires the following **core composer parity**:
 
-The current compatibility baseline is Pi 0.84.2 or newer unless later contract research demonstrates a different minimum.
+- natural-language input without choosing a workflow or skill;
+- a visually distinct bottom composer integrated with the conversation workspace;
+- Enter/submit behavior appropriate for a chat composer;
+- explicit send action;
+- per-Agent draft preservation when switching away and back;
+- file attachment through a picker;
+- drag/drop attachment;
+- pasted-file attachment when supported by the Desktop platform;
+- visible attachment chips/previews with removal;
+- actionable attachment failure/limit feedback;
+- reply context when replying to an existing message is exposed by the surrounding conversation UI.
 
-Pi authentication, model, and provider configuration remain Pi's responsibility. pi-sand should surface failures from that configuration clearly, but must not build a duplicate provider/model configuration platform.
+The upstream-style placeholder semantics include "Ask anything, or drop a file." Exact copy is not required, but the input must communicate both ordinary prompting and attachment support.
 
-The normal UI must not expose raw `spawn ... ENOENT` as the primary explanation when pi-sand can identify a more useful cause.
+**Evidence-backed but deferred from the v0.1 release gate:**
 
-### 5.4 Workspace trust and canonicalization
+- voice recording/dictation;
+- complete rich mention/provider behavior;
+- every attachment media specialization;
+- exact animation/glyph transitions.
 
-Agent creation is an explicit trust decision: the user selects a local directory in which Pi may use its normal tools, extensions, skills, shell commands, and filesystem access under the user's OS privileges.
+These are real reference surfaces, but they are not allowed to delay the first core Grok-compatible release unless later reference testing shows they are essential to the primary journey.
 
-pi-sand does not provide a sandbox in v0.1.
+### 4.5 Working state and activity — Required
 
-Workspace identity is the canonical real filesystem path. Creation must:
+**Compatibility target: Observed / Evidence-backed behavior; Pi-native implementation**
 
-1. expand supported home notation such as `~` and `~/...`;
-2. resolve relative and normalized paths;
-3. follow filesystem aliases with realpath semantics;
-4. verify the result exists and is a directory;
-5. persist the canonical path.
+A running Agent must look visibly alive.
 
-Equivalent paths must collide for workspace exclusion.
+`Pi is working…` as a single static line is an acceptable fallback but is not the final v0.1 target when stable Pi events provide better information.
 
-### 5.5 Agent overview
+The Desktop should expose coarse user-visible activity derived from Pi's actual observable contract, for example:
 
-The Desktop must provide an Agent overview useful for background work.
-
-For each Agent, the user should be able to see at least:
-
-- Agent name;
-- workspace identity in a human-readable form;
-- whether a Turn is currently running;
-- the most recent terminal Turn outcome when useful;
-- enough recency information to distinguish current from stale work.
-
-Agent state must not incorrectly treat `completed`, `failed`, or `interrupted` as the long-lived Agent's identity. Those remain Turn outcomes.
-
-### 5.6 Conversation and Turn controls
-
-Opening an Agent shows its durable transcript and authoritative current Turn state.
-
-While a Turn is running:
-
-- the UI shows that Pi is working;
-- sending another Turn to the same Agent is rejected or disabled clearly;
-- interruption is available;
-- switching to another Agent does not affect it.
-
-Terminal Turn details remain durable so a reopened Desktop can explain failure or interruption without depending on transient logs.
-
-### 5.7 Activity visibility
-
-v0.1 adds **minimal useful activity presentation**, not an exhaustive execution debugger.
-
-The Desktop should present coarse current/recent activity derived from stable observable Pi events, such as tool execution or another user-visible work phase when the concrete Pi RPC contract exposes it reliably.
+- working/running;
+- tool use or command activity where Pi exposes a stable event;
+- waiting for user input when that state exists;
+- completion;
+- failure;
+- interruption.
 
 Rules:
 
-- do not expose private chain-of-thought or reasoning;
-- do not invent a plan that Pi did not emit;
-- do not dump raw RPC JSON into the normal UI;
-- do not require every activity event to become part of the durable transcript;
-- transcript messages remain distinct from activity/progress records;
-- if an event is not stable enough to present reliably, omit it rather than create speculative product semantics.
+- never expose private chain-of-thought;
+- do not invent a plan Pi did not emit;
+- do not build a second reasoning timeline around Pi;
+- do not dump raw Pi RPC JSON into the normal UI;
+- activity records are not automatically durable transcript messages;
+- uncertain Pi events should be omitted rather than assigned speculative product semantics.
 
-A simple `Pi is working…` fallback remains valid when richer stable activity is unavailable.
+The reconstructed header model carries `isRunning`, `isComposingMessage`, `awaitingUserResponse`, and `currentActivity`, which is evidence that the upstream visible experience distinguishes more than a terminal completed/not-completed state. pi-sand should reproduce the useful observable semantics that Pi can support reliably.
 
-### 5.8 Local notifications
+### 4.6 Stop / interrupt — Required
 
-When a Turn reaches a terminal outcome while the user is not actively observing that Agent, pi-sand should emit a best-effort local desktop notification.
+**Compatibility + existing pi-sand behavior**
 
-At minimum, notifications should distinguish:
+The user must be able to stop the selected Agent's active work.
 
-- completed;
-- failed;
-- interrupted when the interruption was not initiated from the currently visible UI.
+Stopping one Agent must not affect another independent active Agent.
 
-Notification delivery is presentation only. Failure to notify must never mutate a Turn, retry work, or change transcript state.
+Already-persisted transcript content remains available after interruption, and the final interrupted state remains durable after Desktop reopen.
 
-The notification mechanism should be replaceable/fakeable in deterministic tests rather than coupled directly to orchestration logic.
+The product control should be expressed as a normal chat/working control, not as a process-management operation.
 
-### 5.9 Service restart and crash semantics
+### 4.7 Agent switching and background work — Required
 
-v0.1 preserves the conservative reliability rule already proven by the foundation.
+**Compatibility target + pi-sand foundation**
+
+Switching the selected conversation must not stop work in the conversation being left.
+
+The user should be able to:
+
+```text
+Agent A working
+   ↓ switch
+Agent B conversation
+   ↓
+Agent A still working
+   ↓ switch back
+Agent A current state/result
+```
+
+Desktop selection is presentation state. It is not Agent/process ownership.
+
+### 4.8 Desktop close/reopen — Required
+
+**Compatibility target + existing pi-sand foundation**
+
+Closing the Desktop application must not cancel an active Turn merely because the UI disappeared.
+
+Reopening must:
+
+- reconnect to the Local Agent Service;
+- restore the last useful selected-Agent state when possible;
+- retrieve authoritative Agent/transcript/Turn state;
+- subscribe to subsequent updates;
+- avoid duplicate or reordered visible content;
+- show either the same running Turn or its durable terminal result.
+
+This requirement justifies the Desktop/Local Agent Service lifetime boundary. It does not justify copying Grok Bot's internal process topology.
+
+### 4.9 Multiple Agents and workspace safety — Required pi-sand extension
+
+**Extension**
+
+Independent Agents in independent canonical workspaces may run concurrently.
+
+The current safety invariant remains:
+
+- one Agent has at most one running Turn;
+- one canonical workspace has at most one running Turn;
+- different Agents in different canonical workspaces may run concurrently;
+- different Agents pointing to the same canonical workspace may not mutate it concurrently.
+
+Workspace creation expands `~`, resolves relative/normalized paths, follows realpath/symlink aliases, verifies the directory exists, and persists the canonical path.
+
+This behavior is a deliberate Linux/Pi-native safety extension. It must fit the Grok-like shell without becoming a scheduler, task queue, worker pool, or second orchestration system.
+
+### 4.10 Connectivity and recoverable shell states — Required
+
+**Compatibility target: Evidence-backed semantics**
+
+The reference roster explicitly models loading, reconnecting, unreachable/error, empty, and hidden-only states.
+
+For the v0.1 core shell, pi-sand must at least implement:
+
+- connecting/loading;
+- ready;
+- empty;
+- temporarily disconnected/reconnecting;
+- unreachable/error with Retry;
+- Agent data preserved across transient Desktop/service connectivity loss.
+
+A connectivity error must not visually imply that durable Agents were deleted.
+
+The exact transport is not part of compatibility. HTTP/SSE, local IPC, WebSocket, or another local mechanism may be used if the observable behavior is correct.
+
+### 4.11 Failures — Required
+
+**Compatibility behavior + Pi-native extension details**
+
+Common failure modes must appear as product states, not raw implementation accidents.
+
+At minimum:
+
+- invalid/missing workspace;
+- workspace already active elsewhere;
+- Pi executable unavailable;
+- Pi prompt rejection;
+- Pi-reported terminal error;
+- unexpected Pi process exit;
+- Local Agent Service unavailable/reconnecting.
+
+A user should not have to interpret `spawn ... ENOENT`, SQLite errors, or raw RPC envelopes when pi-sand can provide a more useful explanation.
 
 If Pi exits unexpectedly before settlement:
 
@@ -283,221 +386,345 @@ If Pi exits unexpectedly before settlement:
 running → failed
 ```
 
-If the Local Agent Service restarts with persisted `running` Turns:
-
-- every such Turn becomes explicitly terminal according to the established product rule;
-- the old request is not replayed;
-- the old Pi process is not adopted;
-- automatic recovery/resume is not attempted.
-
-One Turn's terminal handling must remain scoped to that Turn and must not close or mutate another Agent's Pi execution.
-
-### 5.10 Host sleep
-
-v0.1 guarantees background execution only while the Linux user session/machine is actually running.
-
-System suspend pauses local execution and may disrupt network/model calls. Automatic sleep inhibition is not required for v0.1.
-
-If the product later adds sleep inhibition, it must be explicit and battery-conscious rather than silently changing host power policy.
-
-### 5.11 Security boundary
-
-v0.1 remains local and single-user:
-
-- Local Agent Service binds to loopback by default;
-- no public remote API is required;
-- no root privileges are required;
-- Pi, tools, and extensions run with the current user's privileges;
-- workspace selection is the primary product trust grant;
-- pi-sand does not claim sandbox isolation.
+If the Local Agent Service restarts with persisted `running` Turns, every such Turn is explicitly terminalized according to the established rule. v0.1 does not replay the request, adopt the old worker, or silently pretend the work is still active.
 
 ---
 
-## 6. Persistence and Process Ownership
+## 5. Reference-Supported Surfaces Deferred from the v0.1 Gate
 
-SQLite remains the canonical local product store.
+The reconstructed renderer exposes a much larger product surface than the core conversation journey. The feature tree includes areas such as account/access, Agent info, automations, Computer, hidden chats, onboarding, org chart, permissions, plugins, settings, shared-room/group behavior, feedback, deep links, and more.
 
-It stores durable product state such as:
+These are not denied as real Grok Bot surfaces. They are simply not all release blockers for the first Pi-native compatibility slice.
 
-- Agents;
+### Deferred until independently mapped and prioritized
+
+- full Agent settings/details parity;
+- Computer/screen surface beyond the minimum activity experience;
+- hidden-chat management;
+- shared rooms/groups/org-chart behavior;
+- automations;
+- complete plugin/MCP presentation parity;
+- reactions;
+- voice input/dictation;
+- full onboarding flow;
+- account/team/cloud-access flows;
+- remote-box semantics;
+- deep links;
+- feedback/reporting UI;
+- exact keyboard shortcut/command-palette coverage;
+- all menus/context menus;
+- exact animation timing and micro-interactions.
+
+When one of these surfaces is implemented, its behavior must first be mapped to explicit evidence rather than guessed from a recovered file or feature name.
+
+---
+
+## 6. Product Operability Exists to Support Compatibility
+
+Operational work is necessary, but it is not the product direction.
+
+v0.1 needs enough product operability that the Grok-style journey is real:
+
+- the Local Agent Service survives Desktop closure;
+- normal launch does not require supervising `npm start` in a terminal;
+- the Desktop can find/connect to the local service;
+- Pi availability is checked early enough to show an actionable state;
+- normal local configuration does not require retyping environment variables on every launch;
+- workspace validation happens before execution starts.
+
+The specific Linux service manager, launcher implementation, config file format, and packaging technology are implementation decisions unless they affect observable behavior.
+
+`systemd --user` is a reasonable Linux implementation option, not a defining Grok Bot feature and not an architecture goal by itself.
+
+---
+
+## 7. Visual Fidelity Policy
+
+The v0.1 core shell should be **recognizably Grok Bot-inspired at first glance**, not merely functionally equivalent.
+
+For the required compatibility surface, implementation should intentionally study and reproduce evidence-backed aspects such as:
+
+- two-area roster + conversation composition;
+- information hierarchy;
+- conversation header structure;
+- composer placement and control grouping;
+- working/status visibility;
+- empty/loading/error/reconnect state placement;
+- message density and conversation rhythm;
+- attachment/reply presentation where implemented.
+
+However:
+
+- do not redistribute proprietary assets without rights to do so;
+- do not fabricate missing measurements or controls;
+- do not copy reconstructed CSS/component source;
+- do not make exact pixel identity a blocker where the evidence is incomplete or platform typography differs;
+- do not reproduce macOS-only chrome merely for architectural mimicry on Linux.
+
+The rule is **high fidelity for verified core behavior and composition, conservative treatment of unknown details**.
+
+---
+
+## 8. Persistence and Context
+
+SQLite remains the canonical local product store for pi-sand.
+
+It stores product state such as:
+
+- Agent identity and user-visible metadata;
 - canonical workspace association;
 - Turns and terminal detail;
-- transcript messages;
-- user-visible metadata required for restore.
+- canonical transcript messages;
+- draft/composer state when required for visible compatibility;
+- other durable UI/product metadata needed to restore the observed experience.
 
-The product does not need to persist Pi private reasoning, exact model context, every tool event, or a replayable execution journal.
+It does not need to store:
 
-A database belongs to one Local Agent Service owner at a time. Multi-process shared-database execution is outside the v0.1 runtime model.
+- Pi private reasoning;
+- exact model context;
+- every tool event;
+- an execution replay journal;
+- a second custom memory representation of the Agent.
 
----
+The concepts remain distinct:
 
-## 7. Testing Decisions
+```text
+product history       = durable pi-sand state
+Pi working context    = Pi-owned reasoning/session context
+external ground truth = filesystem / Git / commands / tests
+```
 
-The existing hierarchy remains:
-
-1. a small number of Desktop E2E product tests;
-2. substantial Local Agent Service integration tests with deterministic Pi/notifier fakes;
-3. targeted unit tests for rule-heavy logic;
-4. a very small real-Pi smoke suite.
-
-### Required v0.1 behavioral coverage
-
-Deterministic coverage should prove at least:
-
-1. **Product opens while Pi is unavailable** and shows an actionable unavailable/setup state rather than crashing the Local Agent Service.
-2. **Workspace validation/canonicalization** handles `~`, relative paths, normalized aliases, and symlinks and rejects missing/non-directory paths.
-3. **Two independent Agents remain running concurrently** in different canonical workspaces.
-4. **Same-Agent and same-canonical-workspace overlap is rejected.**
-5. **Completing, failing, or interrupting A leaves B running.**
-6. **Desktop switching/disconnect/reconnect remains independent per Agent.**
-7. **Background terminal outcome can trigger a notifier** without notification failure affecting Turn state.
-8. **Service restart explicitly terminalizes all persisted running Turns without replay/adoption.**
-9. **Agent overview reflects active/idle and recent terminal outcomes from authoritative service state.**
-10. **No normal failure path requires raw Pi RPC/process errors to be interpreted by the user when a product-level explanation is available.**
-
-The real-Pi smoke suite continues to prove the concrete production adapter against an externally verifiable workspace outcome.
-
-A Linux service-manager smoke test should prove that the Local Agent Service can run independently of the invoking terminal and continue an active Turn after the Desktop connection closes.
+Context is temporary. Product state is durable.
 
 ---
 
-## 8. Explicitly Out of Scope for v0.1
+## 9. Testing and Compatibility Evidence
 
-v0.1 does **not** add:
+### Desktop E2E is the compatibility authority
 
+The final question is not "does an internal API look like Grok?"
+
+It is:
+
+> **Does the user-observable Desktop behavior match the verified Grok Bot behavior closely enough for the targeted surface?**
+
+The test hierarchy remains:
+
+1. a small number of Desktop E2E compatibility tests;
+2. substantial Local Agent Service integration tests with a deterministic Pi fake;
+3. focused UI/component tests for evidence-backed state/interaction rules;
+4. targeted unit tests for genuinely rule-heavy logic;
+5. a very small real-Pi smoke suite.
+
+### Reference record required for compatibility UI work
+
+Before implementing a non-trivial Grok-derived UI behavior, record:
+
+- reference feature/surface;
+- source artifact or reconstruction path;
+- evidence anchor/confidence where available;
+- initial visible state;
+- user action;
+- visible result;
+- classification: Observed / Evidence-backed / Inferred / Unknown / Extension.
+
+Passing unit tests or typecheck is not evidence that a reconstructed behavior is correct.
+
+### Mandatory v0.1 behavioral scenarios
+
+The release gate must cover at least:
+
+1. **Launch → roster shell**: Desktop reaches loading/ready/empty or recoverable error states without exposing developer infrastructure.
+2. **Create/open Agent**: an Agent becomes a stable selectable identity with a conversation workspace.
+3. **Composer draft switching**: text/attachment draft state remains associated with the correct Agent when switching away and back.
+4. **Attachment journey**: picker plus drag/drop (and paste where platform-supported) stages a visible attachment or gives an actionable failure state.
+5. **Send → working → stream → terminal result**: the selected Agent visibly enters work, emits user-visible updates, and reaches one durable terminal Turn.
+6. **Switch during work**: leaving Agent A for Agent B does not stop A.
+7. **Independent parallel Agents**: A/workspace A and B/workspace B can remain active simultaneously.
+8. **Shared-workspace exclusion**: another Agent cannot bypass the canonical workspace lock through `~`, normalized paths, or symlink aliases.
+9. **Interrupt isolation**: stopping A does not affect B.
+10. **Desktop close/reopen**: active work continues and reconnect restores authoritative state without duplicate/reordered transcript content.
+11. **Connectivity loss/retry**: the shell shows a recoverable reconnect/unreachable state without implying durable Agents disappeared.
+12. **Pi failure**: prompt rejection, terminal error, and unexpected exit become understandable durable product outcomes.
+13. **Service restart**: every persisted running Turn is explicitly classified without replay/adoption.
+14. **Real Pi smoke**: one controlled real workspace task produces an externally verifiable result through the same product path.
+
+### What not to test as compatibility
+
+Do not make compatibility depend on:
+
+- reconstructed class/module names;
+- exact process count;
+- recovered React component names;
+- internal RPC method names;
+- provider/router topology;
+- exact Pi session identity;
+- hidden model prompts;
+- private reasoning traces.
+
+---
+
+## 10. Explicitly Out of Scope for v0.1
+
+v0.1 does **not** require:
+
+- reproducing Grok Bot's Electron/main/host/coordinator/local-exec topology;
+- the reconstruction project's added inference router;
+- Claude Code/Codex/OpenRouter provider routing as a pi-sand feature;
+- the reconstruction project's local usage tracker;
+- the reconstruction project's local Docker sandbox;
+- a generic runtime/provider abstraction;
 - a scheduler;
 - a task queue;
 - priorities;
 - a worker pool;
 - multiple simultaneous Turns inside one Agent;
 - concurrent mutation of one canonical workspace;
-- automatic Git worktree creation or management;
-- a generic runtime/provider abstraction;
+- automatic Git worktree management;
 - a second planning/orchestration loop around Pi;
-- automatic replay/recovery of interrupted work;
-- worker adoption after service restart;
+- automatic task replay/recovery after service crash;
+- worker adoption;
 - execution checkpoint/replay semantics;
-- custom model-context management;
-- custom memory framework;
+- a custom model-context framework;
+- a custom memory framework;
+- distributed/multi-machine workers;
 - remote/Telegram/mobile frontend;
-- public/versioned remote protocol;
-- distributed or multi-machine workers;
 - multi-user SaaS;
 - macOS/Windows support;
-- Docker/VM sandbox as a product requirement;
-- native Electron/Tauri packaging as a requirement;
-- automatic host sleep inhibition;
-- exhaustive tool/debug UI;
-- pixel-perfect Grok parity.
+- mandatory Docker/VM sandboxing;
+- exact parity for every reference settings/account/team surface;
+- voice input as a release blocker;
+- shared rooms/groups/automations as a release blocker;
+- complete pixel-perfect parity across the entire application;
+- copying proprietary Grok Bot assets or reconstructed source.
 
-These may be considered only after v0.1 becomes a useful local daily-driver and real dogfooding identifies a concrete need.
+These may be added only when either verified Grok compatibility priority or real pi-sand usage justifies them.
 
 ---
 
-## 9. v0.1 Definition of Done
+## 11. v0.1 Definition of Done
 
-v0.1 is complete when a normal Linux user can perform this journey without operating pi-sand as a development process:
+v0.1 is complete when the primary product journey no longer feels like operating a Pi RPC demo and instead feels recognizably like a Pi-native Grok Bot:
 
 ```text
-start/open pi-sand
-      ↓
-Local Agent Service is available without an attached terminal
-      ↓
-Pi readiness is clear
-      ↓
-create/open Agent with a valid local workspace
-      ↓
-send a normal natural-language task
-      ↓
-see useful working/activity state
-      ↓
-switch to another Agent or close the Desktop
-      ↓
-background work continues
-      ↓
-receive a local terminal notification when appropriate
-      ↓
-reopen later
-      ↓
-see the correct durable transcript and terminal/running state
+launch dedicated pi-sand Desktop
+        ↓
+see persistent Agent/chat roster
+        ↓
+select/create Agent
+        ↓
+see Grok-style conversation header + workspace
+        ↓
+compose ordinary natural-language request
+        ↓
+optionally attach local files
+        ↓
+send
+        ↓
+Agent visibly enters Working/activity state
+        ↓
+assistant conversation updates stream
+        ↓
+switch to another Agent without stopping the first
+        ↓
+independent Agent may work concurrently
+        ↓
+close Desktop
+        ↓
+Local Agent Service + Pi continue while host is awake
+        ↓
+reopen
+        ↓
+correct Agent, transcript, active/terminal state are restored
 ```
 
 Additionally:
 
-- configuration required for normal use survives restart;
-- no repeated `PI_BIN=... npm start` ceremony is required;
-- two Agents in different workspaces can work concurrently;
-- shared-workspace overlap remains blocked;
-- interrupt/failure/reconnect remain per-Agent/per-Turn isolated;
-- common Pi/workspace setup failures are actionable product states;
-- service restart never silently replays or adopts unfinished work;
-- Pi remains the sole reasoning/tool/skill/autonomous-work engine;
-- deterministic tests and real-Pi smoke coverage pass.
+- the core shell has evidence-backed roster, header, conversation, composer, and reconnect states;
+- per-Agent draft state works correctly;
+- basic attachments work through the product composer;
+- active work can be interrupted from the normal conversation UI;
+- failures are durable and understandable;
+- common connectivity problems have retry/reconnect presentation;
+- one Agent's lifecycle never mutates another independent Agent;
+- canonical shared-workspace exclusion remains enforced;
+- service restart does not silently replay or adopt unfinished work;
+- normal use does not require interpreting raw process/RPC failures;
+- Pi remains the sole intelligence/tool/skill/autonomous-work engine;
+- no reference-derived internal component exists without an independent pi-sand need;
+- required Desktop compatibility E2E, service integration tests, and real-Pi smoke tests pass.
 
-The release is dogfood-ready when the user can use pi-sand for real project work for days without routinely opening a terminal to supervise the product itself.
+The final subjective gate is also intentional:
 
-Only then should the repository create the first public/tagged release:
-
-```text
-v0.1.0
-```
-
-Until then, package metadata should use a development prerelease such as `0.1.0-dev`.
+> **When the core conversation screen is open, a user familiar with Grok Bot 0.18 should recognize the interaction model without being told that pi-sand was built from a different internal architecture.**
 
 ---
 
-## 10. Recommended Implementation Progression
+## 12. Recommended Implementation Progression
 
-### Slice 1 — Product bootstrap and background service
+### Slice 0 — Reference map for the core shell
 
-Make Local Agent Service operation independent of an attached terminal. Add user-level configuration and the smallest launch/install/status path needed on Linux.
+Before more product code, create a small evidence map for:
 
-Prove:
+- app/roster shell;
+- roster loading/empty/error/reconnect states;
+- Agent row/selection behavior;
+- conversation header;
+- transcript/message composition;
+- composer;
+- working/activity state;
+- stop/interrupt interaction.
 
-- service starts/connects predictably;
-- service keeps running after launcher/Desktop exits;
-- only one service owns one DB;
-- normal use does not require repeated environment-variable setup.
+Do not reverse-engineer the entire application. Capture only the behavior needed for the next slice.
 
-### Slice 2 — Pi/workspace health and actionable errors
+### Slice 1 — Grok-style shell and Agent roster
 
-Add concrete Pi executable/version readiness and product-level workspace/setup errors.
+Replace the developer-oriented Agent dropdown page with the real product shell.
 
-Prove common launch failures no longer appear primarily as ambiguous `ENOENT` or process errors.
+Prove selection, identity, empty/loading/error/reconnect states, and correct per-Agent state projection.
 
-### Slice 3 — Agent overview for parallel background work
+### Slice 2 — Grok-style conversation workspace and composer
 
-Make the Agent list a useful control surface:
+Implement the evidence-backed conversation layout, header, composer, per-Agent drafts, basic attachments, and send interaction.
 
-- active state;
-- recent outcome;
-- workspace identity;
-- switching without affecting work.
+Keep the existing durable service as the authority underneath it.
 
-### Slice 4 — Minimal activity and notifications
+### Slice 3 — Working/activity experience
 
-Expose only stable Pi-derived progress worth showing and add best-effort local terminal notifications.
+Map stable Pi events onto the smallest useful Grok-like visible working states.
 
-Do not turn this into an execution debugger or event-sourcing project.
+Add no planner, workflow engine, or private reasoning display.
 
-### Slice 5 — Real dogfood gate
+### Slice 4 — Background/switch/reconnect product journey
 
-Only after the above slices are integrated should sustained dogfooding become a release gate.
+Integrate the already-proven service lifecycle and multi-Agent behavior into the new shell so switching/closing/reopening feels native rather than like an API demo.
+
+### Slice 5 — Minimum operability required by that journey
+
+Only now add the launch/service discovery, Pi preflight, persistent local configuration, packaging, and failure presentation needed so the Grok-like Desktop journey does not require terminal babysitting.
+
+These are supporting capabilities, not the organizing principle of the product.
+
+### Slice 6 — Compatibility dogfood gate
+
+Dogfood the product as Grok Bot, not as a backend test harness.
 
 The target behavior is:
 
-> Give Agent A work, give Agent B work, close the UI, leave the laptop running, and later return to two trustworthy independent results without caring about pi-sand process management.
+> Open the app, give Agent A real work, move to Agent B, leave the UI, return later, and trust both the conversation experience and the results without thinking about Pi processes, ports, SQLite, RPC, or terminal supervision.
 
 ---
 
-## 11. Questions Deliberately Left Open
+## 13. Stable Design Rule
 
-These questions should be answered by implementation evidence rather than speculative architecture:
+When deciding what to build next, ask in this order:
 
-- Which exact Pi RPC activity events are stable and useful enough for normal UI presentation?
-- Should local notification happen for every completion or only when the Agent/Desktop is not currently visible?
-- Should the Linux launcher start the service on demand, rely on login autostart, or support both?
-- What is the smallest persistent config format/location that follows XDG conventions without creating a configuration subsystem?
-- After real v0.1 failure data exists, is any automatic in-flight recovery actually worth adding in a later release?
+1. **What does Grok Bot 0.18 visibly do here?**
+2. **What evidence supports that behavior?**
+3. **Is it part of the v0.1 core compatibility journey?**
+4. **What is the smallest Pi-native implementation that reproduces it?**
+5. **Can Pi already own the intelligence/runtime part instead of pi-sand recreating it?**
 
-None of these questions justify adding a scheduler, worker system, workflow engine, or custom agent intelligence to v0.1.
+Do not start with reconstructed internal components and work outward.
+
+Start with verified user behavior and work inward.
