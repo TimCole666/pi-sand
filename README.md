@@ -1,37 +1,59 @@
 # pi-sand
 
-A Linux-first desktop client and local service around the installed Pi CLI. The v0.1 slice keeps product state separate from Pi's process and context:
+A Linux-first desktop Agent product around the installed Pi CLI. The v0.1.0 product boundary keeps durable product state, the Local Agent Service, and the Desktop presentation separate:
 
 ```text
-Desktop browser client → Local Agent Service → pi --mode rpc → Agent workspace
+Desktop Client → Local Agent Service → pi --mode rpc → Agent workspace
 ```
 
-## Run
+## Launch the product
 
-Requires Node.js 22.13+ (the service uses the unflagged built-in `node:sqlite` module) and `pi` on `PATH`.
+Requires Node.js 22.13+ (the service uses the unflagged built-in `node:sqlite` module), Chromium, and `pi` on `PATH`.
 
 ```sh
-npm start
-# open http://127.0.0.1:4317
+npm run launch
 ```
 
-By default the SQLite database is stored at `${XDG_DATA_HOME:-~/.local/share}/pi-sand/pi-sand.sqlite`. Set `PI_SAND_DB` to choose another SQLite file, `PORT` to choose the local HTTP port, or `PI_BIN` to choose the Pi executable. The service creates the database and its parent directory on first start. Create an Agent with a workspace directory, then submit ordinary natural-language requests.
+The supported Linux entry point starts or connects to the loopback-only Local Agent Service, then opens the Desktop in Chromium through `xdg-open`. No terminal, manually selected port, or manually opened localhost URL is required for normal use. `PI_SAND_NO_BROWSER=1 npm run launch` starts the product service without opening a browser, which is useful for automated checks. `PI_SAND_BROWSER` can select the browser opener when needed.
 
-## Test
+`npm start` remains a developer-oriented service-only entry point; it is not the normal product experience. The service binds only to `127.0.0.1`, protects mutation requests from unrelated browser origins, and allows only one Local Agent Service process to own a database at a time.
+
+By default the SQLite database is stored at `${XDG_DATA_HOME:-~/.local/share}/pi-sand/pi-sand.sqlite`. Set `PI_SAND_DB` to choose another database, `PORT` to choose the fixed local endpoint, or `PI_BIN` to choose the Pi executable. The service creates its database and parent directory on first start.
+
+Create an Agent with a workspace directory, then submit ordinary natural-language requests. Workspace input accepts absolute paths and `~`/`~/...`; other relative paths are rejected. Accepted paths are verified directories, realpathed, and persisted as one canonical workspace identity, so symlink aliases share the same execution exclusion.
+
+## Product boundary
+
+The Local Agent Service owns durable Agents, Turns, user/assistant transcript messages, staged/committed attachment metadata, canonical workspaces, and Pi process ownership. The Desktop owns presentation state such as the selected Agent and unsent per-Agent drafts. Closing the Desktop does not stop the service or active Pi work; reopening takes an authoritative snapshot and reconnects to semantic updates without replaying or duplicating transcript messages.
+
+Pi owns reasoning, tools, skills, retries inside its autonomous loop, and its native conversational context. pi-sand does not add a planner, scheduler, queue, worker pool, provider abstraction, replay loop, or custom memory/context system. Independent Agents may run concurrently only when their canonical workspaces differ. Stop, unexpected Pi exit, and service-restart reconciliation produce explicit durable Turn outcomes; unfinished work after service restart is interrupted without replay or worker adoption.
+
+## Test seams
+
+The v0.1.0 release proof has exactly three durable seams:
+
+1. **Actual Desktop E2E** — supported Chromium is rendered and driven through the product. These tests live in `test/desktop-actual-e2e.test.js`, `test/desktop-attachment-e2e.test.js`, `test/desktop-chromium-e2e.test.js`, `test/desktop-process-e2e.test.js`, and `test/product-boundary.test.js` (Chromium-dependent tests are skipped when the supported runtime is unavailable).
+2. **Local Agent Service integration** — deterministic narrow Pi fakes prove persistence, lifecycle, reconnect, workspace safety, attachments, ownership, and control-plane behavior. `test/service.test.js`, `test/attachments.test.js`, `test/orphan-worker.test.js`, `test/product-boundary.test.js`, and `test/stop-isolation.test.js` contain this coverage. `test/service-http-e2e.test.js` proves HTTP/SSE transport only; it is not Actual Desktop E2E.
+3. **Small Real-Pi smoke** — `test/real-pi.acceptance.test.js` contains the three production contracts: basic execution, two-Turn Pi-native conversational continuity, and production attachment consumption. It is skipped by the deterministic suite and requires `PI_SAND_REAL_PI=1` with a configured model.
+
+The renamed `desktop-client-harness*.test.js` files are fake-DOM/client harness support tests, not Actual Desktop E2E. They remain useful for narrow rendering behavior but do not count as the compatibility authority.
+
+Run the deterministic suite and Pi contract self-test with:
 
 ```sh
 npm test
 npm run spike:self-test
-# Only with a configured real `pi` CLI and an intentionally available model:
+```
+
+Run the opt-in production smoke layer with:
+
+```sh
 npm run test:real-pi
 ```
 
-The deterministic service tests use a deliberately narrow fake matching the Pi RPC event seam. The public Desktop E2E tests traverse the mounted Desktop through real HTTP/SSE to the Local Agent Service and deterministic Pi for create/open → send → stream → complete, completed transcript reopening, close during active work → reconnect, interrupt, and unexpected Pi exit; lower-level tests cover persistence, transcript identity/order, and restart reconciliation without asserting model wording. `test:real-pi` creates an isolated temporary workspace and asks the installed Pi CLI to write one exact fixture file; it is skipped by normal test runs so development and CI do not require model credentials.
+## Documentation authorities
 
-## v0.1 boundary
-
-The Local Agent Service owns Agents, Turns, transcript messages, and the Pi child process. The Desktop client only uses HTTP/SSE semantic operations; closing its window or losing its SSE connection does not cancel active work. Reopening the Desktop takes an authoritative Agent snapshot and subscribes to subsequent updates, replacing its rendered transcript from that snapshot so reconnects cannot duplicate or reorder visible messages. The Desktop renders the latest durable terminal Turn state; failed and interrupted Turns retain their explanatory detail after reopen. An active Turn can be interrupted from the Desktop: the service forwards Pi's concrete RPC abort request and records exactly one `interrupted` terminal outcome only when Pi emits `agent_settled`, while retaining already durable transcript content. `agent_end` is not terminal because Pi may continue its autonomous loop through a retry, compaction retry, or queued continuation. An unexpected Pi exit becomes one durable `failed` terminal outcome. On Local Agent Service startup, every persisted `running` Turn is durably classified as `interrupted` with an explanation that it was not resumed: pi-sand never adopts the former Pi process or replays its request. Terminal Turns, Agent metadata, workspace association, and transcript messages restore unchanged, and a later new Turn may be submitted normally.
-
-Independent Agents may run concurrently only when their canonical workspaces differ. The service allows at most one running Turn per Agent and at most one running Turn per canonical workspace, so two Agents referring to the same real directory cannot overlap. Agent creation expands `~`, resolves relative and normalized paths, follows filesystem aliases, verifies the workspace exists and is a directory, and persists the resulting canonical filesystem path. Completion, failure, interruption, and Desktop reconnect remain scoped to each Agent's Turn. Pi runs with its normal installed tools, extensions, and skills; the restrictive flags in the isolated integration spike are not product behavior. pi-sand does not add a scheduler, queue, worker pool, planning loop, task retry, provider abstraction, automatic replay, custom context/memory system, or direct client database access.
-
-The canonical transcript contains user-visible user and assistant messages. Pi runtime/session IDs are optional metadata and do not replace the durable application Agent/Turn IDs. `docs/v0.1-lifecycle-evidence.md` records the implemented lifecycle behaviors as Observed, Evidence-backed, Inferred, Unknown, or Extension and lists the explicit v0.1 guarantees and deferrals.
+- [`SPEC-v0.1.md`](SPEC-v0.1.md) is the sole normative v0.1.0 product specification.
+- [`REFERENCE.md`](REFERENCE.md) is the explicitly non-normative Grok Bot 0.18 evidence ledger.
+- [`docs/v0.1-lifecycle-evidence.md`](docs/v0.1-lifecycle-evidence.md) records current evidence classifications and pi-sand extensions.
+- [`SPEC.md`](SPEC.md) is retained as superseded historical material and must not be used as a competing release authority.

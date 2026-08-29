@@ -139,7 +139,7 @@ async function createAndSend(view, directory, message = "Fix the failing tests")
   await view.elements.send.onsubmit({ preventDefault() {}, target: view.elements.send });
 }
 
-test("public Desktop E2E: create, send, stream, and complete", async () => withPublicDesktopServer(async ({ controls, directory, openDesktop }) => {
+test("Desktop client harness over HTTP creates, sends, streams, and completes", async () => withPublicDesktopServer(async ({ controls, directory, openDesktop }) => {
   const view = openDesktop();
   await createAndSend(view, directory);
   await eventually(() => view.elements.status.textContent === "Pi is working…" && /Working: Fix the failing tests/.test(view.elements.messages.innerHTML), "Desktop did not render its real SSE stream");
@@ -149,7 +149,7 @@ test("public Desktop E2E: create, send, stream, and complete", async () => withP
   assert.equal((view.elements.messages.innerHTML.match(/Completed result\./g) ?? []).length, 1);
 }));
 
-test("public Desktop E2E: durable transcript restores after Desktop restart", async () => withPublicDesktopServer(async ({ controls, directory, openDesktop }) => {
+test("Desktop client harness over HTTP restores a durable transcript after restart", async () => withPublicDesktopServer(async ({ controls, directory, openDesktop }) => {
   const first = openDesktop();
   await createAndSend(first, directory);
   controls[0].release();
@@ -162,7 +162,7 @@ test("public Desktop E2E: durable transcript restores after Desktop restart", as
   assert.equal((reopened.elements.messages.innerHTML.match(/class="message/g) ?? []).length, 2);
 }));
 
-test("public Desktop E2E: closing during work reconnects to the same result", async () => withPublicDesktopServer(async ({ controls, directory, openDesktop, service }) => {
+test("Desktop client harness over HTTP reconnects to the same result", async () => withPublicDesktopServer(async ({ controls, directory, openDesktop, service }) => {
   const first = openDesktop();
   await createAndSend(first, directory, "Keep working");
   await eventually(() => first.elements.status.textContent === "Pi is working…", "first Desktop did not show active work");
@@ -178,7 +178,7 @@ test("public Desktop E2E: closing during work reconnects to the same result", as
   assert.equal((reopened.elements.messages.innerHTML.match(/Completed result\./g) ?? []).length, 1);
 }));
 
-test("public Desktop E2E: interrupt reaches one stable visible interruption", async () => withPublicDesktopServer(async ({ directory, openDesktop }) => {
+test("Desktop client harness over HTTP reaches one stable visible interruption", async () => withPublicDesktopServer(async ({ directory, openDesktop }) => {
   const view = openDesktop();
   await createAndSend(view, directory, "Stop this work");
   await eventually(() => view.elements.interrupt.hidden === false, "Desktop did not show an interrupt action");
@@ -188,7 +188,7 @@ test("public Desktop E2E: interrupt reaches one stable visible interruption", as
   assert.equal(view.elements.interrupt.hidden, true);
 }));
 
-test("public Desktop E2E: unexpected Pi exit reaches visible failure", async () => withPublicDesktopServer(async ({ controls, directory, openDesktop }) => {
+test("Desktop client harness over HTTP renders an unexpected Pi exit failure", async () => withPublicDesktopServer(async ({ controls, directory, openDesktop }) => {
   const view = openDesktop();
   await createAndSend(view, directory, "Fail this work");
   await eventually(() => /Working: Fail this work/.test(view.elements.messages.innerHTML), "Desktop did not render streaming content before failure");

@@ -69,7 +69,7 @@ async function eventually(predicate, message) {
   assert.fail(message);
 }
 
-test("Desktop HTTP/SSE journey closes during work and reconnects to one canonical result", async () => {
+test("Local Agent Service HTTP/SSE transport closes during work and reconnects to one canonical result", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-sand-desktop-e2e-"));
   const service = new AgentService({ dbPath: join(directory, "state.sqlite"), piFactory: delayedPi });
   const server = createAgentServer(service);
@@ -115,7 +115,7 @@ test("Desktop HTTP/SSE journey closes during work and reconnects to one canonica
   }
 });
 
-test("two Desktop connections reconnect independently while their separate workspace Turns run concurrently", async () => {
+test("Local Agent Service HTTP/SSE connections reconnect independently across concurrent Turns", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-sand-desktop-parallel-e2e-"));
   const workspaceA = join(directory, "workspace-a");
   const workspaceB = join(directory, "workspace-b");

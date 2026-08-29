@@ -106,7 +106,7 @@ async function createAndSend(view, directory, message = "Fix the failing tests")
   return view.storage.get("pi-sand-agent");
 }
 
-test("Desktop creates, opens, sends, streams, and renders a completed Turn", async () => withDesktop(async ({ service, base, directory }) => {
+test("Desktop client harness creates, opens, sends, streams, and renders a completed Turn", async () => withDesktop(async ({ service, base, directory }) => {
   const view = desktop({ base });
   const agentId = await createAndSend(view, directory);
   await eventually(() => service.getAgent(agentId).turns[0]?.status === "completed", "Turn did not complete");
@@ -117,7 +117,7 @@ test("Desktop creates, opens, sends, streams, and renders a completed Turn", asy
   assert.equal(view.elements.interrupt.hidden, true);
 }));
 
-test("Desktop restart reopens a completed durable transcript and terminal state", async () => withDesktop(async ({ service, base, directory }) => {
+test("Desktop client harness reopens a completed durable transcript and terminal state", async () => withDesktop(async ({ service, base, directory }) => {
   const storage = new Map();
   const first = desktop({ base, storage });
   const agentId = await createAndSend(first, directory);
@@ -129,7 +129,7 @@ test("Desktop restart reopens a completed durable transcript and terminal state"
   assert.equal(reopened.elements.status.textContent, "Turn completed.");
 }));
 
-test("Desktop close during work reconnects to the same active Turn and one result", async () => withDesktop(async ({ service, base, directory }) => {
+test("Desktop client harness reconnects to the same active Turn and one result", async () => withDesktop(async ({ service, base, directory }) => {
   const storage = new Map();
   const first = desktop({ base, storage });
   const agentId = await createAndSend(first, directory, "Keep working");
@@ -150,7 +150,7 @@ test("Desktop close during work reconnects to the same active Turn and one resul
   assert.equal((reopened.elements.messages.innerHTML.match(/class="message/g) ?? []).length, 2);
 }, controlledPi));
 
-test("Desktop interrupt renders the durable interruption explanation", async () => withDesktop(async ({ service, base, directory }) => {
+test("Desktop client harness renders the durable interruption explanation", async () => withDesktop(async ({ service, base, directory }) => {
   const view = desktop({ base });
   const agentId = await createAndSend(view, directory, "Stop this work");
   await view.elements.interrupt.onclick();
@@ -159,7 +159,7 @@ test("Desktop interrupt renders the durable interruption explanation", async () 
   assert.equal(view.elements.interrupt.hidden, true);
 }, controlledPi));
 
-test("Desktop keeps independent drafts across Agent switching and restart with draft-first roster previews", async () => withDesktop(async ({ base, directory }) => {
+test("Desktop client harness keeps independent drafts across Agent switching and restart", async () => withDesktop(async ({ base, directory }) => {
   const storage = new Map();
   const first = desktop({ base, storage });
   await first.client.ready;
@@ -193,7 +193,7 @@ test("Desktop keeps independent drafts across Agent switching and restart with d
   assert.equal(storage.get("pi-sand-agent"), alphaId);
 }, completedPi));
 
-test("Desktop renders unexpected Pi exit as a durable failed Turn", async () => withDesktop(async ({ service, base, directory }) => {
+test("Desktop client harness renders unexpected Pi exit as a durable failed Turn", async () => withDesktop(async ({ service, base, directory }) => {
   const view = desktop({ base });
   const agentId = await createAndSend(view, directory, "Fail this work");
   view.sources.at(-1).deliver(service.getAgent(agentId));

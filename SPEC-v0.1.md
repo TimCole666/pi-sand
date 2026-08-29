@@ -1,6 +1,8 @@
 # pi-sand v0.1 — Pi-native Grok Bot 0.18 Compatibility Specification
 
-Status: **Draft for third independent review**
+Status: **Normative v0.1 product specification**
+
+This document is the sole normative authority for the v0.1.0 dogfood-ready product boundary. [`REFERENCE.md`](REFERENCE.md) is the companion non-normative evidence ledger; [`SPEC.md`](SPEC.md) is historical and superseded.
 
 ## Problem Statement
 
