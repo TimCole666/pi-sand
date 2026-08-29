@@ -23,8 +23,10 @@ export function mountDesktop({
   const $ = (selector) => document.querySelector(selector);
   let agent = null;
   let selectedAgentId = null;
+  let activeTurnId = null;
   let source = null;
   let roster = [];
+  let sendInFlight = false;
   const drafts = readDrafts(localStorage);
 
   function escapeHtml(value) {
@@ -125,9 +127,15 @@ export function mountDesktop({
     return `Turn ${latest.status}: ${latest.terminalDetail || "No further detail is available."}`;
   }
 
+  function updateComposerState(active = Boolean(activeTurnId)) {
+    const submit = $("#send-submit");
+    if (submit) submit.disabled = active || sendInFlight;
+  }
+
   function render(snapshot) {
     agent = snapshot.agent;
     selectedAgentId = snapshot.agent.id;
+    activeTurnId = snapshot.activeTurnId;
     $("#setup").hidden = false;
     $("#conversation").hidden = false;
     $("#agent-meta").textContent = `${agent.name} · ${agent.workspace}`;
@@ -137,6 +145,7 @@ export function mountDesktop({
     $("#status").textContent = snapshot.state === "active" ? "Pi is working…" : terminalStatus(snapshot);
     $("#status").className = snapshot.state === "active" ? "running" : snapshot.turns.at(-1)?.status === "failed" ? "error" : "";
     $("#interrupt").hidden = !snapshot.activeTurnId;
+    updateComposerState(Boolean(snapshot.activeTurnId));
     renderAgentList(roster);
   }
 
@@ -179,14 +188,20 @@ export function mountDesktop({
   input?.addEventListener?.("input", () => setDraft(selectedAgentId, input.value));
   $("#send").onsubmit = async (event) => {
     event.preventDefault();
-    if (!agent) return;
+    if (!agent || activeTurnId || sendInFlight) return;
     const messageInput = composerInput();
     const message = messageInput?.value ?? "";
+    sendInFlight = true;
+    updateComposerState();
     try {
       await request(`/api/agents/${encodeURIComponent(agent.id)}/turns`, { method: "POST", body: JSON.stringify({ message }) });
       if (messageInput) messageInput.value = "";
       setDraft(agent.id, "");
     } catch (error) { alertImpl(error.message); }
+    finally {
+      sendInFlight = false;
+      updateComposerState();
+    }
   };
   $("#interrupt").onclick = async () => {
     const active = (await request(`/api/agents/${encodeURIComponent(agent.id)}`)).activeTurnId;
