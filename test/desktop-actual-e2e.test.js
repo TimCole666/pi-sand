@@ -236,6 +236,7 @@ test("actual Chromium Desktop isolates concurrent Agents and stops only the sele
     await createAgent("B", workspaceB);
 
     const idFor = async (name) => evaluate(`[...document.querySelectorAll('[data-agent-id]')].find((button) => button.textContent.includes(${JSON.stringify(name)}))?.dataset.agentId`);
+    const rowText = async (name) => evaluate(`[...document.querySelectorAll('[data-agent-id]')].find((button) => button.textContent.includes(${JSON.stringify(name)}))?.textContent || ''`);
     const send = async (name, message) => {
       const id = await idFor(name);
       await evaluate(`document.querySelector('[data-agent-id="${id}"]').click()`);
@@ -246,15 +247,18 @@ test("actual Chromium Desktop isolates concurrent Agents and stops only the sele
     await send("A", "A running");
     await send("B", "B running");
     assert.equal(controls.size, 2);
+    await waitFor(async () => (await rowText("A")).includes("Working") && (await rowText("B")).includes("Working"), "both running Agents did not show Working in the roster");
 
     await evaluate(`(async () => { const id = ${JSON.stringify(await idFor("A"))}; document.querySelector('[data-agent-id="' + id + '"]').click(); await new Promise((resolve) => setTimeout(resolve, 20)); document.querySelector('#interrupt').click(); })()`);
     await waitFor(() => evaluate("document.querySelector('#status').textContent") .then((status) => status.startsWith("Turn interrupted:")), "Desktop did not render A interruption");
+    await waitFor(async () => !(await rowText("A")).includes("Working") && (await rowText("B")).includes("Working"), "stopping A changed the background B roster state");
     const agentBId = await idFor("B");
     await evaluate(`document.querySelector('[data-agent-id="${agentBId}"]').click()`);
     await waitFor(() => evaluate("document.querySelector('#header-status').textContent") .then((status) => status === "Working"), "Stopping A affected B");
 
     controls.get("B running").release();
     await waitFor(() => evaluate("document.querySelector('#status').textContent") .then((status) => status === "Turn completed."), "B did not complete after A stopped");
+    await waitFor(async () => !(await rowText("B")).includes("Working"), "B roster row did not clear Working after completion");
     const completedB = service.getAgent(agentBId);
     assert.equal(completedB.turns[0].status, "completed");
     assert.equal(service.getAgent(await idFor("A")).turns[0].status, "interrupted");

@@ -163,8 +163,10 @@ export function createAgentServer(service, { getService = () => service } = {}) 
           }
         };
         const unsubscribe = currentService.subscribe(agentId, send);
+        const unsubscribeRoster = currentService.subscribeRoster(send);
+        send({ type: "roster_updated", roster: currentService.listAgents() });
         send({ type: "snapshot", snapshot: currentService.getAgent(agentId) });
-        req.on("close", () => unsubscribe());
+        req.on("close", () => { unsubscribe(); unsubscribeRoster(); });
         return;
       }
       return json(res, 404, { error: "not found" });

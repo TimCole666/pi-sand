@@ -686,10 +686,14 @@ test("Agent roster summaries expose stable order and the latest durable message 
   assert.equal(initial[0].recentPreview, null);
 
   service.sendMessage(first.agent.id, "first request");
+  assert.equal(service.listAgents()[0].state, "active");
+  assert.equal(service.listAgents()[1].state, "idle");
   await new Promise((resolve) => setTimeout(resolve, 20));
   const afterTurn = service.listAgents();
   assert.equal(afterTurn[0].recentPreview, "Done.");
+  assert.equal(afterTurn[0].state, "idle");
   assert.equal(afterTurn[1].recentPreview, null);
+  assert.equal(afterTurn[1].state, "idle");
 }), fakePi);
 
 test("independent Agents run concurrently while completion, failure, and interruption stay isolated", async () => {

@@ -34,6 +34,8 @@ export function mountDesktop({
   let source = null;
   let roster = [];
   let sendInFlight = false;
+  let selectionGeneration = 0;
+  let selectionPending = false;
   const drafts = readDrafts(localStorage);
 
   function escapeHtml(value) {
@@ -75,7 +77,7 @@ export function mountDesktop({
     else drafts[agentId] = draft;
     persistDrafts();
     renderAgentList(roster);
-    renderAttachments(draft.attachments);
+    if (selectedAgentId === agentId) renderAttachments(draft.attachments);
   }
 
   function setConnectionState(state, message) {
@@ -120,9 +122,10 @@ export function mountDesktop({
         const name = item.name?.trim() || "Agent";
         const marker = name[0]?.toUpperCase() || "A";
         const active = item.id === selected ? " selected" : "";
+        const working = item.state === "active" ? '<small class="agent-row-status">Working</small>' : "";
         return `<button type="button" class="agent-row${active}" data-agent-id="${escapeHtml(item.id)}" aria-pressed="${item.id === selected}">`+
           `<span class="agent-marker" aria-hidden="true">${escapeHtml(marker)}</span>`+
-          `<span class="agent-row-copy"><strong>${escapeHtml(name)}</strong><small>${escapeHtml(previewFor(item))}</small></span>`+
+          `<span class="agent-row-copy"><strong>${escapeHtml(name)}</strong>${working}<small>${escapeHtml(previewFor(item))}</small></span>`+
           `</button>`;
       }).join("");
       for (const button of list.querySelectorAll?.("[data-agent-id]") ?? []) {
@@ -158,6 +161,11 @@ export function mountDesktop({
     if (submit) submit.disabled = active || sendInFlight;
   }
 
+  function updateInterruptState() {
+    const interrupt = $("#interrupt");
+    if (interrupt) interrupt.hidden = selectionPending || !activeTurnId;
+  }
+
   function setAttachmentFeedback(message, error = false) {
     const feedback = $("#attachment-feedback");
     if (!feedback) return;
@@ -176,12 +184,15 @@ export function mountDesktop({
       button.addEventListener("click", async () => {
         const chip = button.closest("[data-attachment-id]");
         const id = chip?.dataset.attachmentId;
-        if (!id || !agent) return;
+        const agentId = selectedAgentId;
+        if (!id || !agentId) return;
         try {
-          await request(`/api/agents/${encodeURIComponent(agent.id)}/attachments/${encodeURIComponent(id)}`, { method: "DELETE" });
-          setDraftAttachments(agent.id, currentDraft(agent.id).attachments.filter((attachment) => attachment.id !== id));
-          setAttachmentFeedback("");
-        } catch (error) { setAttachmentFeedback(error.message, true); }
+          await request(`/api/agents/${encodeURIComponent(agentId)}/attachments/${encodeURIComponent(id)}`, { method: "DELETE" });
+          setDraftAttachments(agentId, currentDraft(agentId).attachments.filter((attachment) => attachment.id !== id));
+          if (selectedAgentId === agentId) setAttachmentFeedback("");
+        } catch (error) {
+          if (selectedAgentId === agentId) setAttachmentFeedback(error.message, true);
+        }
       });
     }
   }
@@ -195,9 +206,10 @@ export function mountDesktop({
       .filter((file) => file?.name);
   }
 
-  async function stageFiles(files) {
-    if (!agent) return;
-    const existing = currentDraft(agent.id).attachments;
+  async function stageFiles(files, initiatingAgentId = selectedAgentId) {
+    const agentId = initiatingAgentId;
+    if (!agentId) return;
+    const existing = currentDraft(agentId).attachments;
     const incoming = [...files].filter((file) => file?.name);
     if (!incoming.length) return;
     if (existing.length + incoming.length > MAX_ATTACHMENTS) {
@@ -211,49 +223,67 @@ export function mountDesktop({
       for (const file of incoming) {
         const form = new FormDataImpl();
         form.append("file", file, file.name);
-        const result = await request(`/api/agents/${encodeURIComponent(agent.id)}/attachments`, { method: "POST", body: form });
+        const result = await request(`/api/agents/${encodeURIComponent(agentId)}/attachments`, { method: "POST", body: form });
         uploaded.push(result.attachment);
       }
     } catch (error) {
       await Promise.allSettled(uploaded.map((attachment) => request(
-        `/api/agents/${encodeURIComponent(agent.id)}/attachments/${encodeURIComponent(attachment.id)}`,
+        `/api/agents/${encodeURIComponent(agentId)}/attachments/${encodeURIComponent(attachment.id)}`,
         { method: "DELETE" },
       )));
       throw error;
     }
-    setDraftAttachments(agent.id, [...existing, ...uploaded]);
-    setAttachmentFeedback("");
+    const latest = currentDraft(agentId).attachments;
+    if (latest.length + uploaded.length > MAX_ATTACHMENTS) {
+      await Promise.allSettled(uploaded.map((attachment) => request(
+        `/api/agents/${encodeURIComponent(agentId)}/attachments/${encodeURIComponent(attachment.id)}`,
+        { method: "DELETE" },
+      )));
+      throw new Error(`You can attach up to ${MAX_ATTACHMENTS} files.`);
+    }
+    const latestIds = new Set(latest.map((attachment) => attachment.id));
+    setDraftAttachments(agentId, [...latest, ...uploaded.filter((attachment) => !latestIds.has(attachment.id))]);
+    if (selectedAgentId === agentId) setAttachmentFeedback("");
   }
 
   async function handleAttachmentInput(event, files) {
+    const agentId = selectedAgentId;
     if (files.length && event.preventDefault) event.preventDefault();
+    if (!agentId) return;
     try {
-      await stageFiles(files);
+      await stageFiles(files, agentId);
     } catch (error) {
-      setAttachmentFeedback(error.message, true);
+      if (selectedAgentId === agentId) setAttachmentFeedback(error.message, true);
     }
   }
 
-  async function reconcileDraftAttachments(agentId) {
+  async function reconcileDraftAttachments(agentId, isCurrent = () => true) {
     const draft = currentDraft(agentId);
-    if (!draft.attachments.length) return;
+    if (!draft.attachments.length) return true;
+    const startingAttachmentIds = new Set(draft.attachments.map((attachment) => attachment.id));
     const available = await request(`/api/agents/${encodeURIComponent(agentId)}/attachments`);
+    if (!isCurrent()) return false;
     const byId = new Map(available.map((attachment) => [attachment.id, attachment]));
-    const valid = draft.attachments.map((attachment) => byId.get(attachment.id)).filter(Boolean);
-    if (valid.length !== draft.attachments.length) {
-      drafts[agentId] = { ...draft, attachments: valid };
+    const latest = currentDraft(agentId);
+    const valid = latest.attachments
+      .map((attachment) => byId.get(attachment.id) ?? (startingAttachmentIds.has(attachment.id) ? null : attachment))
+      .filter(Boolean);
+    if (valid.length !== latest.attachments.length) {
+      drafts[agentId] = { ...latest, attachments: valid };
       if (!drafts[agentId].text && !valid.length) delete drafts[agentId];
       persistDrafts();
-      setAttachmentFeedback("Some draft attachments are no longer available and were removed.", true);
+      if (selectedAgentId === agentId) setAttachmentFeedback("Some draft attachments are no longer available and were removed.", true);
     } else {
-      drafts[agentId] = { ...draft, attachments: valid };
+      drafts[agentId] = { ...latest, attachments: valid };
+      persistDrafts();
     }
+    return true;
   }
 
   function updateRosterFromSnapshot(snapshot) {
     const latest = snapshot.messages.at(-1);
     roster = roster.map((item) => item.id === snapshot.agent.id
-      ? { ...item, recentPreview: latest?.content ?? null }
+      ? { ...item, recentPreview: latest?.content ?? null, state: snapshot.state }
       : item);
   }
 
@@ -276,30 +306,56 @@ export function mountDesktop({
     ).join("");
     $("#status").textContent = working ? "" : terminalStatus(snapshot);
     $("#status").className = snapshot.turns.at(-1)?.status === "failed" ? "error" : "";
-    $("#interrupt").hidden = !snapshot.activeTurnId;
+    updateInterruptState();
     updateComposerState(Boolean(snapshot.activeTurnId));
     renderAttachments();
     renderAgentList(roster);
   }
 
   async function openAgent(id) {
+    const generation = ++selectionGeneration;
+    const agentId = id;
+    selectionPending = true;
+    updateInterruptState();
     source?.close();
     source = null;
-    const snapshot = await request(`/api/agents/${encodeURIComponent(id)}`);
-    selectedAgentId = id;
-    localStorage.setItem(SELECTED_AGENT_KEY, id);
-    await reconcileDraftAttachments(id);
-    render(snapshot);
-    const input = composerInput();
-    if (input) input.value = currentDraft(id).text;
-    renderAttachments(currentDraft(id).attachments);
-    source = new EventSourceImpl(`${apiBase}/api/agents/${encodeURIComponent(id)}/events`);
-    source.onopen = () => setConnectionState("connected", "");
-    source.onerror = () => setConnectionState("reconnecting", "Reconnecting to your computer…");
-    source.onmessage = (event) => {
-      const update = JSON.parse(event.data);
-      if (update.snapshot) render(update.snapshot);
-    };
+    try {
+      const snapshot = await request(`/api/agents/${encodeURIComponent(agentId)}`);
+      if (generation !== selectionGeneration) return;
+      const reconciled = await reconcileDraftAttachments(agentId, () => generation === selectionGeneration);
+      if (!reconciled || generation !== selectionGeneration) return;
+      selectedAgentId = agentId;
+      localStorage.setItem(SELECTED_AGENT_KEY, agentId);
+      selectionPending = false;
+      render(snapshot);
+      const input = composerInput();
+      if (input) input.value = currentDraft(agentId).text;
+      renderAttachments(currentDraft(agentId).attachments);
+      const nextSource = new EventSourceImpl(`${apiBase}/api/agents/${encodeURIComponent(agentId)}/events`);
+      if (generation !== selectionGeneration) {
+        nextSource.close();
+        return;
+      }
+      source = nextSource;
+      nextSource.onopen = () => {
+        if (generation === selectionGeneration && source === nextSource) setConnectionState("connected", "");
+      };
+      nextSource.onerror = () => {
+        if (generation === selectionGeneration && source === nextSource) setConnectionState("reconnecting", "Reconnecting to your computer…");
+      };
+      nextSource.onmessage = (event) => {
+        if (generation !== selectionGeneration || selectedAgentId !== agentId || source !== nextSource) return;
+        const update = JSON.parse(event.data);
+        if (update.type === "roster_updated" && Array.isArray(update.roster)) renderAgentList(update.roster);
+        else if (update.snapshot?.agent?.id === agentId) render(update.snapshot);
+      };
+    } catch (error) {
+      if (generation === selectionGeneration) {
+        selectionPending = false;
+        updateInterruptState();
+      }
+      throw error;
+    }
   }
 
   const create = $("#create");
@@ -347,16 +403,23 @@ export function mountDesktop({
   });
   $("#send").onsubmit = async (event) => {
     event.preventDefault();
-    if (!agent || activeTurnId || sendInFlight) return;
+    const agentId = selectedAgentId;
+    if (!agentId || activeTurnId || sendInFlight) return;
     const messageInput = composerInput();
     const message = messageInput?.value ?? "";
+    const submittedAttachments = currentDraft(agentId).attachments;
+    const submittedAttachmentIds = submittedAttachments.map((attachment) => attachment.id);
     sendInFlight = true;
     updateComposerState();
     try {
-      await request(`/api/agents/${encodeURIComponent(agent.id)}/turns`, { method: "POST", body: JSON.stringify({ message, attachments: currentDraft(agent.id).attachments.map((attachment) => attachment.id) }) });
-      if (messageInput) messageInput.value = "";
-      setDraft(agent.id, "");
-      setDraftAttachments(agent.id, []);
+      await request(`/api/agents/${encodeURIComponent(agentId)}/turns`, { method: "POST", body: JSON.stringify({ message, attachments: submittedAttachmentIds }) });
+      const latest = currentDraft(agentId);
+      const submittedIds = new Set(submittedAttachmentIds);
+      const remainingAttachments = latest.attachments.filter((attachment) => !submittedIds.has(attachment.id));
+      const remainingText = latest.text === message ? "" : latest.text;
+      if (selectedAgentId === agentId && messageInput?.value === message) messageInput.value = remainingText;
+      setDraft(agentId, remainingText);
+      setDraftAttachments(agentId, remainingAttachments);
     } catch (error) { alertImpl(error.message); }
     finally {
       sendInFlight = false;
@@ -364,8 +427,14 @@ export function mountDesktop({
     }
   };
   $("#interrupt").onclick = async () => {
-    const active = (await request(`/api/agents/${encodeURIComponent(agent.id)}`)).activeTurnId;
-    if (active) await request(`/api/agents/${encodeURIComponent(agent.id)}/interrupt`, { method: "POST", body: JSON.stringify({ turnId: active }) });
+    const agentId = selectedAgentId;
+    if (!agentId || selectionPending) return;
+    const knownTurnId = activeTurnId;
+    try {
+      const snapshot = await request(`/api/agents/${encodeURIComponent(agentId)}`);
+      const turnId = knownTurnId || snapshot.activeTurnId;
+      if (turnId) await request(`/api/agents/${encodeURIComponent(agentId)}/interrupt`, { method: "POST", body: JSON.stringify({ turnId }) });
+    } catch (error) { alertImpl(error.message); }
   };
 
   async function restoreSelection(agents) {
@@ -380,6 +449,8 @@ export function mountDesktop({
   const ready = refreshAgents().then((agents) => restoreSelection(agents)).catch(() => {});
 
   function destroy() {
+    selectionGeneration += 1;
+    selectionPending = false;
     source?.close();
     source = null;
   }

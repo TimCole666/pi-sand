@@ -515,6 +515,10 @@ export class AgentService {
         agents.workspace,
         agents.created_at AS createdAt,
         agents.updated_at AS updatedAt,
+        CASE WHEN EXISTS (
+          SELECT 1 FROM turns
+          WHERE turns.agent_id = agents.id AND turns.status = 'running'
+        ) THEN 'active' ELSE 'idle' END AS state,
         (
           SELECT messages.content
           FROM messages
@@ -555,6 +559,11 @@ export class AgentService {
     const event = (update) => { if (update.agentId === agentId) listener(update); };
     this.events.on("update", event);
     return () => this.events.off("update", event);
+  }
+
+  subscribeRoster(listener) {
+    this.events.on("roster", listener);
+    return () => this.events.off("roster", listener);
   }
 
   sendMessage(agentId, message, options = {}) {
@@ -770,7 +779,10 @@ export class AgentService {
     this.publish(agentId, "turn_finished", { turnId, status, detail });
   }
 
-  publish(agentId, type, data) { this.events.emit("update", { id: randomUUID(), agentId, type, ...data, snapshot: this.snapshot(agentId) }); }
+  publish(agentId, type, data) {
+    this.events.emit("update", { id: randomUUID(), agentId, type, ...data, snapshot: this.snapshot(agentId) });
+    this.events.emit("roster", { id: randomUUID(), type: "roster_updated", agentId, roster: this.listAgents() });
+  }
 }
 
 function promptWithAttachments(message, attachments) {
