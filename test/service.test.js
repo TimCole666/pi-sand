@@ -97,6 +97,47 @@ test("streams updates through the semantic service subscription", async () => wi
   assert.equal(new Set(updates.flatMap((e) => e.snapshot.messages.map((m) => m.id))).size, updates.at(-1).snapshot.messages.length);
 }));
 
+test("same-Agent follow-up reuses one Pi-native session without replaying the durable transcript", async () => {
+  const prompts = [];
+  let factoryCalls = 0;
+  const piFactory = ({ onEvent }) => {
+    factoryCalls += 1;
+    return {
+      prompt({ message }) {
+        prompts.push(message);
+        onEvent({ type: "session", id: "native-session" });
+        onEvent({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: `Streaming ${message}` } });
+        onEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: `Answer to ${message}` }], stopReason: "stop" } });
+        onEvent({ type: "agent_settled" });
+      },
+      abort() {},
+      close() {},
+    };
+  };
+
+  await withService(async (service) => {
+    const agent = service.createAgent({ workspace: "/tmp" });
+    const first = service.sendMessage(agent.agent.id, "Remember the codeword BLUE.");
+    const second = service.sendMessage(agent.agent.id, "Use the codeword from our previous turn to continue.");
+
+    assert.equal(first.status, "completed");
+    assert.equal(second.status, "completed");
+    assert.equal(factoryCalls, 1, "follow-up must use the same live Pi RPC session");
+    assert.deepEqual(prompts, [
+      "Remember the codeword BLUE.",
+      "Use the codeword from our previous turn to continue.",
+    ], "pi-sand sends only the new user prompt, not a transcript replay");
+    const snapshot = service.getAgent(agent.agent.id);
+    assert.deepEqual(snapshot.turns.map((turn) => turn.piSessionId), ["native-session", "native-session"]);
+    assert.deepEqual(snapshot.messages.map((message) => message.content), [
+      "Remember the codeword BLUE.",
+      "Answer to Remember the codeword BLUE.",
+      "Use the codeword from our previous turn to continue.",
+      "Answer to Use the codeword from our previous turn to continue.",
+    ]);
+  }, piFactory);
+});
+
 test("agent_end leaves a Turn running until agent_settled and then finishes exactly once", async () => {
   let execution;
   const piFactory = ({ onEvent, onClose }) => {

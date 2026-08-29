@@ -41,6 +41,7 @@ The observations below were made with Pi `0.84.2`, Node `v26.7.0`, on Linux (`x8
 `pi --mode rpc` accepts strict JSONL commands on stdin and writes responses/events on stdout.
 
 - A prompt command is `{"id":"...","type":"prompt","message":"..."}`. Its response only acknowledges acceptance (`success: true`); execution events arrive asynchronously.
+- The same RPC process accepts subsequent `prompt` commands after `agent_settled`; Pi's in-memory session context is carried into those ordinary follow-up prompts. This is the supported v0.1 continuity boundary. A new process has no continuity guarantee when `--no-session` is used.
 - `get_state` returns a response containing `sessionId`, `isStreaming`, `sessionFile`, and message counts. In the probe, RPC did not emit the JSON-mode session header, so the service should use `get_state` (or its own Agent identity) when it needs the runtime identifier.
 - `abort` returns an acknowledgement and causes the active assistant message to end with `stopReason: "aborted"`. In the observed run, Pi then emitted `turn_end`, `agent_end`, and `agent_settled`; the process itself remained available for more RPC commands until terminated by the probe.
 - An interrupt request is therefore asynchronous: the service must wait for the terminal event and make the product Turn terminal once, rather than assuming the acknowledgement itself means work has stopped.
@@ -68,13 +69,13 @@ The Local Agent Service must classify this child-process close as a failed Turn 
 The smallest proven subprocess seam is:
 
 1. spawn `pi --mode rpc` in the Agent workspace;
-2. send one `prompt` command;
+2. keep that RPC process for the lifetime of the live Agent context and send one `prompt` command per product Turn;
 3. translate `message_update` text deltas and selected tool lifecycle events to service updates;
 4. treat `agent_end` as non-terminal and wait for `agent_settled` plus the final assistant message before normal or interrupted completion;
 5. send `abort` for an interrupt and wait for the resulting `stopReason: "aborted"`;
 6. classify a child close with no terminal event as failure.
 
-This is a concrete Pi CLI contract, not a generic `AgentRuntime` interface. Session continuation, crash recovery, provider substitution, retry loops, planning, and context management remain outside this spike.
+This is a concrete Pi CLI contract, not a generic `AgentRuntime` interface. Native in-process follow-up prompts are covered by the production two-Turn smoke. Session continuation after process/service replacement, crash recovery, provider substitution, retry loops, planning, and a pi-sand-owned context manager remain outside this spike.
 
 ## Evidence classification
 

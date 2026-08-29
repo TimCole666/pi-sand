@@ -128,6 +128,13 @@ export class AgentService {
     }
     this.piFactory = piFactory;
     this.events = new EventEmitter();
+    // A Pi RPC process owns conversational context for one Agent while it is
+    // alive. The process is an execution detail, not the durable Agent
+    // identity; it may be replaced after an unsupported process boundary.
+    this.agentExecutions = new Map();
+    this.activeTurns = new Map();
+    // Keep the active-turn map public for the existing service integration
+    // seam, while agentExecutions retains an idle RPC session for follow-ups.
     this.executions = new Map();
     this.promptRequestIds = new Map();
     this.assistantOutcomes = new Map();
@@ -242,13 +249,16 @@ export class AgentService {
     // Turns remain running until the next service reconciles them; no work is
     // adopted or replayed by this instance after its database closes.
     this.closed = true;
-    for (const [turnId, execution] of this.executions.entries()) {
-      execution.close?.();
+    const activeExecutions = new Map(this.executions);
+    for (const execution of this.agentExecutions.values()) execution.close?.();
+    for (const [turnId, execution] of activeExecutions.entries()) {
       // Deterministic in-process fakes do not cross an OS lifetime boundary.
       // A real Pi child remains unconfirmed until its close is observed or the
       // next service lifetime proves it gone.
       if (!workerMetadata(execution)) this.markWorkerTerminated(turnId);
     }
+    this.agentExecutions.clear();
+    this.activeTurns.clear();
     this.executions.clear();
     this.promptRequestIds.clear();
     this.assistantOutcomes.clear();
@@ -334,12 +344,23 @@ export class AgentService {
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     this.publish(agentId, "turn_started", { turnId });
     const promptRequestId = `prompt-${randomUUID()}`;
-    const execution = this.piFactory({
-      cwd: agent.workspace,
-      onEvent: (event) => this.handlePiEvent(agentId, turnId, event),
-      onClose: (result) => this.handlePiClose(agentId, turnId, result),
-    });
+    let execution = this.agentExecutions.get(agentId);
+    if (!execution) {
+      execution = this.piFactory({
+        cwd: agent.workspace,
+        // One long-lived RPC process is Pi's native conversation context for
+        // this Agent. Route every event to the currently active product Turn;
+        // durable transcript content is never sent back to Pi by pi-sand.
+        onEvent: (event) => {
+          const activeTurnId = this.activeTurns.get(agentId);
+          if (activeTurnId) this.handlePiEvent(agentId, activeTurnId, event);
+        },
+        onClose: (result) => this.handlePiClose(agentId, this.activeTurns.get(agentId), result),
+      });
+      this.agentExecutions.set(agentId, execution);
+    }
     this.executions.set(turnId, execution);
+    this.activeTurns.set(agentId, turnId);
     this.promptRequestIds.set(turnId, promptRequestId);
     const worker = workerMetadata(execution);
     if (worker) {
@@ -403,14 +424,24 @@ export class AgentService {
 
   handlePiClose(agentId, turnId, { code = null, signal = null, error } = {}) {
     if (this.closed) return;
+    // A session can close while idle between Turns. There is no product Turn
+    // to fail in that case; the next request will establish a new Pi context.
+    if (!turnId) {
+      this.agentExecutions.delete(agentId);
+      return;
+    }
     const turn = this.db.prepare("SELECT status FROM turns WHERE id = ?").get(turnId);
-    if (turn?.status !== "running") return;
+    if (turn?.status !== "running") {
+      this.agentExecutions.delete(agentId);
+      return;
+    }
     const detail = error
       ? `Pi failed to start: ${error.message}`
       : signal
         ? `Pi exited with ${signal}`
         : `Pi exited with code ${code}`;
     const interruptedBeforeSettlement = this.interruptingTurns.has(turnId);
+    this.agentExecutions.delete(agentId);
     this.markWorkerTerminated(turnId);
     this.finishTurn(
       agentId,
@@ -441,12 +472,15 @@ export class AgentService {
     const finishedAt = now();
     const terminalDetail = detail || (status === "interrupted" ? "The Turn was interrupted by the user." : "");
     this.db.prepare("UPDATE turns SET status = ?, finished_at = ?, terminal_detail = ? WHERE id = ?").run(status, finishedAt, terminalDetail, turnId);
-    const execution = this.executions.get(turnId);
     this.executions.delete(turnId);
+    if (this.activeTurns.get(agentId) === turnId) this.activeTurns.delete(agentId);
     this.promptRequestIds.delete(turnId);
     this.assistantOutcomes.delete(turnId);
     this.interruptingTurns.delete(turnId);
-    if (execution?.close) execution.close();
+    // Keep the Pi RPC process alive after settlement. Subsequent prompts sent
+    // to that same process use Pi's native in-memory session context. The
+    // process remains an implementation detail and is closed with the service
+    // or replaced after an unsupported process boundary.
     this.publish(agentId, "turn_finished", { turnId, status, detail });
   }
 
