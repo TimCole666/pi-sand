@@ -18,6 +18,53 @@ async function body(req) {
   return text ? JSON.parse(text) : {};
 }
 
+async function rawBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+function parseMultipart(buffer, contentType) {
+  const boundaryMatch = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType ?? "");
+  const boundary = boundaryMatch?.[1] ?? boundaryMatch?.[2];
+  if (!boundary) throw new Error("attachment upload boundary is missing");
+  const marker = Buffer.from(`--${boundary}`);
+  let cursor = 0;
+  while (true) {
+    const start = buffer.indexOf(marker, cursor);
+    if (start < 0) break;
+    const contentStart = start + marker.length;
+    if (buffer.subarray(contentStart, contentStart + 2).toString() === "--") break;
+    const partStart = contentStart + 2;
+    const next = buffer.indexOf(marker, partStart);
+    if (next < 0) break;
+    const part = buffer.subarray(partStart, Math.max(partStart, next - 2));
+    const separator = part.indexOf(Buffer.from("\r\n\r\n"));
+    if (separator >= 0) {
+      const headers = part.subarray(0, separator).toString("utf8");
+      const disposition = /content-disposition:[^\r\n]*name="[^"]*"[^\r\n]*filename="([^"]*)"/i.exec(headers);
+      if (disposition) {
+        const mediaType = /content-type:\s*([^\r\n]+)/i.exec(headers)?.[1]?.trim() || "application/octet-stream";
+        return { filename: disposition[1], contentType: mediaType, bytes: part.subarray(separator + 4) };
+      }
+    }
+    cursor = next;
+  }
+  throw new Error("attachment file is required");
+}
+
+async function attachmentBody(req) {
+  const contentType = req.headers["content-type"] ?? "";
+  if (contentType.toLowerCase().startsWith("multipart/form-data")) return parseMultipart(await rawBody(req), contentType);
+  const value = await body(req);
+  const bytes = Array.isArray(value.bytes)
+    ? Buffer.from(value.bytes)
+    : typeof value.bytes === "string" ? Buffer.from(value.bytes, value.encoding === "utf8" ? "utf8" : "base64")
+      : typeof value.content === "string" ? Buffer.from(value.content, value.encoding === "base64" ? "base64" : "utf8")
+        : Buffer.alloc(0);
+  return { filename: value.filename, contentType: value.contentType, bytes };
+}
+
 function route(pathname) { return pathname.split("/").filter(Boolean); }
 function pathnameIsStatic(pathname) { return pathname === "/" || pathname === "/index.html" || pathname === "/app.js"; }
 
@@ -86,7 +133,16 @@ export function createAgentServer(service) {
         const snapshot = service.getAgent(agentId);
         return snapshot ? json(res, 200, snapshot) : json(res, 404, { error: "agent not found" });
       }
-      if (req.method === "POST" && parts[3] === "turns" && parts.length === 4) return json(res, 201, service.sendMessage(agentId, (await body(req)).message));
+      if (req.method === "POST" && parts[3] === "attachments" && parts.length === 4) {
+        return json(res, 201, { attachment: service.stageAttachment(agentId, await attachmentBody(req)) });
+      }
+      if (req.method === "DELETE" && parts[3] === "attachments" && parts.length === 5) {
+        return json(res, 200, { attachment: service.releaseAttachment(agentId, parts[4]) });
+      }
+      if (req.method === "POST" && parts[3] === "turns" && parts.length === 4) {
+        const request = await body(req);
+        return json(res, 201, service.sendMessage(agentId, request.message, { attachments: request.attachments }));
+      }
       if (req.method === "POST" && parts[3] === "interrupt" && parts.length === 4) return json(res, 200, service.interrupt(agentId, (await body(req)).turnId));
       if (req.method === "GET" && parts[3] === "events" && parts.length === 4) {
         res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });

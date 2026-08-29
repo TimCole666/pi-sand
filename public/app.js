@@ -5,7 +5,12 @@ function readDrafts(storage) {
   try {
     const value = JSON.parse(storage.getItem(DRAFTS_KEY) ?? "{}");
     if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-    return Object.fromEntries(Object.entries(value).filter(([, draft]) => typeof draft === "string"));
+    return Object.fromEntries(Object.entries(value).flatMap(([id, draft]) => {
+      if (typeof draft === "string") return [[id, { text: draft, attachments: [] }]];
+      if (!draft || typeof draft !== "object") return [];
+      const attachments = Array.isArray(draft.attachments) ? draft.attachments.filter((attachment) => attachment?.id && attachment.filename) : [];
+      return [[id, { text: typeof draft.text === "string" ? draft.text : "", attachments }]];
+    }));
   } catch {
     return {};
   }
@@ -46,12 +51,29 @@ export function mountDesktop({
     try { localStorage.setItem(DRAFTS_KEY, JSON.stringify(drafts)); } catch { /* Storage may be unavailable; the current input remains usable. */ }
   }
 
+  function currentDraft(agentId = selectedAgentId) {
+    return drafts[agentId] ?? { text: "", attachments: [] };
+  }
+
   function setDraft(agentId, value) {
     if (!agentId) return;
-    if (value) drafts[agentId] = value;
-    else delete drafts[agentId];
+    const draft = currentDraft(agentId);
+    draft.text = value;
+    if (!draft.text && draft.attachments.length === 0) delete drafts[agentId];
+    else drafts[agentId] = draft;
     persistDrafts();
     renderAgentList(roster);
+  }
+
+  function setDraftAttachments(agentId, attachments) {
+    if (!agentId) return;
+    const draft = currentDraft(agentId);
+    draft.attachments = attachments;
+    if (!draft.text && draft.attachments.length === 0) delete drafts[agentId];
+    else drafts[agentId] = draft;
+    persistDrafts();
+    renderAgentList(roster);
+    renderAttachments(draft.attachments);
   }
 
   function setConnectionState(state, message) {
@@ -65,16 +87,18 @@ export function mountDesktop({
     if (retry) retry.hidden = state === "connected";
   }
 
-  async function request(url, options) {
-    const response = await fetchImpl(`${apiBase}${url}`, { headers: { "content-type": "application/json" }, ...options });
+  async function request(url, options = {}) {
+    const headers = { ...options.headers };
+    if (options.body === undefined || typeof options.body === "string") headers["content-type"] ??= "application/json";
+    const response = await fetchImpl(`${apiBase}${url}`, { ...options, headers });
     const data = await response.json();
     if (!response.ok) throw Error(data.error);
     return data;
   }
 
   function previewFor(item) {
-    const draft = drafts[item.id];
-    return draft?.trim() ? draft : item.recentPreview?.trim() || "No messages yet.";
+    const draft = currentDraft(item.id);
+    return draft.text?.trim() ? draft.text : item.recentPreview?.trim() || "No messages yet.";
   }
 
   function renderAgentList(agents) {
@@ -132,6 +156,25 @@ export function mountDesktop({
     if (submit) submit.disabled = active || sendInFlight;
   }
 
+  function renderAttachments(attachments = currentDraft().attachments) {
+    const list = $("#attachments");
+    if (!list) return;
+    list.innerHTML = attachments.map((attachment) =>
+      `<span class="attachment-chip" data-attachment-id="${escapeHtml(attachment.id)}">${escapeHtml(attachment.filename)} <button type="button" aria-label="Remove ${escapeHtml(attachment.filename)}">×</button></span>`
+    ).join("");
+    for (const button of list.querySelectorAll?.("[data-attachment-id] button") ?? []) {
+      button.addEventListener("click", async () => {
+        const chip = button.closest("[data-attachment-id]");
+        const id = chip?.dataset.attachmentId;
+        if (!id || !agent) return;
+        try {
+          await request(`/api/agents/${encodeURIComponent(agent.id)}/attachments/${encodeURIComponent(id)}`, { method: "DELETE" });
+          setDraftAttachments(agent.id, currentDraft(agent.id).attachments.filter((attachment) => attachment.id !== id));
+        } catch (error) { alertImpl(error.message); }
+      });
+    }
+  }
+
   function render(snapshot) {
     agent = snapshot.agent;
     selectedAgentId = snapshot.agent.id;
@@ -140,12 +183,13 @@ export function mountDesktop({
     $("#conversation").hidden = false;
     $("#agent-meta").textContent = `${agent.name} · ${agent.workspace}`;
     $("#messages").innerHTML = snapshot.messages.map((message) =>
-      `<div class="message ${escapeHtml(message.role)}" data-id="${escapeHtml(message.id)}">${escapeHtml(message.content)}</div>`
+      `<div class="message ${escapeHtml(message.role)}" data-id="${escapeHtml(message.id)}">${escapeHtml(message.content)}${(message.attachments ?? []).map((attachment) => `<span class="message-attachment">📎 ${escapeHtml(attachment.filename)}</span>`).join("")}</div>`
     ).join("");
     $("#status").textContent = snapshot.state === "active" ? "Pi is working…" : terminalStatus(snapshot);
     $("#status").className = snapshot.state === "active" ? "running" : snapshot.turns.at(-1)?.status === "failed" ? "error" : "";
     $("#interrupt").hidden = !snapshot.activeTurnId;
     updateComposerState(Boolean(snapshot.activeTurnId));
+    renderAttachments();
     renderAgentList(roster);
   }
 
@@ -157,7 +201,8 @@ export function mountDesktop({
     localStorage.setItem(SELECTED_AGENT_KEY, id);
     render(snapshot);
     const input = composerInput();
-    if (input) input.value = drafts[id] ?? "";
+    if (input) input.value = currentDraft(id).text;
+    renderAttachments(currentDraft(id).attachments);
     source = new EventSourceImpl(`${apiBase}/api/agents/${encodeURIComponent(id)}/events`);
     source.onopen = () => setConnectionState("connected", "");
     source.onerror = () => setConnectionState("reconnecting", "Reconnecting to your computer…");
@@ -186,6 +231,22 @@ export function mountDesktop({
 
   const input = composerInput();
   input?.addEventListener?.("input", () => setDraft(selectedAgentId, input.value));
+  $("#pick-file")?.addEventListener?.("click", () => $("#file-input")?.click());
+  $("#file-input")?.addEventListener?.("change", async (event) => {
+    if (!agent) return;
+    const existing = currentDraft(agent.id).attachments;
+    try {
+      const uploaded = [];
+      for (const file of [...event.target.files]) {
+        const form = new FormDataImpl();
+        form.append("file", file, file.name);
+        const result = await request(`/api/agents/${encodeURIComponent(agent.id)}/attachments`, { method: "POST", body: form });
+        uploaded.push(result.attachment);
+      }
+      setDraftAttachments(agent.id, [...existing, ...uploaded]);
+    } catch (error) { alertImpl(error.message); }
+    finally { event.target.value = ""; }
+  });
   $("#send").onsubmit = async (event) => {
     event.preventDefault();
     if (!agent || activeTurnId || sendInFlight) return;
@@ -194,9 +255,10 @@ export function mountDesktop({
     sendInFlight = true;
     updateComposerState();
     try {
-      await request(`/api/agents/${encodeURIComponent(agent.id)}/turns`, { method: "POST", body: JSON.stringify({ message }) });
+      await request(`/api/agents/${encodeURIComponent(agent.id)}/turns`, { method: "POST", body: JSON.stringify({ message, attachments: currentDraft(agent.id).attachments.map((attachment) => attachment.id) }) });
       if (messageInput) messageInput.value = "";
       setDraft(agent.id, "");
+      setDraftAttachments(agent.id, []);
     } catch (error) { alertImpl(error.message); }
     finally {
       sendInFlight = false;
