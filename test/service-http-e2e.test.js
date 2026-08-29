@@ -98,7 +98,7 @@ test("Local Agent Service HTTP/SSE transport closes during work and reconnects t
     assert.equal(reconnectSnapshot.activeTurnId, turn.id);
     assert.deepEqual(reconnectSnapshot.messages.map((message) => message.id), whileClosed.messages.map((message) => message.id));
 
-    const execution = service.executions.get(turn.id);
+    const execution = service.turnExecutions.get(turn.id);
     execution.release();
     await eventually(() => reopenedDesktop.events.some((event) => event.type === "turn_finished"), "reopened Desktop did not receive completion");
     await reopenedDesktop.close();
@@ -150,11 +150,11 @@ test("Local Agent Service HTTP/SSE connections reconnect independently across co
       "each reconnected Desktop did not receive its own active Turn",
     );
 
-    service.executions.get(turnA.id).release();
+    service.turnExecutions.get(turnA.id).release();
     await eventually(() => reopenedA.events.some((event) => event.type === "turn_finished"), "reconnected Desktop A did not observe completion");
     assert.equal((await json(base, `/api/agents/${agentB.agent.id}`)).activeTurnId, turnB.id);
 
-    service.executions.get(turnB.id).release();
+    service.turnExecutions.get(turnB.id).release();
     await eventually(() => reopenedB.events.some((event) => event.type === "turn_finished"), "reconnected Desktop B did not observe completion");
   } finally {
     await Promise.allSettled([firstA?.close(), firstB?.close(), reopenedA?.close(), reopenedB?.close()]);

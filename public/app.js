@@ -250,9 +250,17 @@ export function mountDesktop({
     }
   }
 
+  function updateRosterFromSnapshot(snapshot) {
+    const latest = snapshot.messages.at(-1);
+    roster = roster.map((item) => item.id === snapshot.agent.id
+      ? { ...item, recentPreview: latest?.content ?? null }
+      : item);
+  }
+
   function render(snapshot) {
     agent = snapshot.agent;
     selectedAgentId = snapshot.agent.id;
+    updateRosterFromSnapshot(snapshot);
     activeTurnId = snapshot.activeTurnId;
     $("#setup").hidden = false;
     $("#conversation").hidden = false;

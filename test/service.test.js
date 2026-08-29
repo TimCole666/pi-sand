@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { basename, join, relative } from "node:path";
+import { basename, join } from "node:path";
 import { AgentService, defaultDatabasePath } from "../src/service.js";
 
 function fakePi({ onEvent, onClose }) {
@@ -200,6 +200,22 @@ test("a rejected Pi prompt fails one Turn without waiting for process close", as
     assert.equal(snapshot.turns[0].status, "failed");
     assert.equal(snapshot.turns[0].terminalDetail, "Pi rejected the prompt: workspace is unavailable");
     assert.equal(updates.filter((event) => event.type === "turn_finished").length, 1);
+  }, piFactory);
+});
+
+test("an unavailable Pi executable becomes an understandable product failure", async () => {
+  const piFactory = ({ onClose }) => ({
+    prompt() { onClose({ error: Object.assign(new Error("spawn pi ENOENT"), { code: "ENOENT" }) }); },
+    abort() {},
+    close() {},
+  });
+  await withService(async (service) => {
+    const agent = service.createAgent({ workspace: "/tmp" });
+    service.sendMessage(agent.agent.id, "Start work");
+    const snapshot = service.getAgent(agent.agent.id);
+    assert.equal(snapshot.turns[0].status, "failed");
+    assert.equal(snapshot.turns[0].terminalDetail, "Pi is unavailable or incompatible with the required lifecycle contract.");
+    assert.doesNotMatch(snapshot.turns[0].terminalDetail, /spawn pi|ENOENT/);
   }, piFactory);
 });
 
@@ -449,8 +465,11 @@ test("Agent creation persists a canonical workspace and rejects missing or non-d
   await writeFile(file, "not a directory");
   const service = new AgentService({ dbPath: path, piFactory: fakePi });
   try {
-    const agent = service.createAgent({ workspace: relative(process.cwd(), directory) });
+    const agent = service.createAgent({ workspace: directory });
     assert.equal(agent.agent.workspace, directory);
+    assert.throws(() => service.createAgent({ workspace: "." }), /absolute path or use ~ home notation/);
+    assert.throws(() => service.createAgent({ workspace: `./${basename(directory)}` }), /absolute path or use ~ home notation/);
+    assert.throws(() => service.createAgent({ workspace: `../${basename(directory)}` }), /absolute path or use ~ home notation/);
     assert.throws(() => service.createAgent({ workspace: join(directory, "missing") }), /workspace must exist and be a directory/);
     assert.throws(() => service.createAgent({ workspace: file }), /workspace must exist and be a directory/);
   } finally {

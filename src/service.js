@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { acquireDatabaseLock } from "./database-lock.js";
+import { processIsAlive } from "./process.js";
 import { spawnPi } from "./pi.js";
 
 const TERMINAL = new Set(["completed", "failed", "interrupted"]);
@@ -14,16 +15,6 @@ function now() { return new Date().toISOString(); }
 
 function sleepSync(milliseconds) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
-}
-
-function processIsAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error.code === "EPERM";
-  }
 }
 
 // Linux exposes a process start identity in /proc. A PID alone can be reused;
@@ -63,9 +54,10 @@ function processGroupIsAlive(processGroupId) {
 }
 
 function workerIsGone(worker) {
-  if (!processIsAlive(worker.workerPid)) return !processGroupIsAlive(worker.workerPgid);
+  const groupAlive = processGroupIsAlive(worker.workerPgid);
+  if (!processIsAlive(worker.workerPid)) return !groupAlive;
   const currentIdentity = processStartIdentity(worker.workerPid);
-  if (worker.workerStartIdentity && currentIdentity && currentIdentity !== worker.workerStartIdentity) return true;
+  if (worker.workerStartIdentity && currentIdentity && currentIdentity !== worker.workerStartIdentity) return !groupAlive;
   return false;
 }
 
@@ -106,6 +98,7 @@ export function defaultDatabasePath() {
 function canonicalWorkspace(workspace) {
   if (typeof workspace !== "string" || !workspace.trim()) throw new Error("workspace is required");
   const expanded = workspace === "~" ? homedir() : workspace.startsWith("~/") ? join(homedir(), workspace.slice(2)) : workspace;
+  if (!isAbsolute(expanded)) throw new Error("workspace must be an absolute path or use ~ home notation");
   try {
     const canonical = realpathSync.native(resolve(expanded));
     if (!statSync(canonical).isDirectory()) throw new Error("not a directory");
@@ -135,11 +128,11 @@ export class AgentService {
     // A Pi RPC process owns conversational context for one Agent while it is
     // alive. The process is an execution detail, not the durable Agent
     // identity; it may be replaced after an unsupported process boundary.
-    this.agentExecutions = new Map();
+    this.agentSessions = new Map();
     this.activeTurns = new Map();
     // Keep the active-turn map public for the existing service integration
-    // seam, while agentExecutions retains an idle RPC session for follow-ups.
-    this.executions = new Map();
+    // seam, while agentSessions retains an idle RPC session for follow-ups.
+    this.turnExecutions = new Map();
     this.promptRequestIds = new Map();
     this.assistantOutcomes = new Map();
     this.interruptingTurns = new Set();
@@ -231,12 +224,16 @@ export class AgentService {
 
   ensureWorkspaceSafe(workspace) {
     const workers = this.db.prepare(`
-      SELECT turns.id, turns.worker_pid AS workerPid, turns.worker_pgid AS workerPgid,
+      SELECT turns.id, turns.agent_id AS agentId, turns.worker_pid AS workerPid, turns.worker_pgid AS workerPgid,
              turns.worker_start_identity AS workerStartIdentity
       FROM turns JOIN agents ON agents.id = turns.agent_id
       WHERE agents.workspace = ? AND turns.worker_terminated = 0
     `).all(workspace);
     for (const worker of workers) {
+      // An idle Pi RPC session owned by this service is the native context for
+      // a later Turn, not an orphan from an earlier service lifetime. Only
+      // reconcile workers for which this service has no owning session.
+      if (this.agentSessions.has(worker.agentId)) continue;
       if (stopPriorWorker(worker)) this.markWorkerTerminated(worker.id);
       else this.unsafeWorkspaces.add(workspace);
     }
@@ -272,17 +269,17 @@ export class AgentService {
     // Turns remain running until the next service reconciles them; no work is
     // adopted or replayed by this instance after its database closes.
     this.closed = true;
-    const activeExecutions = new Map(this.executions);
-    for (const execution of this.agentExecutions.values()) execution.close?.();
+    const activeExecutions = new Map(this.turnExecutions);
+    for (const execution of this.agentSessions.values()) execution.close?.();
     for (const [turnId, execution] of activeExecutions.entries()) {
       // Deterministic in-process fakes do not cross an OS lifetime boundary.
       // A real Pi child remains unconfirmed until its close is observed or the
       // next service lifetime proves it gone.
       if (!workerMetadata(execution)) this.markWorkerTerminated(turnId);
     }
-    this.agentExecutions.clear();
+    this.agentSessions.clear();
     this.activeTurns.clear();
-    this.executions.clear();
+    this.turnExecutions.clear();
     this.promptRequestIds.clear();
     this.assistantOutcomes.clear();
     this.interruptingTurns.clear();
@@ -340,9 +337,11 @@ export class AgentService {
     if (!new Set(["staged", "committed", "released"]).has(state)) throw new Error("attachment state is invalid");
     return this.db.prepare(`
       SELECT id, filename, content_type AS contentType, byte_size AS byteSize,
-             state, created_at AS createdAt, updated_at AS updatedAt
+             storage_path AS storagePath, state, created_at AS createdAt, updated_at AS updatedAt
       FROM attachments WHERE agent_id = ? AND state = ? ORDER BY created_at, id
-    `).all(agentId, state);
+    `).all(agentId, state)
+      .filter((attachment) => existsSync(attachment.storagePath))
+      .map(({ storagePath, ...attachment }) => attachment);
   }
 
   attachmentForSend(agentId, id) {
@@ -465,7 +464,7 @@ export class AgentService {
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     this.publish(agentId, "turn_started", { turnId });
     const promptRequestId = `prompt-${randomUUID()}`;
-    let execution = this.agentExecutions.get(agentId);
+    let execution = this.agentSessions.get(agentId);
     if (!execution) {
       execution = this.piFactory({
         cwd: agent.workspace,
@@ -478,9 +477,9 @@ export class AgentService {
         },
         onClose: (result) => this.handlePiClose(agentId, this.activeTurns.get(agentId), result),
       });
-      this.agentExecutions.set(agentId, execution);
+      this.agentSessions.set(agentId, execution);
     }
-    this.executions.set(turnId, execution);
+    this.turnExecutions.set(turnId, execution);
     this.activeTurns.set(agentId, turnId);
     this.promptRequestIds.set(turnId, promptRequestId);
     const worker = workerMetadata(execution);
@@ -500,7 +499,7 @@ export class AgentService {
   interrupt(agentId, turnId) {
     const turn = this.db.prepare("SELECT status FROM turns WHERE id = ? AND agent_id = ?").get(turnId, agentId);
     if (!turn || turn.status !== "running") return this.getAgent(agentId);
-    const execution = this.executions.get(turnId);
+    const execution = this.turnExecutions.get(turnId);
     if (!execution) { this.finishTurn(agentId, turnId, "interrupted"); return this.getAgent(agentId); }
     if (this.interruptingTurns.has(turnId)) return this.getAgent(agentId);
     this.interruptingTurns.add(turnId);
@@ -552,21 +551,21 @@ export class AgentService {
     // A session can close while idle between Turns. There is no product Turn
     // to fail in that case; the next request will establish a new Pi context.
     if (!turnId) {
-      this.agentExecutions.delete(agentId);
+      this.agentSessions.delete(agentId);
       return;
     }
     const turn = this.db.prepare("SELECT status FROM turns WHERE id = ?").get(turnId);
     if (turn?.status !== "running") {
-      this.agentExecutions.delete(agentId);
+      this.agentSessions.delete(agentId);
       return;
     }
     const detail = error
-      ? `Pi failed to start: ${error.message}`
+      ? piStartupDetail(error)
       : signal
         ? `Pi exited with ${signal}`
         : `Pi exited with code ${code}`;
     const interruptedBeforeSettlement = this.interruptingTurns.has(turnId);
-    this.agentExecutions.delete(agentId);
+    this.agentSessions.delete(agentId);
     this.markWorkerTerminated(turnId);
     this.finishTurn(
       agentId,
@@ -597,7 +596,7 @@ export class AgentService {
     const finishedAt = now();
     const terminalDetail = detail || (status === "interrupted" ? "The Turn was interrupted by the user." : "");
     this.db.prepare("UPDATE turns SET status = ?, finished_at = ?, terminal_detail = ? WHERE id = ?").run(status, finishedAt, terminalDetail, turnId);
-    this.executions.delete(turnId);
+    this.turnExecutions.delete(turnId);
     if (this.activeTurns.get(agentId) === turnId) this.activeTurns.delete(agentId);
     this.promptRequestIds.delete(turnId);
     this.assistantOutcomes.delete(turnId);
@@ -631,4 +630,14 @@ function promptRejectionDetail(event) {
 
 function assistantErrorDetail(outcome) {
   return outcome?.errorMessage ? `Pi assistant error: ${outcome.errorMessage}` : "Pi assistant ended with an error.";
+}
+
+function piStartupDetail(error) {
+  const message = String(error?.message ?? "");
+  const unavailable = ["ENOENT", "EACCES", "ENOTDIR"].includes(error?.code)
+    || /\b(?:ENOENT|EACCES|ENOTDIR)\b/i.test(message)
+    || /^spawn\s+\S+\s+(?:ENOENT|EACCES|ENOTDIR)$/i.test(message);
+  return unavailable
+    ? "Pi is unavailable or incompatible with the required lifecycle contract."
+    : `Pi failed to start: ${message || "an unknown startup error occurred"}`;
 }

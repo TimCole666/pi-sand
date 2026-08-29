@@ -115,6 +115,7 @@ test("Desktop client harness creates, opens, sends, streams, and renders a compl
   assert.match(view.elements.messages.innerHTML, /Done\./);
   assert.equal(view.elements.status.textContent, "Turn completed.");
   assert.equal(view.elements.interrupt.hidden, true);
+  assert.match(view.elements["agent-list"].innerHTML, /Done\./, "roster preview should reflect the latest durable assistant message");
 }));
 
 test("Desktop client harness reopens a completed durable transcript and terminal state", async () => withDesktop(async ({ service, base, directory }) => {
@@ -142,7 +143,7 @@ test("Desktop client harness reconnects to the same active Turn and one result",
   await reopened.client.ready;
   await eventually(() => reopened.sources.length === 1, "reopened Desktop did not load active Agent");
   assert.equal(reopened.elements.status.textContent, "Pi is working…");
-  service.executions.get(service.getAgent(agentId).activeTurnId).release();
+  service.turnExecutions.get(service.getAgent(agentId).activeTurnId).release();
   reopened.sources[0].deliver(service.getAgent(agentId));
   assert.equal(reopened.elements.status.textContent, "Turn completed.");
   assert.match(reopened.elements.messages.innerHTML, /Done later\./);

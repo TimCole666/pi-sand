@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -99,6 +99,47 @@ test("service restart terminates an orphan worker before releasing its workspace
   } finally {
     if (child.exitCode === null) child.kill("SIGKILL");
     await waitForExit(child).catch(() => {});
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a reused worker PID does not bypass a still-live recorded process group", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-sand-reused-worker-pid-"));
+  const dbPath = join(directory, "state.sqlite");
+  const marker = join(directory, "reused-worker-terminated");
+  const worker = spawn(process.execPath, ["-e", "const fs = require('node:fs'); process.on('SIGTERM', () => { fs.writeFileSync(process.env.MARKER, 'terminated'); process.exit(0); }); setInterval(() => {}, 1000)"], {
+    detached: true,
+    stdio: "ignore",
+    env: { ...process.env, MARKER: marker },
+  });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const first = new AgentService({ dbPath, piFactory: completingPi });
+    const agent = first.createAgent({ workspace: directory });
+    first.close();
+
+    const db = new DatabaseSync(dbPath);
+    const turnId = randomUUID();
+    const timestamp = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO turns (id, agent_id, user_message, status, started_at, worker_pid, worker_pgid, worker_start_identity, worker_terminated)
+      VALUES (?, ?, ?, 'running', ?, ?, ?, ?, 0)
+    `).run(turnId, agent.agent.id, "Prior worker with a reused PID", timestamp, worker.pid, worker.pid, "not-the-current-process");
+    db.close();
+
+    const second = new AgentService({ dbPath, piFactory: completingPi });
+    try {
+      assert.equal(second.getAgent(agent.agent.id).turns[0].status, "interrupted");
+      assert.equal(existsSync(marker), true, "reconciliation must terminate the live recorded group");
+      await waitForExit(worker);
+      const nextTurn = second.sendMessage(agent.agent.id, "Use the workspace after the worker is gone");
+      assert.equal(nextTurn.status, "completed");
+    } finally {
+      second.close();
+    }
+  } finally {
+    if (worker.exitCode === null) worker.kill("SIGKILL");
+    await waitForExit(worker).catch(() => {});
     await rm(directory, { recursive: true, force: true });
   }
 });
