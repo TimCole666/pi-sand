@@ -1,6 +1,6 @@
 # pi-sand v0.1 — Pi-native Grok Bot 0.18 Compatibility Specification
 
-Status: **Draft for second independent review**
+Status: **Draft for third independent review**
 
 ## Problem Statement
 
@@ -54,42 +54,43 @@ Evidence can justify a behavioral requirement or test. Evidence alone must not c
 
 1. As a user, I want a persistent two-pane desktop shell with an Agent/chat roster and a selected conversation workspace so that pi-sand feels like a coherent Agent product rather than a developer page.
 2. As a user, I want the roster to provide New-chat creation, saved Agent rows, a useful empty state, loading/connecting state, reconnect feedback, an unreachable/error state, and Retry.
-3. As a user, I want each Agent row to show a stable identity marker and name plus useful recent context when available, such as a draft or recent message preview.
-4. As a user, I want selecting an Agent to open that Agent's conversation without affecting whether another Agent is working.
+3. As a user, I want each Agent row to show a stable identity marker and name plus deterministic recent context: a nonempty draft preview first, otherwise the latest durable user/assistant preview when available.
+4. As a user, I want selecting an Agent to open that Agent's conversation without changing that Agent's execution ownership.
 5. As a user, I want the last selected Agent to be restored after reopening when that Agent still exists, with a sensible fallback when it does not.
-6. As a user, I want the selected conversation header to show the Agent identity and a visible Working state while that Agent is active.
+6. As a user, I want the selected conversation header to show the Agent identity and a visible `Working` state while that Agent is active.
 7. As a user, I want user and assistant messages to appear as a readable conversation rather than a process log.
 8. As a user, I want visible assistant output to stream into the conversation when Pi emits usable streaming output.
-9. As a user, I want transcript ordering and message identity to remain stable across reconnect so content is not duplicated or reordered.
-10. As a user, I want a bottom conversation composer with ordinary natural-language input and an explicit send action without choosing a workflow or skill.
-11. As a user, I want an unsent draft to be preserved independently per Agent while I switch between Agents.
-12. As a user, I want an unsent per-Agent draft to survive Desktop close/reopen and be reconciled with the restored Agent roster.
-13. As a user, I want the composer to make starting another Turn unavailable while the selected Agent already has a running Turn rather than letting me submit an operation the service will reject.
-14. As a user, I want to attach files through a picker, drag/drop, or pasted file input where the Desktop platform supports it.
-15. As a user, I want selected attachments to appear in the composer with removal controls and understandable failure/limit feedback.
-16. As a user, I want a sent attachment to remain associated with the durable user message after reopen and to be available to Pi for the submitted request.
-17. As a user, I want a running Agent to look visibly alive through a clear working state and stable Pi-derived activity when such activity has a reliable product meaning.
-18. As a user, I want the shell to preserve my Agents during transient connectivity failure and communicate reconnect/error state without implying that durable Agents disappeared.
+9. As a user, I want a bottom conversation composer with ordinary natural-language input and an explicit send action without choosing a workflow or skill.
+10. As a user, I want an unsent draft to be preserved independently per Agent while I switch between Agents.
+11. As a user, I want an unsent per-Agent draft to survive Desktop close/reopen and be reconciled with the restored Agent roster.
+12. As a user, I want to attach files through a picker, drag/drop, or pasted-file input where the supported Desktop platform permits it.
+13. As a user, I want selected attachments to appear in the composer with removal controls and understandable failure/limit feedback.
+14. As a user, I want a running Agent to have a clear visible `Working` state.
+15. As a user, I want the shell to preserve my saved Agents during transient connectivity failure and communicate reconnect/error state without implying that durable Agents disappeared.
 
 ### B. pi-sand Extensions — Required
 
-19. As a user, I want launching pi-sand to establish the local product service without requiring me to start a server, choose a port, or keep a terminal open.
-20. As a user, I want closing the Desktop window to leave the Local Agent Service and active Pi work running.
-21. As a user, I want reopening pi-sand to reconnect to authoritative Agent, Turn, transcript, workspace, and execution state without replaying work or duplicating transcript content.
-22. As a user, I want to stop the selected Agent's active Turn without affecting another independent running Agent.
-23. As a user, I want completed, failed, and interrupted Turn outcomes to remain durable and understandable after reopen.
-24. As a user, I want two Agents in different canonical workspaces to be able to work concurrently.
-25. As a user, I want the product to reject overlapping work when the same Agent already has a running Turn or when another Agent is already running in the same canonical workspace.
-26. As a user, I want equivalent workspace paths such as `~`, normalized absolute paths, and symlink/realpath aliases to resolve to one canonical workspace identity.
-27. As a user, I want invalid, missing, or non-directory workspaces rejected before work starts.
-28. As a user, I want common failures to appear as product-level states rather than raw process/RPC/database accidents.
-29. As a user, I want service restart to classify every previously persisted running Turn explicitly instead of replaying it, adopting an old worker, or pretending it is still running.
-30. As a user, I want ordinary follow-up requests within an Agent to use Pi-native conversational context while pi-sand keeps durable transcript state separate from Pi model context.
+16. As a user, I want launching pi-sand to establish the local product service without requiring me to start a server, choose a port, or keep a terminal open.
+17. As a user, I want closing the Desktop window or process to leave the Local Agent Service and active Pi work running.
+18. As a user, I want reopening pi-sand to reconnect to authoritative Agent, Turn, transcript, workspace, and execution state without replaying work or duplicating/reordering transcript content.
+19. As a user, I want the composer to make starting another Turn unavailable while the selected Agent already has a running Turn rather than letting me submit an operation the service will reject.
+20. As a user, I want to stop the selected Agent's active Turn without affecting another independent running Agent.
+21. As a user, I want completed, failed, and interrupted Turn outcomes to remain durable and understandable after reopen.
+22. As a user, I want two Agents in different canonical workspaces to be able to work concurrently.
+23. As a user, I want the product to reject overlapping work when the same Agent already has a running Turn or when another Agent is already running in the same canonical workspace.
+24. As a user, I want workspace inputs using absolute paths or `~` / `~/...` home notation to resolve to one canonical real filesystem identity, including symlink/realpath aliases.
+25. As a user, I want unsupported relative paths, missing paths, and non-directory paths rejected before work starts.
+26. As a user, I want common failures to appear as product-level states rather than raw process/RPC/database accidents.
+27. As a user, I want service restart to produce one explicit durable `interrupted` outcome for every previously persisted running Turn, without replaying it, adopting an old worker, or pretending it is still running.
+28. As a user, I want ordinary follow-up requests within an Agent to use Pi-native conversational context while pi-sand keeps durable transcript state separate from Pi model context.
+29. As a user, I want a sent attachment to remain associated with the durable user message after reopen and to be available to Pi for the submitted request.
+30. As a user, I want a persisted unsent draft that references staged attachments to remain sendable after Desktop close/reopen without silently restoring dead file references.
 
 ### C. Conditional or deferred behavior — Not v0.1 release gates unless promoted by later evidence
 
 - **Needs-attention / awaiting-user-response semantics:** the visual concept is evidence-backed, but v0.1 does not require a waiting-for-user interaction contract unless a stable Pi request-for-user-input seam is proven and specified.
 - **Unread activity transitions:** the presentation concept is evidence-backed, but exact unread transition semantics are not a v0.1 gate.
+- **Richer Pi-derived activity:** `Working` is required; tool/activity detail is deferred until a concrete stable Pi-event → product-state mapping is specified.
 - **Reply-to-message context:** evidence supports reply UI, but reply behavior is deferred unless separately promoted after the Pi conversational-context contract is proven sufficient.
 - **Voice input/dictation:** evidence-backed but deferred.
 - **Complete rich mention/provider behavior:** deferred.
@@ -111,11 +112,19 @@ The following remain authoritative:
 
 pi-sand must not add a second planner, workflow engine, scheduler, queue, worker pool, or generic runtime platform around Pi.
 
+### Domain mapping
+
+The Grok-style `New chat` affordance creates a new durable pi-sand **Agent**. v0.1 does not introduce a separate durable Chat domain object.
+
+A Turn remains one submitted unit of work inside an Agent conversation.
+
 ### Product state ownership
 
-The Local Agent Service is authoritative for durable Agent identity, Turns, transcript, workspace association, and execution state.
+The Local Agent Service is authoritative for durable Agent identity, Turns, transcript, workspace association, attachment commit metadata, and execution state.
 
 Desktop-owned presentation state such as selected Agent and unsent per-Agent drafts is persisted on the Desktop and reconciled against authoritative service state after reconnect.
+
+For unsent attachments, the Desktop owns the draft reference while the Local Agent Service owns the staged bytes. A draft reference must remain valid for as long as that attachment remains part of the persisted draft.
 
 The product must not move client-only state into the service merely for convenience unless a concrete cross-Desktop requirement appears later.
 
@@ -125,9 +134,21 @@ Normal product use must not depend on `npm start`, an attached shell, or a user-
 
 Launching the product must establish or start the Local Agent Service. Failure to do so becomes the same connecting/retry/error product experience used for other local connectivity failures.
 
+Normal Desktop-window/process closure must not stop the Local Agent Service or active Pi work.
+
 The implementation may use a native launcher, per-user service manager, or another Linux-appropriate mechanism. v0.1 specifies behavior, not the service-manager technology.
 
 Only one Local Agent Service process may own a given pi-sand SQLite database at a time.
+
+### Local control-plane access boundary
+
+The Local Agent Service is a privileged local control plane: it can create Agents, stage files, start Pi, submit prompts, and interrupt work under the user's normal OS privileges.
+
+Its mutation/control surface must not be exposed on non-local network interfaces.
+
+If browser-reachable HTTP or another browser-accessible transport is used, an arbitrary webpage or browser origin must not be able to create Agents, submit prompts, interrupt Turns, or stage/commit attachments merely because it can reach the local endpoint.
+
+The concrete transport, origin-checking, local capability, authentication, or equivalent protection mechanism is an implementation choice. The user-visible/security invariant is local single-user control, not LAN or arbitrary-origin control.
 
 ### Conversation and Pi context
 
@@ -139,7 +160,7 @@ Pi process/session identity remains replaceable and never becomes Agent identity
 
 If the concrete Pi integration cannot provide safe cross-Turn continuity without violating these ownership rules, that is a release-blocking product gap to resolve at the Pi integration boundary rather than by adding a pi-sand memory/orchestration layer.
 
-### Attachment ownership and durability
+### Attachment ownership, durability, and draft lifetime
 
 Attachment bytes must be staged into Local Agent Service-owned local storage before send.
 
@@ -147,13 +168,28 @@ A successful send commits stable attachment metadata with the durable user messa
 
 After send/reopen, the transcript must still identify the attachment as part of the durable user message even if the Desktop process that originally selected the file is gone.
 
-Staged-but-unsent files are temporary product state and may be garbage-collected after the owning draft is cleared or after a bounded cleanup policy. Exact on-disk layout and cleanup timing are implementation details.
+For an unsent persisted draft, staged bytes referenced by that draft must remain valid until one of these events occurs:
+
+- the attachment is removed from the draft;
+- the draft is successfully sent and the attachment is committed;
+- the draft is explicitly cleared/replaced so the reference is no longer live.
+
+Bounded garbage collection applies only to orphaned/unreferenced staging data. v0.1 must not silently restore a persisted draft whose live attachment references were garbage-collected.
+
+Exact on-disk layout and orphan-cleanup timing are implementation details.
 
 ### Workspace semantics and trust
 
 Workspace association defines Pi's canonical working directory and an explicit user-intent trust context.
 
-Workspace creation must expand supported home notation, resolve relative/normalized paths, follow realpath/symlink aliases, verify the path exists and is a directory, and persist the canonical path.
+The supported v0.1 text-path contract accepts:
+
+- absolute filesystem paths;
+- `~` and `~/...` home notation.
+
+Other relative paths are rejected in v0.1 rather than being resolved against an arbitrary process working directory.
+
+Accepted input is normalized, resolved through realpath/symlink aliases, verified as an existing directory, and persisted as the canonical real path.
 
 v0.1 does **not** claim OS-level filesystem confinement to that workspace. Pi, its tools, extensions, and shell commands execute with the user's normal OS privileges unless Pi itself provides a stronger boundary.
 
@@ -171,13 +207,29 @@ Completing, failing, or interrupting one Turn must not mutate or terminate anoth
 
 No scheduler, queue, priorities, or same-workspace concurrent mutation is added.
 
-### Turn lifecycle and restart policy
+### Turn lifecycle, Stop, and restart policy
 
 Pi prompt acceptance is not equivalent to successful completion. pi-sand continues to follow the concrete Pi lifecycle through settlement.
 
-Unexpected Pi exit before settlement produces an explicit failed Turn.
+For a normal user Stop:
 
-If the Local Agent Service restarts with persisted running Turns, every such Turn becomes explicitly terminal according to the established interruption/restart rule. v0.1 does not replay requests, adopt old workers, or perform automatic recovery/resume.
+1. pi-sand requests cancellation/interruption from the owning Pi execution;
+2. already-durable partial transcript content remains durable;
+3. successful Pi settlement after that Stop request produces the durable Turn outcome `interrupted`;
+4. Pi failure or process exit before successful settlement produces `failed`, not `interrupted`.
+
+Unexpected Pi exit before settlement therefore produces an explicit failed Turn.
+
+If the Local Agent Service starts and finds persisted `running` Turns from a previous service lifetime:
+
+- each such Turn is terminalized exactly once as `interrupted` with a restart/not-resumed explanation;
+- the request is not replayed;
+- the previous worker is not adopted;
+- automatic recovery/resume is not attempted.
+
+A prior-service Pi worker must not remain able to mutate its workspace after that workspace is made available for new work. The service/worker lifetime design must therefore ensure that prior-service workers are terminated or otherwise proven unable to execute before the corresponding Agent/workspace lock is released. If that cannot be established safely, the Agent/workspace remains unavailable for new work rather than risking concurrent mutation.
+
+This liveness/cleanup requirement is not worker adoption: pi-sand does not resume or continue the prior Turn.
 
 ### Product-level failure set
 
@@ -190,7 +242,8 @@ v0.1 must provide understandable product states for this finite set:
 - prompt rejection;
 - Pi-reported terminal failure;
 - unexpected Pi exit;
-- restart-interrupted work.
+- restart-interrupted work;
+- local control-plane access/bootstrap failure when the product cannot establish a safe local connection.
 
 Raw implementation details may be available for diagnostics, but they are not the primary user explanation when pi-sand can identify one of these causes.
 
@@ -204,34 +257,55 @@ v0.1 keeps three durable testing seams, plus targeted pure unit tests where usef
 
 ### 1. Actual Desktop E2E — compatibility authority
 
-This seam renders the actual Desktop UI/runtime, crosses the real Local Agent Service boundary, and uses deterministic Pi behavior.
+This seam renders and drives the actual supported Desktop client/runtime, crosses the real Local Agent Service boundary, and uses deterministic Pi behavior.
 
-Keep it small and product-journey oriented. The critical journeys are:
+Keep it small and product-journey oriented. The required journeys are:
 
-1. open/create/select → draft → switch → return → send → visible streaming/Working;
-2. Agent A runs while the user switches to Agent B and optionally starts independent B work; roster/header state remains isolated and correct;
-3. disconnect or Desktop close → reconnect/reopen → selection/draft reconciliation plus authoritative transcript/Turn restoration without duplication, including error/Retry shell states;
-4. attachment staging through supported Desktop inputs → send → durable attachment restoration after reopen.
+1. **Core conversation:** cold/open product → create/select Agent → draft → switch → return → send → visible streaming/`Working`.
+2. **Parallel isolation:** Agent A runs while the user switches to Agent B and optionally starts independent B work; roster/header state remains isolated and correct.
+3. **Cold bootstrap + background lifetime:** begin with no Local Agent Service running → launch the actual product and prove it establishes the service → start deterministic work → close the actual Desktop window/process without stopping the service/work → relaunch → reconcile selection/draft and restore authoritative transcript/Turn state without duplication/reordering, including reconnect/error/Retry shell behavior.
+4. **Stop:** start active work through the actual Desktop → invoke the actual Stop control → observe the selected Turn become `interrupted` while independent Agent work remains unaffected.
+5. **Attachment journey:** stage through supported Desktop inputs → preserve draft attachment across Desktop close/reopen → send → reopen → durable user-message attachment remains present.
+6. **Representative classified failure:** one execution failure reaches the actual Desktop as a product-level state without requiring the user to interpret raw RPC/process errors.
 
-A test that exercises HTTP/SSE without rendering the actual Desktop is **not** Desktop E2E.
+A test that exercises HTTP/SSE without rendering/driving the actual supported Desktop client is **not** Desktop E2E.
 
 ### 2. Local Agent Service integration
 
 This seam drives the public semantic Local Agent Service boundary with deterministic Pi behavior.
 
-It carries lifecycle permutations, prompt rejection, settlement, unexpected Pi exit, interruption, persistence, service restart, canonical workspace handling, same-Agent/same-workspace exclusion, independent multi-Agent concurrency, attachment staging/commit semantics, and product-level failure classification.
+It carries:
+
+- prompt acceptance/rejection and settlement permutations;
+- explicit Stop semantics (`interrupted` only after successful post-Stop settlement; failure/exit before settlement → `failed`);
+- unexpected Pi exit;
+- persistence and startup reconciliation;
+- restart terminalization plus prior-worker/workspace safety;
+- canonical workspace handling and unsupported-relative-path rejection;
+- same-Agent/same-workspace exclusion;
+- independent multi-Agent concurrency and lifecycle isolation;
+- single-database-owner acquisition/competing startup behavior;
+- attachment staging, persisted-draft reference lifetime, commit, and orphan cleanup semantics;
+- local control-plane protection against non-local/arbitrary-origin mutation;
+- finite product-level failure classification.
 
 HTTP/SSE-only transport tests may live here when they prove transport behavior, but they should not duplicate Desktop compatibility journeys.
 
 ### 3. Real-Pi smoke
 
-Keep one or very few tests through the production Pi adapter and Local Agent Service with externally verifiable workspace outcomes.
+Keep this layer very small, but it must prove the release-critical production Pi adapter contracts that deterministic fakes cannot prove.
 
-This layer proves that the concrete Pi contract still works. It does not duplicate the deterministic lifecycle matrix.
+Required production smoke cases:
+
+1. **Basic execution:** a normal request produces an externally verifiable workspace outcome.
+2. **Two-Turn conversational continuity:** Turn 1 establishes information only through Pi-native conversational context; Turn 2 must use that context to produce an externally verifiable outcome without pi-sand replaying/summarizing the durable transcript into model context.
+3. **Attachment consumption:** a sent attachment is actually readable/usable by the production Pi integration and affects an externally verifiable workspace outcome.
+
+These tests prove the concrete Pi integration boundary. They do not duplicate the deterministic lifecycle matrix.
 
 ### Unit tests
 
-Targeted pure unit tests are appropriate for rule-heavy logic such as canonicalization or small state projections. They are not another architectural compatibility seam.
+Targeted pure unit tests are appropriate for rule-heavy logic such as canonicalization, origin/access checks, or small state projections. They are not another architectural compatibility seam.
 
 Hand-written fake DOM/EventSource harnesses should not become a separate long-lived compatibility layer when the same behavior can be exercised through the actual Desktop or Local Agent Service integration boundary.
 
@@ -251,6 +325,7 @@ v0.1 does not require:
 - custom model-context management or custom memory framework;
 - remote, Telegram, or mobile frontend;
 - public/versioned remote protocol;
+- LAN-accessible or multi-user control plane;
 - distributed or multi-machine workers;
 - multi-user SaaS;
 - full parity with reference-internal component topology/boundaries;
@@ -275,7 +350,7 @@ v0.1 does not require:
 v0.1 is ready for release when a normal Linux user can perform this journey without operating pi-sand as a development process:
 
 ```text
-launch pi-sand
+launch pi-sand with no service pre-started
       ↓
 local product service becomes available without terminal/port management
       ↓
@@ -289,7 +364,7 @@ Agent visibly works and streams usable output
       ↓
 switch to another Agent without stopping the first
       ↓
-close the Desktop while work is active
+close the actual Desktop while work is active
       ↓
 reopen later
       ↓
@@ -298,7 +373,9 @@ selection/draft presentation state reconciles
 authoritative Agent/Turn/transcript/result state is correct and unduplicated
 ```
 
-All stable ownership, concurrency, failure, restart, and security/trust statements in this spec must hold throughout that journey.
+The release also requires the production Pi smoke proofs for cross-Turn conversational continuity and attachment consumption.
+
+All stable ownership, concurrency, lifecycle, control-plane access, failure, restart-worker, and workspace-trust statements in this spec must hold throughout that journey.
 
 ## Further Notes
 
