@@ -14,7 +14,7 @@ Requires Node.js 22.13+ (the service uses the unflagged built-in `node:sqlite` m
 npm run launch
 ```
 
-The supported Linux entry point starts or connects to the loopback-only Local Agent Service, then opens the Desktop in Chromium through `xdg-open`. No terminal, manually selected port, or manually opened localhost URL is required for normal use. `PI_SAND_NO_BROWSER=1 npm run launch` starts the product service without opening a browser, which is useful for automated checks. `PI_SAND_BROWSER` can select the browser opener when needed.
+The supported Linux entry point starts or connects to the loopback-only Local Agent Service, then locates and invokes the supported Chromium Desktop directly. No terminal, manually selected port, or manually opened localhost URL is required for normal use. `PI_SAND_NO_BROWSER=1 npm run launch` starts the product service without opening a browser, which is useful for automated checks. Chromium must be installed and available at `/usr/bin/chromium`, `/usr/bin/chromium-browser`, or on `PATH`.
 
 `npm start` remains a developer-oriented service-only entry point; it is not the normal product experience. The service binds only to `127.0.0.1`, protects mutation requests from unrelated browser origins, and allows only one Local Agent Service process to own a database at a time.
 

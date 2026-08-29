@@ -135,11 +135,11 @@ export class AgentService {
     try {
       this.db = new DatabaseSync(dbPath);
     } catch (error) {
-      this.databaseLock?.release();
-      this.databaseLock = null;
+      this.releaseInitializationResources();
       throw new Error(`The Local Agent Service could not open its database: ${error.message}`, { cause: error });
     }
-    this.piFactory = piFactory;
+    try {
+      this.piFactory = piFactory;
     this.piCompatibilityChecked = false;
     this.attachmentDirectory = dbPath === ":memory:"
       ? join(tmpdir(), `pi-sand-attachments-${randomUUID()}`)
@@ -203,8 +203,21 @@ export class AgentService {
     this.ensureWorkerColumns();
     this.cleanupOrphanedAttachments();
     this.canonicalizeStoredWorkspaces();
-    this.reconcilePriorWorkers();
-    this.reconcileUnfinishedTurns();
+      this.reconcilePriorWorkers();
+      this.reconcileUnfinishedTurns();
+    } catch (error) {
+      this.releaseInitializationResources();
+      throw error;
+    }
+  }
+
+  releaseInitializationResources() {
+    const database = this.db;
+    const lock = this.databaseLock;
+    this.db = null;
+    this.databaseLock = null;
+    try { database?.close(); } catch { /* Preserve the initialization failure. */ }
+    try { lock?.release(); } catch { /* Preserve the initialization failure. */ }
   }
 
   ensureTerminalDetailColumn() {

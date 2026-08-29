@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import { accessSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 const SERVICE_START_TIMEOUT_MS = 10_000;
 const SERVICE_POLL_INTERVAL_MS = 50;
+const SUPPORTED_CHROMIUM_PATHS = ["/usr/bin/chromium", "/usr/bin/chromium-browser"];
+const SUPPORTED_CHROMIUM_COMMANDS = ["chromium", "chromium-browser"];
 const serverPath = fileURLToPath(new URL("./server.js", import.meta.url));
 
 function sleep(milliseconds) {
@@ -35,8 +38,23 @@ export async function waitForService({ baseUrl, fetchImpl = fetch, child, timeou
   throw new Error(`The Local Agent Service could not be reached during product launch${lastError ? `: ${lastError.message}` : "."}`);
 }
 
-/** Open the supported browser Desktop without making the browser the worker owner. */
-export function openDesktop(url, { command = process.env.PI_SAND_BROWSER ?? "xdg-open", spawnImpl = spawn } = {}) {
+/** Locate the one supported Linux Desktop runtime: Chromium. */
+export function locateChromium({ pathEnv = process.env.PATH, accessImpl = accessSync } = {}) {
+  const candidates = [
+    ...SUPPORTED_CHROMIUM_PATHS,
+    ...String(pathEnv ?? "").split(":").filter(Boolean).flatMap((directory) => SUPPORTED_CHROMIUM_COMMANDS.map((name) => join(directory, name))),
+  ];
+  for (const candidate of candidates) {
+    try {
+      accessImpl(candidate, constants.X_OK);
+      return candidate;
+    } catch { /* Try the next supported installation location. */ }
+  }
+  throw new Error("The supported Chromium Desktop runtime was not found. Install Chromium and make it available on PATH.");
+}
+
+/** Open the supported Chromium Desktop without making it the worker owner. */
+export function openDesktop(url, { command = locateChromium(), spawnImpl = spawn } = {}) {
   const browser = spawnImpl(command, [url], { detached: true, stdio: "ignore" });
   browser.unref?.();
   return browser;
@@ -53,6 +71,7 @@ export async function launchProduct({
   fetchImpl = fetch,
   spawnImpl = spawn,
   openDesktopImpl = openDesktop,
+  openDesktopOptions = {},
   timeoutMs = SERVICE_START_TIMEOUT_MS,
   openBrowser = process.env.PI_SAND_NO_BROWSER !== "1",
 } = {}) {
@@ -73,13 +92,13 @@ export async function launchProduct({
       // The Desktop is the product surface for bootstrap failures too. Open it
       // before surfacing the launcher error so it can render Connecting/Error
       // and Retry instead of leaving the user with only launcher stderr.
-      if (openBrowser) openDesktopImpl(baseUrl);
+      if (openBrowser) openDesktopImpl(baseUrl, openDesktopOptions);
       throw error;
     }
-    if (openBrowser) openDesktopImpl(baseUrl);
+    if (openBrowser) openDesktopImpl(baseUrl, openDesktopOptions);
     await waitForService({ baseUrl, fetchImpl, child: serviceProcess, timeoutMs });
   }
-  if (!started && openBrowser) openDesktopImpl(baseUrl);
+  if (!started && openBrowser) openDesktopImpl(baseUrl, openDesktopOptions);
   return { url: baseUrl, started, pid: serviceProcess?.pid ?? null };
 }
 

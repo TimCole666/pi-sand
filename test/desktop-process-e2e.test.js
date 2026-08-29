@@ -1,16 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { AgentService } from "../src/service.js";
 import { createAgentServer } from "../src/server.js";
+import { locateChromium, openDesktop } from "../src/launcher.js";
 
-const CHROMIUM = "/usr/bin/chromium";
-const supportedDesktop = existsSync(CHROMIUM);
+const CHROMIUM = (() => {
+  try { return locateChromium(); } catch { return null; }
+})();
+const supportedDesktop = Boolean(CHROMIUM) && typeof WebSocket === "function";
 
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -49,17 +51,24 @@ function waitForClose(child) {
 }
 
 async function launchChromium(url, profilePath) {
-  const child = spawn(CHROMIUM, [
-    "--headless=new",
-    "--no-sandbox",
-    "--disable-gpu",
-    "--disable-dev-shm-usage",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--remote-debugging-port=0",
-    `--user-data-dir=${profilePath}`,
-    url,
-  ], { stdio: ["ignore", "ignore", "pipe"] });
+  let browserCommand;
+  const child = openDesktop(url, {
+    spawnImpl: (command, args, spawnOptions) => {
+      browserCommand = command;
+      return spawn(command, [
+        "--headless=new",
+        "--no-sandbox",
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--remote-debugging-port=0",
+        `--user-data-dir=${profilePath}`,
+        ...args,
+      ], { ...spawnOptions, stdio: ["ignore", "ignore", "pipe"] });
+    },
+  });
+  assert.equal(browserCommand, CHROMIUM);
   child.stderr.setEncoding("utf8");
   let stderr = "";
   let debugging;

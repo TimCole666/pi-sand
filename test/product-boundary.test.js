@@ -3,14 +3,18 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { AgentService } from "../src/service.js";
 import { databaseLockPath } from "../src/database-lock.js";
 import { createAgentServer, isAllowedLocalOrigin, startServer } from "../src/server.js";
-import { launchProduct } from "../src/launcher.js";
+import { launchProduct, locateChromium, openDesktop } from "../src/launcher.js";
+
+const chromiumPath = (() => {
+  try { return locateChromium(); } catch { return null; }
+})();
 
 async function listen(server, host = "127.0.0.1") {
   server.listen(0, host);
@@ -31,9 +35,11 @@ async function waitForProcessExit(pid) {
 
 function dumpDom(url) {
   return new Promise((resolve, reject) => {
-    const child = spawn("/usr/bin/chromium", [
-      "--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--dump-dom", "--virtual-time-budget=1000", url,
-    ], { stdio: ["ignore", "pipe", "pipe"] });
+    const child = openDesktop(url, {
+      spawnImpl: (command, args) => spawn(command, [
+        "--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--dump-dom", "--virtual-time-budget=1000", ...args,
+      ], { stdio: ["ignore", "pipe", "pipe"] }),
+    });
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8");
@@ -70,6 +76,54 @@ test("only one Local Agent Service owns a database at a time", async () => {
     first.close();
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("a failed AgentService bootstrap releases ownership so product Retry works in the same server", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-sand-bootstrap-retry-"));
+  const dbPath = join(directory, "state.sqlite");
+  const attachmentDirectory = `${dbPath}.attachments`;
+  const oldDatabase = process.env.PI_SAND_DB;
+  await writeFile(attachmentDirectory, "bootstrap blocker");
+  process.env.PI_SAND_DB = dbPath;
+  const runtime = startServer({ port: 0 });
+  await once(runtime.server, "listening");
+  const base = `http://127.0.0.1:${runtime.server.address().port}`;
+  try {
+    const failed = await fetch(`${base}/api/health`);
+    assert.equal(failed.status, 503);
+    assert.equal(runtime.service, undefined, "the degraded server must not retain a partially initialized service");
+    assert.ok(runtime.startupError);
+    assert.equal(existsSync(databaseLockPath(dbPath)), false, "failed initialization must release the database ownership marker");
+
+    await rm(attachmentDirectory);
+    const retried = await fetch(`${base}/api/health`);
+    assert.equal(retried.status, 200);
+    assert.ok(runtime.service, "Retry must establish the service without restarting the product host");
+    assert.equal(runtime.startupError, null);
+    assert.equal(existsSync(databaseLockPath(dbPath)), true);
+  } finally {
+    runtime.service?.close();
+    await closeServer(runtime.server);
+    if (oldDatabase === undefined) delete process.env.PI_SAND_DB;
+    else process.env.PI_SAND_DB = oldDatabase;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("normal Desktop launch invokes the located Chromium runtime directly", { skip: !chromiumPath }, () => {
+  const calls = [];
+  const child = { unref() {} };
+  const command = locateChromium();
+  openDesktop("http://127.0.0.1:4317", {
+    spawnImpl: (...args) => {
+      calls.push(args);
+      return child;
+    },
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], command);
+  assert.deepEqual(calls[0][1], ["http://127.0.0.1:4317"]);
+  assert.notEqual(command, "xdg-open");
 });
 
 test("the product server is loopback-only and rejects arbitrary browser-origin mutations", async () => {
@@ -179,7 +233,7 @@ test("cold launch starts a real detached Local Agent Service without manual port
   }
 });
 
-test("the supported Chromium Desktop renders the two-pane cold shell", { skip: !existsSync("/usr/bin/chromium") }, async () => {
+test("the supported Chromium Desktop renders the two-pane cold shell", { skip: !chromiumPath }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-sand-chromium-"));
   const service = new AgentService({ dbPath: join(directory, "state.sqlite") });
   const server = createAgentServer(service);

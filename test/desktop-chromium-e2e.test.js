@@ -1,16 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
 import { AgentService } from "../src/service.js";
+import { locateChromium, openDesktop } from "../src/launcher.js";
 import { createAgentServer } from "../src/server.js";
 
-const CHROMIUM = "/usr/bin/chromium";
-const supportedDesktop = existsSync(CHROMIUM);
+const CHROMIUM = (() => {
+  try { return locateChromium(); } catch { return null; }
+})();
+const supportedDesktop = Boolean(CHROMIUM) && typeof WebSocket === "function";
 
 async function eventually(predicate, message, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;
@@ -81,11 +83,18 @@ async function waitForDevToolsPort(directory, child) {
 
 async function startChromium(url, agentId) {
   const directory = await mkdtemp(join(tmpdir(), "pi-sand-chromium-profile-"));
-  const child = spawn(CHROMIUM, [
-    "--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
-    "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0",
-    `--user-data-dir=${directory}`, "about:blank",
-  ], { stdio: ["ignore", "ignore", "ignore"] });
+  let browserCommand;
+  const child = openDesktop(url, {
+    spawnImpl: (command, args, spawnOptions) => {
+      browserCommand = command;
+      return spawn(command, [
+        "--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+        "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0",
+        `--user-data-dir=${directory}`, ...args,
+      ], { ...spawnOptions, stdio: ["ignore", "ignore", "ignore"] });
+    },
+  });
+  assert.equal(browserCommand, CHROMIUM);
   const port = await waitForDevToolsPort(directory, child);
   const pages = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
   const page = pages.find((item) => item.type === "page");
