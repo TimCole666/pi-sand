@@ -1,24 +1,22 @@
 # pi-sand Grok Bot 0.18 Reference Map
 
-Status: **Working evidence map for v0.1**
+Status: **Non-normative evidence ledger**
 
-This document is the detailed evidence companion to `SPEC-v0.1.md`.
+This document is the evidence companion to `SPEC-v0.1.md`.
 
-Its purpose is to answer a narrower question than the product spec:
+Its job is to record what user-visible Grok Bot 0.18 behavior is actually supported by inspectable evidence, what remains uncertain, and where that evidence lives.
 
-> What user-visible Grok Bot 0.18 behavior do we actually have evidence for, and how should that behavior constrain pi-sand?
+It does **not** define v0.1 release scope. `SPEC-v0.1.md` is the normative product specification.
 
-The target is not to reconstruct Grok Bot's source architecture. The target is to reproduce the useful observable desktop behavior with the existing Pi-native pi-sand architecture.
+A reference behavior being real does not automatically make it a v0.1 requirement. Likewise, a recovered source file or internal name does not justify copying Grok Bot's architecture.
 
----
-
-## 1. Reference authority
+## Evidence policy
 
 Primary reference repository:
 
 `b-nnett/grok-bot-0.18-reconstructed`
 
-Primary upstream artifact represented by that repository:
+Primary upstream release represented by that repository:
 
 - Product: Grok Bot
 - Version: 0.18.0
@@ -28,672 +26,325 @@ Primary upstream artifact represented by that repository:
 
 Source: `b-nnett/grok-bot-0.18-reconstructed/PROVENANCE.md`.
 
-The reconstructed repository explicitly states that the shipped renderer contained optimized production bundles, not the authored frontend source or source maps. Its readable `frontend/` tree is therefore evidence-backed reconstruction, not original source.
+The reference repository explicitly states that the shipped renderer contained optimized production bundles rather than the authored frontend source or original source maps. Its readable `frontend/` tree is therefore a partial evidence-backed reconstruction, not Anysphere's original source.
 
-For pi-sand the governing rule is:
-
-> **Desktop-observable behavior is compatibility authority; reconstructed implementation structure is not.**
-
-The evidence hierarchy used here is:
+Evidence classes used here:
 
 - **Observed** — repeatably visible in the shipped product/artifact.
 - **Evidence-backed** — supported by shipped strings, CSS, DOM signatures, emitted code, contracts, or explicit reconstruction anchors.
-- **Inferred** — plausible but not strong enough to become a strict compatibility requirement.
-- **Unknown** — not yet mapped.
-- **Extension** — intentional pi-sand behavior, not claimed as Grok Bot parity.
+- **Inferred** — plausible but not strong enough to constrain parity.
+- **Unknown** — not sufficiently mapped.
+- **Extension** — intentional pi-sand behavior rather than an upstream Grok claim.
 
-If evidence is missing, the correct action is to leave the behavior unmapped rather than invent it.
+The governing rule is:
 
----
+> **Desktop-observable behavior is compatibility authority; reconstructed implementation structure is not.**
 
-## 2. Core v0.1 visual model
+## Core shell evidence
 
-The core experience is a persistent two-pane desktop shell:
+### Two-pane Agent roster + conversation workspace
 
-```text
-┌───────────────────────────────┬──────────────────────────────────────────────┐
-│ Agent / chat roster           │ Selected Agent conversation                 │
-│                               │                                              │
-│ New / Search                  │ avatar  Agent name  Working                 │
-│                               ├──────────────────────────────────────────────┤
-│ Agent A                       │                                              │
-│   preview / draft / status    │ transcript                                  │
-│ Agent B                       │                                              │
-│   preview / draft / status    │                                              │
-│ ...                           │                                              │
-│                               ├──────────────────────────────────────────────┤
-│                               │ composer                                     │
-└───────────────────────────────┴──────────────────────────────────────────────┘
-```
+**Evidence strength:** Evidence-backed
 
-This is directly reflected in the reconstructed production renderer: the root lays out a sidebar column next to a `minmax(0, 1fr)` conversation column and mounts `ConversationSidebar` as the roster owner.
+The reconstructed production renderer lays out a persistent sidebar column next to a conversation column and mounts `ConversationSidebar` as the roster owner.
 
-Evidence:
+Useful anchors:
 
 - `frontend/src/production/ProductionRenderer.tsx`
 - `frontend/src/recovered/features/conversation/workspace/sidebar.tsx`
 - `frontend/src/recovered/features/conversation/workspace/view.css`
 
-Useful geometry from the evidence-backed CSS:
+Evidence-backed geometry includes roughly:
 
 - roster header: 50 px high;
 - conversation header: minimum 51 px high;
-- Agent rows: minimum 58 px in expanded mode;
-- transcript content is centered around an approximately 690 px reading width;
-- composer surface is a rounded input shell with a 16 px radius;
-- sidebar may collapse to a narrow avatar rail.
+- expanded Agent row: minimum 58 px high;
+- transcript reading width centered around approximately 690 px;
+- composer shell: rounded standalone input surface with 16 px radius.
 
-These numbers are reference geometry, not a requirement to copy every CSS token or pixel. v0.1 should preserve the recognizable hierarchy and density before chasing exact styling.
+These geometry observations are implementation/reference notes, not mandatory pixel values for pi-sand.
 
----
+### Roster states
 
-## 3. Root shell states
+**Evidence strength:** Evidence-backed
 
-### 3.1 Loading / setup
+The recovered roster explicitly contains states corresponding to:
 
-**Classification: Evidence-backed**
+- `Connecting to your computer…`
+- `No saved agents yet.`
+- `Can’t reach your computer`
+- Retry / Retrying
+- `Reconnecting to your computer…`
 
-The reconstructed root shell has a dedicated setup/loading state rather than displaying an empty broken app while initialization is incomplete.
-
-Evidence:
-
-- `frontend/src/recovered/features/window-chrome/root-shell-state.tsx`
-- artifact anchors include `index-UbX-y3il.js#L131944`, `#L132101-L132102`, and `#L132985`.
-
-Reference behavior:
-
-- root-level loading is visually distinct from an empty roster;
-- the shell does not imply that saved Agents are gone while initialization is pending.
-
-pi-sand mapping:
-
-- Local Agent Service connection / first snapshot loading should have an explicit shell state.
-
-### 3.2 Empty workspace
-
-**Classification: Evidence-backed**
-
-The root shell has a specific no-chat state rather than fabricating a selected conversation.
-
-Evidence:
-
-- `frontend/src/recovered/features/window-chrome/root-shell-state.tsx`
-
-pi-sand mapping:
-
-- zero Agents should show an intentional empty state with a clear create/new action.
-
-### 3.3 Fatal renderer error
-
-**Classification: Evidence-backed, deferred fidelity**
-
-The reference has a root error boundary with recovery affordances.
-
-Evidence:
-
-- `frontend/src/recovered/features/window-chrome/root-shell-state.tsx`
-
-v0.1 requirement:
-
-- catastrophic Desktop render failure should not silently present stale or blank state.
-
-Exact error copy and developer diagnostics are not compatibility blockers.
-
----
-
-## 4. Agent roster
-
-### 4.1 Core roster controls
-
-**Classification: Evidence-backed**
-
-The roster includes explicit new-chat and search controls.
-
-Evidence:
-
-- `frontend/src/recovered/features/conversation/workspace/sidebar.tsx`
-- artifact anchors include `index-UbX-y3il.js#byteOffset=2601270` for the collapsed new-chat control and `#byteOffset=2605212` for search.
-
-v0.1 requirement:
-
-- a persistent Agent list;
-- a clear create/new action;
-- a clear Agent selection affordance;
-- search may be implemented after the basic roster if needed, but the shell should reserve a normal product location for it rather than treating Agent choice as a developer dropdown.
-
-### 4.2 Agent row information hierarchy
-
-**Classification: Evidence-backed**
-
-An Agent row is not just a name. The reconstructed row model can project:
-
-- avatar / identity marker;
-- Agent name;
-- recent activity / message preview;
-- draft preview;
-- waiting-for-user state;
-- working state;
-- unread / attention marker;
-- recency;
-- pinned/collapsed variants.
-
-Evidence:
-
-- `frontend/src/recovered/features/conversation/workspace/sidebar.tsx`
-- `frontend/src/recovered/features/conversation/workspace/sidebar-agent-status.ts`
-- `frontend/src/recovered/features/conversation/workspace/model.ts`
-
-The reconstructed row gives draft text priority over waiting reason, and waiting reason priority over the last-message preview. That is useful behavioral evidence for information hierarchy even if pi-sand initially renders a simpler row.
-
-### 4.3 Status precedence
-
-**Classification: Evidence-backed**
-
-The reconstructed status projection distinguishes at least:
-
-```text
-needs attention
-unread activity
-working
-```
-
-with waiting/attention taking precedence over ordinary running presentation.
-
-Evidence:
-
-- `frontend/src/recovered/features/conversation/workspace/sidebar-agent-status.ts`
-- Mac anchors around `index-UbX-y3il.js#byteOffset=1131225` and `#byteOffset=1131705`
-- matching Windows anchors are recorded in the same file.
-
-pi-sand mapping:
-
-```text
-Turn running                    -> working
-stable Pi user-response state  -> needs attention / waiting
-new unseen terminal/output     -> unread activity, if/when unread semantics are added
-```
-
-Do not infer a waiting state from private reasoning or heuristics. Only expose it when a stable Pi/product event supports it.
-
-### 4.4 Roster connectivity states
-
-**Classification: Evidence-backed**
-
-The reference has distinct roster states for loading, empty, unreachable/error, and reconnecting, with explicit retry behavior.
-
-Evidence:
+Anchors:
 
 - `frontend/src/recovered/features/roster/status.tsx`
 - `frontend/src/recovered/features/roster/reconnect-notice.tsx`
 - `frontend/src/recovered/features/root-resilience/connection-state.tsx`
-- anchors include `index-UbX-y3il.js#byteOffset=2550111` and `#byteOffset=2553043`.
 
-Important semantic rule:
+The semantic point is stronger than the exact copy: temporary reachability failure is presented as a connection problem, not as loss of saved Agents.
 
-> Temporary transport failure must not visually imply that durable Agents were deleted.
+## Agent roster evidence
 
-pi-sand should adapt the wording to a local Linux service, but preserve the state distinction.
+### Agent row identity and preview
 
----
+**Evidence strength:** Evidence-backed
 
-## 5. Agent selection
+Agent rows carry identity and recent-conversation information rather than only workspace metadata.
 
-### 5.1 Persistent last selection
+Recovered projections include:
 
-**Classification: Evidence-backed**
-
-The reconstructed client owns a persistent last-selected-Agent slice and restores it across client lifecycle.
-
-Evidence:
-
-- `frontend/src/recovered/features/roster/selection-state.ts`
-- artifact anchors around `index-UbX-y3il.js#byteOffset=777400` and `#byteOffset=819190`.
-
-Reference semantics:
-
-- selected Agent id is client-persisted;
-- selection has a pending/load phase;
-- if the stored Agent no longer exists once the roster is complete, selection falls back to an available Agent;
-- selection persistence is presentation/client state, not worker ownership.
-
-pi-sand mapping:
-
-- reopening should return to the last useful Agent when possible;
-- changing selection must never stop that Agent's Turn;
-- if the saved Agent no longer exists, fall back predictably.
-
-### 5.2 Keyboard navigation
-
-**Classification: Evidence-backed, deferred**
-
-The root shell includes keyboard navigation for previous/next Agent and direct indexed Agent selection.
-
-Evidence:
-
-- `frontend/src/recovered/features/window-chrome/root-shell-state.tsx`
-
-This is useful parity work, but not a first implementation blocker.
-
----
-
-## 6. Conversation header
-
-### 6.1 Identity projection
-
-**Classification: Evidence-backed**
-
-The selected conversation has a real identity header with:
-
-- Agent avatar / identity marker;
 - Agent name;
-- visible working state;
-- room/settings/computer controls when those surfaces are available.
+- avatar/identity marker;
+- draft preview when a draft exists;
+- waiting reason when present;
+- otherwise recent message/entry preview;
+- updated recency;
+- running/attention/unread visual state.
 
-Evidence:
+Anchors:
 
-- `frontend/src/recovered/features/conversation/workspace/chat-header.tsx`
-- artifact anchor `index-UbX-y3il.js#byteOffset=4886695`.
-
-The normal-Agent header explicitly renders a working label when `isRunning` is true.
-
-v0.1 requirement:
-
-- avatar/identity marker + Agent name + running state are required;
-- richer Agent settings and Computer controls are deferred until separately mapped.
-
----
-
-## 7. Conversation transcript
-
-### 7.1 Transcript is a product surface, not a process log
-
-**Classification: Evidence-backed**
-
-The reference transcript is a structured conversation surface with user/assistant messages and additional card/event types. It is not raw coordinator output.
-
-Evidence:
-
-- `frontend/src/recovered/features/conversation/workspace/transcript.tsx`
-- `frontend/src/recovered/features/conversation/workspace/model.ts`
+- `frontend/src/recovered/features/conversation/workspace/sidebar.tsx`
+- `frontend/src/recovered/features/conversation/workspace/sidebar-agent-status.ts`
 - `frontend/src/production/model.ts`
 
-The transcript model supports stable message ids, user/assistant roles, timestamps, attachments, delivery state, reply relation, rich text, and streaming state.
+The row-detail priority in the reconstructed sidebar is effectively draft → waiting reason → recent message.
 
-pi-sand v0.1 core requires:
+### Working / Needs attention / Unread activity presentation
 
-- durable user + assistant messages;
-- visible streaming assistant output;
-- stable ordering and identity across reconnect;
-- completed/failed/interrupted history after reopen;
-- no duplicate messages after snapshot/reconnect replacement.
+**Evidence strength:** Evidence-backed for visual states; semantics partially unknown
 
-### 7.2 Message actions / reply
+The recovered sidebar status projection distinguishes:
 
-**Classification: Evidence-backed, staged**
+- `Working`
+- `Needs attention`
+- `Unread activity`
 
-The reference exposes message-level actions including reply and copy, with reply state feeding back into the composer.
+and gives attention/unread precedence over ordinary running presentation in some layouts.
 
-Evidence:
+Anchor:
 
+- `frontend/src/recovered/features/conversation/workspace/sidebar-agent-status.ts`
+
+**Important gap:** exact unread transition rules are not sufficiently mapped for pi-sand parity. Likewise, a stable Pi request-for-user-input/waiting seam has not yet been established. These visuals are real reference evidence, but their complete runtime semantics remain non-normative until independently proven.
+
+## Selection evidence
+
+### Last selected Agent persistence
+
+**Evidence strength:** Evidence-backed
+
+The recovered client persists the last selected Agent and restores/reconciles it against the complete roster, including fallback when the previous Agent is no longer available.
+
+Anchor:
+
+- `frontend/src/recovered/features/roster/selection-state.ts`
+
+The recovered state is explicitly client-persisted. This is evidence that selection is presentation state, separate from Agent execution ownership.
+
+## Conversation header evidence
+
+### Agent identity + Working
+
+**Evidence strength:** Evidence-backed
+
+The recovered header directly projects:
+
+- Agent avatar;
+- Agent name;
+- `Working` when `isRunning` is true.
+
+Anchor:
+
+- `frontend/src/recovered/features/conversation/workspace/chat-header.tsx`
+
+The header also contains evidence for settings/details and a Computer control, but those surfaces are not automatically core parity requirements.
+
+## Transcript evidence
+
+### Conversation entries
+
+**Evidence strength:** Evidence-backed
+
+The recovered conversation workspace is a structured transcript rather than a raw process log. The model and transcript view support ordinary user/assistant messages plus richer entry types.
+
+Anchors:
+
+- `frontend/src/recovered/features/conversation/workspace/model.ts`
 - `frontend/src/recovered/features/conversation/workspace/transcript.tsx`
+- `frontend/src/production/model.ts`
+
+Evidence includes stable entry/message IDs, streaming message state, delivery state, attachments, reply metadata, tool-call representations, and multiple richer card types.
+
+For pi-sand, the important evidence is that product transcript and execution/activity presentation are distinct concepts. It does not imply that every Grok entry type must be reproduced.
+
+### Reply UI
+
+**Evidence strength:** Evidence-backed
+
+The recovered workspace contains reply selection, reply previews, navigation, and submission projection.
+
+Anchor:
+
 - `frontend/src/recovered/features/conversation/workspace/conversation-workspace-controller.ts`
 
-v0.1 recommendation:
+**Gap:** the evidence supports the UI/product concept, but pi-sand's exact Pi-context semantics for a reply are not yet proven. Reply parity therefore remains a candidate surface rather than a release requirement unless promoted in `SPEC-v0.1.md`.
 
-- reply is useful core parity if inexpensive;
-- reactions, threads, and the full message-action surface may follow later.
+## Composer evidence
 
-### 7.3 Delivery/offline presentation
+### Structured composer
 
-**Classification: Evidence-backed, not automatically applicable**
+**Evidence strength:** Evidence-backed
 
-The reference has queued, failed-send, resend/delete, and offline-send presentation.
+The recovered composer is substantially richer than a plain textarea. Evidence supports:
 
-Evidence:
+- ordinary text prompting;
+- explicit send action;
+- file picker;
+- drag/drop files;
+- pasted files;
+- attachment chips and removal;
+- reply pill/context;
+- rich-text editor;
+- voice/dictation UI;
+- attachment failure notices;
+- maximum composer attachment count of 6 in the recovered model.
 
-- `frontend/src/recovered/features/conversation/workspace/transcript.tsx`
-
-This should not be copied mechanically into pi-sand. The local Pi RPC/service semantics differ from the reference network model. Only add these states if the pi-sand transport actually has equivalent durable meaning.
-
----
-
-## 8. Composer
-
-### 8.1 Core shape
-
-**Classification: Evidence-backed**
-
-The reference composer is a persistent bottom input dock, not a plain standalone textarea.
-
-Evidence:
+Anchors:
 
 - `frontend/src/recovered/features/conversation/workspace/composer.tsx`
-- `frontend/src/recovered/features/conversation/workspace/view.css`
-- `frontend/src/production/ProductionRenderer.tsx`
+- `frontend/src/recovered/features/conversation/workspace/model.ts`
+- `frontend/src/recovered/features/conversation/workspace/desktop.ts`
+- `frontend/manifests/conversation-evidence.json`
 
-The production renderer mounts the composer under the transcript in a dedicated input dock and scopes it to the active Agent.
+The reconstructed default placeholder includes `Ask anything, or drop a file.`; exact wording is not itself an architectural requirement.
 
-v0.1 required core:
+### Per-Agent draft persistence
 
-- integrated bottom composer;
-- normal natural-language input;
-- explicit send action;
-- sensible keyboard submission;
-- disabled/busy state when sending is unavailable;
-- per-Agent scope.
+**Evidence strength:** Evidence-backed
 
-### 8.2 Per-Agent draft persistence
+The recovered draft store is explicitly client-persisted and keyed per Agent, including draft/recovery state and restoration across client lifecycle.
 
-**Classification: Evidence-backed**
-
-Draft state is explicitly client-persisted and keyed by Agent.
-
-Evidence:
+Anchor:
 
 - `frontend/src/recovered/features/conversation/workspace/draft-state.ts`
-- artifact anchors around `index-UbX-y3il.js#byteOffset=4769359`, `#byteOffset=4771060`, and `#byteOffset=4773604`.
 
-Reference semantics:
+This evidence supports keeping unsent drafts as Desktop-owned presentation state rather than treating them as authoritative service execution state.
 
-- switching away from an Agent need not destroy its unsent draft;
-- draft and recovery state are separate concepts;
-- an accepted send clears only the matching/current draft.
+### Attachment staging
 
-v0.1 requirement:
+**Evidence strength:** Evidence-backed for upstream product flow
 
-> Type in Agent A, switch to B, return to A, and the unsent A draft is still there.
+The recovered Desktop bridge stages selected file bytes and later commits staged attachments.
 
-### 8.3 Attachments
+Anchor:
 
-**Classification: Evidence-backed**
-
-The reconstructed composer supports:
-
-- file picker;
-- drag/drop;
-- pasted files;
-- visible attachment list/chips;
-- removal;
-- attachment limits;
-- user-visible staging errors.
-
-Evidence:
-
-- `frontend/src/recovered/features/conversation/workspace/composer.tsx`
 - `frontend/src/recovered/features/conversation/workspace/desktop.ts`
-- `frontend/src/recovered/features/conversation/workspace/model.ts`
 
-The reconstructed model defines a six-attachment composer limit. That is reference behavior, but pi-sand should confirm whether carrying over the exact numeric limit is useful before making it a product invariant.
+The upstream flow supports the existence of a staged → committed lifecycle, but pi-sand's storage layout and Pi handoff are independent product design choices governed by `SPEC-v0.1.md`.
 
-### 8.4 Rich text and voice
+## Working/activity evidence
 
-**Classification: Evidence-backed, deferred from v0.1 gate**
+**Evidence strength:** Evidence-backed at the product-state level; exact Pi mapping is independent
 
-The reference includes a rich-text editor and voice/dictation states.
+Recovered Agent models expose fields such as:
 
-Evidence:
+- `isRunning`
+- `isComposingMessage`
+- `awaitingUserResponse`
+- `currentActivity`
 
-- `frontend/src/recovered/features/conversation/workspace/composer.tsx`
-- voice artifact anchors recorded in that file.
+Anchors:
 
-These are real surfaces, but they should not delay the first Pi-native core conversation release.
-
----
-
-## 9. Working and activity state
-
-### 9.1 Reference model
-
-**Classification: Evidence-backed**
-
-The renderer model contains separate fields for:
-
-- `isRunning`;
-- `isComposingMessage`;
-- `awaitingUserResponse`;
-- `currentActivity`;
-- `waitingReason`;
-- `draftPrompt`;
-- `lastEntry` / last-message preview.
-
-Evidence:
-
-- `frontend/src/recovered/features/conversation/workspace/model.ts`
-- `frontend/src/production/model.ts`
 - `frontend/src/recovered/features/conversation/workspace/chat-header.tsx`
+- `frontend/src/production/model.ts`
 - `frontend/src/recovered/features/conversation/workspace/sidebar-agent-status.ts`
 
-This is strong evidence that the visible product differentiates more than idle/running/finished.
+This is good evidence that Grok Bot's visible experience distinguishes more than a simple terminal completed/not-completed bit.
 
-### 9.2 Pi-native translation
+It is **not** evidence that pi-sand should invent activity semantics that Pi does not expose reliably. Exact Pi-event → product-activity translation remains a pi-sand integration decision.
 
-pi-sand must not synthesize those fields by inventing a second orchestration layer.
+## Root shell / navigation evidence
 
-Use this translation rule:
+**Evidence strength:** Evidence-backed
 
-| Grok-visible concept | pi-sand source |
-| --- | --- |
-| running | persisted Turn state + live Pi execution |
-| assistant streaming | Pi message delta events |
-| current activity | only stable, user-visible Pi events we can classify safely |
-| waiting for user | only a stable Pi/product request-for-user-input signal |
-| last preview | durable transcript summary |
-| draft preview | Desktop-owned per-Agent draft |
+The recovered root shell includes explicit empty/loading/fatal-error states and keyboard/selection navigation helpers.
 
-Never use private chain-of-thought as activity content.
+Anchor:
 
-If Pi exposes no reliable richer activity for a moment, a simple working state is correct.
+- `frontend/src/recovered/features/window-chrome/root-shell-state.tsx`
 
----
+Examples include `No chats yet`, a setup/loading state, previous/next Agent navigation, indexed Agent selection, and history-like back/forward selection navigation.
 
-## 10. Background switching and reconnect
+These are real surfaces; exact shortcut parity is not automatically part of v0.1.
 
-### 10.1 Reference-backed client behavior
+## Larger recovered surfaces
 
-The reference clearly treats Agent selection and connection state as client/UI state. Selection can be restored independently, and reconnecting/unreachable states are modeled without deleting the roster.
+**Evidence strength:** Evidence-backed existence, not automatically v0.1 scope
 
-Evidence:
+The recovered frontend feature tree contains many additional areas, including:
 
-- `frontend/src/recovered/features/roster/selection-state.ts`
-- `frontend/src/recovered/features/root-resilience/connection-state.tsx`
-- `frontend/src/recovered/features/roster/status.tsx`
-- `frontend/src/recovered/features/roster/reconnect-notice.tsx`
+- Agent info/settings;
+- automations;
+- Computer;
+- hidden chats;
+- onboarding;
+- org chart;
+- permissions;
+- plugins;
+- account/access;
+- deep links;
+- feedback;
+- shared rooms/groups;
+- command palette and more.
 
-### 10.2 pi-sand extension
+Their existence is useful mapping evidence. None becomes a v0.1 requirement unless `SPEC-v0.1.md` explicitly promotes it.
 
-**Classification: Extension**
+## Reference-repository extensions that are not upstream parity evidence
 
-The stronger pi-sand guarantee remains:
+The reconstruction project also adds its own experiments, including an inference router, routed Claude/Codex/OpenRouter support, local usage tracking, and optional local Docker sandboxing.
 
-```text
-Desktop selection/lifetime != Agent execution lifetime
-```
+These are reconstruction-project extensions, not Grok Bot 0.18 parity requirements for pi-sand.
 
-Therefore:
+## Intentional pi-sand Extensions
 
-- switching A -> B does not stop A;
-- closing the Desktop does not stop A;
-- reopening obtains authoritative state from the Local Agent Service;
-- independent Agents in independent canonical workspaces may continue concurrently.
+The following important product behaviors come from pi-sand's own product/architecture goals rather than a strict Grok parity claim:
 
-This is a deliberate Pi-native local architecture guarantee. Do not claim that the reference repository alone proves the exact same local process semantics.
+- Desktop close does not cancel active work while the Local Agent Service remains alive;
+- one Agent has at most one running Turn;
+- one canonical workspace has at most one running Turn;
+- independent Agents in independent canonical workspaces may run concurrently;
+- workspace identity uses canonical real filesystem paths;
+- service restart explicitly terminalizes persisted running Turns without replay/adoption;
+- Pi remains the reasoning/runtime owner while pi-sand owns durable product state.
 
----
+Whether any of these resembles upstream behavior is secondary; their release status comes from `SPEC-v0.1.md`, not this evidence ledger.
 
-## 11. v0.1 compatibility matrix
+## Known evidence gaps
 
-| Surface | Classification | v0.1 |
-| --- | --- | --- |
-| Two-pane shell | Evidence-backed | Required |
-| Agent roster | Evidence-backed | Required |
-| New Agent/chat action | Evidence-backed | Required |
-| Search | Evidence-backed | Recommended, may follow first shell |
-| Persist last selected Agent | Evidence-backed | Required |
-| Agent avatar/name header | Evidence-backed | Required |
-| Visible Working state | Evidence-backed | Required |
-| Durable transcript | Evidence-backed + pi-sand foundation | Required |
-| Streaming assistant text | Evidence-backed + Pi contract | Required |
-| Per-Agent draft | Evidence-backed | Required |
-| File attachment picker | Evidence-backed | Required |
-| Drag/drop/paste attachment | Evidence-backed | Required for parity slice |
-| Reply context | Evidence-backed | Recommended |
-| Rich text | Evidence-backed | Deferred |
-| Voice/dictation | Evidence-backed | Deferred |
-| Reactions/threads | Evidence-backed | Deferred |
-| Pinned Agents/sections | Evidence-backed | Deferred |
-| Hidden chats | Evidence-backed | Deferred |
-| Shared rooms/groups | Evidence-backed | Deferred |
-| Computer surface | Evidence-backed | Deferred |
-| Full Agent settings | Evidence-backed | Deferred |
-| Reconnecting/unreachable states | Evidence-backed | Required |
-| Desktop close does not stop Turn | pi-sand Extension | Required |
-| Multi-Agent independent concurrency | pi-sand Extension | Required |
-| Canonical workspace lock | pi-sand Extension | Required |
-| Exact upstream stop-button placement | Unknown in this evidence pass | Do not guess |
-| Exact notification behavior | Unknown in this evidence pass | Do not claim parity |
+These remain **Unknown** or insufficiently mapped and must not become Grok parity requirements by intuition:
 
----
+- exact upstream Desktop-close/background-execution semantics;
+- exact Agent creation + workspace-selection presentation;
+- exact stop/interrupt control placement and copy;
+- exact unread transition rules;
+- exact awaiting-user-response interaction and response path;
+- exact failed-vs-interrupted visual treatment;
+- exact activity/tool-event placement inside or around the transcript;
+- completion/terminal desktop-notification behavior;
+- which reference behaviors depend on remote/cloud infrastructure unavailable to a local Pi-native implementation.
 
-## 12. First implementation slice derived from this map
+If one of these matters to a future ticket, first gather evidence and update this ledger. Then decide release scope in the spec.
 
-The first UI implementation should deliberately be smaller than the full recovered feature tree.
+## Clean-room rule
 
-Build this first:
+Reference evidence may create:
 
-```text
-Window shell
-  ├── roster
-  │    ├── New
-  │    ├── Agent rows
-  │    │    ├── avatar/name
-  │    │    ├── preview/draft/waiting detail
-  │    │    └── working/attention state
-  │    └── loading / empty / reconnect / error states
-  │
-  └── selected conversation
-       ├── header: avatar + name + Working
-       ├── durable transcript + streaming assistant text
-       └── composer
-            ├── per-Agent draft
-            ├── send
-            └── file attachments
-```
+- a behavioral requirement in the spec;
+- a compatibility test;
+- a screenshot/state record;
+- a research note.
 
-Then prove this behavioral journey before adding more surfaces:
+Reference evidence must not, by itself, create an internal pi-sand component or justify copying reconstructed implementation code, proprietary assets, or recovered source organization.
 
-```text
-create/open Agent A
-      ↓
-type a draft
-      ↓
-switch to Agent B
-      ↓
-return to A; draft survives
-      ↓
-send A; A shows Working
-      ↓
-switch to B while A continues
-      ↓
-A remains visibly working in roster
-      ↓
-return to A; streaming/result is current
-      ↓
-disconnect/reconnect Desktop
-      ↓
-selection + transcript + Turn state restore correctly
-```
-
----
-
-## 13. Behavioral tests to derive
-
-Compatibility evidence should create observable tests, not reconstructed internal components.
-
-The first reference-derived tests should prove:
-
-1. Root shell distinguishes loading, empty, ready, reconnecting, and unreachable states.
-2. Roster is visible while a conversation is selected; Agent selection is not a `<select>`-only developer surface.
-3. Selected Agent header shows identity and Working when the Agent is running.
-4. An Agent row reflects running state without requiring that Agent to be currently selected.
-5. Per-Agent drafts survive Agent switching.
-6. Transcript state does not duplicate or reorder after reconnect/snapshot replacement.
-7. Streaming assistant output is visible before Turn settlement.
-8. File attachment picker and drag/drop/paste feed the same composer attachment state.
-9. Switching Agents does not affect another Agent's running Turn.
-10. Transport loss preserves the visible concept that Agents are durable and allows retry/reconnect.
-
-Tests should assert user-observable state and product contracts. They should not assert reconstructed Grok internal module names.
-
----
-
-## 14. Evidence gaps to investigate before claiming parity
-
-The following need a dedicated evidence pass rather than guesswork:
-
-- exact stop/interrupt control placement and state transitions in the shipped UI;
-- exact Agent creation flow and workspace-selection presentation;
-- exact upstream semantics for background work when the Desktop window closes;
-- exact notification behavior for completed unattended work;
-- which activity/tool events are visible in the ordinary conversation versus only in Computer/tool surfaces;
-- precise unread-state transition rules;
-- initial onboarding/setup screens relevant to a local Pi-native build;
-- whether attachment limits and failure copy should be matched exactly or adapted to Pi/local constraints;
-- exact visual treatment of an interrupted versus failed Turn.
-
-Until mapped, these remain **Unknown** or pi-sand **Extension** behavior.
-
----
-
-## 15. Reference file index
-
-Core evidence used in this pass:
-
-```text
-PROVENANCE.md
-
-frontend/src/production/ProductionRenderer.tsx
-frontend/src/production/model.ts
-
-frontend/src/recovered/features/window-chrome/root-shell-state.tsx
-frontend/src/recovered/features/root-resilience/connection-state.tsx
-frontend/src/recovered/features/roster/status.tsx
-frontend/src/recovered/features/roster/reconnect-notice.tsx
-frontend/src/recovered/features/roster/selection-state.ts
-
-frontend/src/recovered/features/conversation/workspace/sidebar.tsx
-frontend/src/recovered/features/conversation/workspace/sidebar-agent-status.ts
-frontend/src/recovered/features/conversation/workspace/chat-header.tsx
-frontend/src/recovered/features/conversation/workspace/transcript.tsx
-frontend/src/recovered/features/conversation/workspace/conversation-workspace-controller.ts
-frontend/src/recovered/features/conversation/workspace/model.ts
-frontend/src/recovered/features/conversation/workspace/composer.tsx
-frontend/src/recovered/features/conversation/workspace/draft-state.ts
-frontend/src/recovered/features/conversation/workspace/desktop.ts
-frontend/src/recovered/features/conversation/workspace/view.css
-```
-
-This list is intentionally narrower than the reconstructed repository's feature tree. It is the evidence base for the first core Agent conversation journey, not an inventory of everything Grok Bot 0.18 contains.
-
----
-
-## 16. Translation rule for future research
-
-For every new Grok-derived feature, record:
-
-```text
-User-visible behavior
-      ↓
-Evidence class
-      ↓
-Artifact/reconstruction anchor
-      ↓
-What pi-sand must reproduce
-      ↓
-What is implementation-specific and must NOT be copied
-      ↓
-Observable compatibility test
-```
-
-That keeps the direction stable:
-
-> **Grok Bot 0.18 defines the visible product language. Pi defines the intelligence. pi-sand owns persistence, routing, presentation, and process boundaries.**
+The immutable user-facing behavior is what matters.
