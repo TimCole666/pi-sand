@@ -1,4 +1,7 @@
-# Pi-Native Grok Bot Compatibility Specification
+# Historical: Pi-Native Grok Bot Compatibility Specification
+
+> **Superseded.** This document is retained for historical context only. The sole normative v0.1 authority is [`SPEC-v0.1.md`](SPEC-v0.1.md); the companion [`REFERENCE.md`](REFERENCE.md) is explicitly non-normative.
+
 
 ## Problem Statement
 

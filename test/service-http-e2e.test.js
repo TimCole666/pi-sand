@@ -69,7 +69,7 @@ async function eventually(predicate, message) {
   assert.fail(message);
 }
 
-test("Desktop HTTP/SSE journey closes during work and reconnects to one canonical result", async () => {
+test("Local Agent Service HTTP/SSE transport closes during work and reconnects to one canonical result", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-sand-desktop-e2e-"));
   const service = new AgentService({ dbPath: join(directory, "state.sqlite"), piFactory: delayedPi });
   const server = createAgentServer(service);
@@ -98,7 +98,7 @@ test("Desktop HTTP/SSE journey closes during work and reconnects to one canonica
     assert.equal(reconnectSnapshot.activeTurnId, turn.id);
     assert.deepEqual(reconnectSnapshot.messages.map((message) => message.id), whileClosed.messages.map((message) => message.id));
 
-    const execution = service.executions.get(turn.id);
+    const execution = service.turnExecutions.get(turn.id);
     execution.release();
     await eventually(() => reopenedDesktop.events.some((event) => event.type === "turn_finished"), "reopened Desktop did not receive completion");
     await reopenedDesktop.close();
@@ -115,7 +115,7 @@ test("Desktop HTTP/SSE journey closes during work and reconnects to one canonica
   }
 });
 
-test("two Desktop connections reconnect independently while their separate workspace Turns run concurrently", async () => {
+test("Local Agent Service HTTP/SSE connections reconnect independently across concurrent Turns", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-sand-desktop-parallel-e2e-"));
   const workspaceA = join(directory, "workspace-a");
   const workspaceB = join(directory, "workspace-b");
@@ -150,11 +150,11 @@ test("two Desktop connections reconnect independently while their separate works
       "each reconnected Desktop did not receive its own active Turn",
     );
 
-    service.executions.get(turnA.id).release();
+    service.turnExecutions.get(turnA.id).release();
     await eventually(() => reopenedA.events.some((event) => event.type === "turn_finished"), "reconnected Desktop A did not observe completion");
     assert.equal((await json(base, `/api/agents/${agentB.agent.id}`)).activeTurnId, turnB.id);
 
-    service.executions.get(turnB.id).release();
+    service.turnExecutions.get(turnB.id).release();
     await eventually(() => reopenedB.events.some((event) => event.type === "turn_finished"), "reconnected Desktop B did not observe completion");
   } finally {
     await Promise.allSettled([firstA?.close(), firstB?.close(), reopenedA?.close(), reopenedB?.close()]);

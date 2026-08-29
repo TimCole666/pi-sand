@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentService } from "../src/service.js";
@@ -18,6 +18,37 @@ function waitForTerminal(service, agentId) {
     }, timeoutMs);
     const unsubscribe = service.subscribe(agentId, (event) => {
       if (event.type === "turn_finished") {
+        clearTimeout(timer);
+        unsubscribe();
+        resolve(event.snapshot);
+      }
+    });
+  });
+}
+
+async function assertWorkspaceDoesNotContain(root, secret) {
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) {
+      await assertWorkspaceDoesNotContain(path, secret);
+    } else {
+      const contents = await readFile(path);
+      assert.equal(contents.includes(Buffer.from(secret)), false, `workspace file ${path} contains the conversational secret`);
+    }
+  }
+}
+
+function waitForTurn(service, agentId, turnId) {
+  const snapshot = service.getAgent(agentId);
+  const turn = snapshot.turns.find((candidate) => candidate.id === turnId);
+  if (turn && turn.status !== "running") return Promise.resolve(snapshot);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      unsubscribe();
+      reject(new Error(`real Pi Turn ${turnId} did not settle within ${timeoutMs}ms`));
+    }, timeoutMs);
+    const unsubscribe = service.subscribe(agentId, (event) => {
+      if (event.type === "turn_finished" && event.turnId === turnId) {
         clearTimeout(timer);
         unsubscribe();
         resolve(event.snapshot);
@@ -45,5 +76,68 @@ test("real Pi writes a controlled workspace fixture through the Local Agent Serv
   } finally {
     service.close();
     await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("real Pi consumes a staged attachment and produces an externally verifiable workspace result", { skip: enabled ? false : "set PI_SAND_REAL_PI=1 with a configured pi CLI to run the real-Pi acceptance scenario" }, async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "pi-sand-real-pi-attachment-"));
+  const dbPath = join(workspace, "state.sqlite");
+  const output = join(workspace, "pi-sand-attachment-smoke.txt");
+  const service = new AgentService({ dbPath });
+  try {
+    const agent = service.createAgent({ name: "Real Pi attachment smoke", workspace });
+    const attachment = service.stageAttachment(agent.agent.id, {
+      filename: "source-note.txt",
+      contentType: "text/plain",
+      bytes: Buffer.from("PI_ATTACHMENT_7X"),
+    });
+    const turn = service.sendMessage(agent.agent.id, [
+      "Read the attached source-note.txt from the stable local path supplied by pi-sand.",
+      "Create pi-sand-attachment-smoke.txt in the current workspace with exactly the attachment's contents.",
+      "Do not use the pi-sand durable transcript as a source. Reply after the file is written.",
+    ].join(" "), { attachments: [attachment.id] });
+    const completed = await waitForTurn(service, agent.agent.id, turn.id);
+    assert.equal(completed.turns.find((candidate) => candidate.id === turn.id).status, "completed");
+    assert.equal(await readFile(output, "utf8"), "PI_ATTACHMENT_7X");
+    assert.equal(completed.messages.find((message) => message.turnId === turn.id && message.role === "user").attachments[0].id, attachment.id);
+    assert.equal(service.attachmentSnapshot(attachment.id).state, "committed");
+  } finally {
+    service.close();
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("real Pi preserves ordinary follow-up context in one Agent session", { skip: enabled ? false : "set PI_SAND_REAL_PI=1 with a configured pi CLI to run the real-Pi acceptance scenario" }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-sand-real-pi-context-"));
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  // Keep the durable transcript and attachment directory outside the Pi
+  // workspace so the codeword can only come from Pi's live native context.
+  const dbPath = join(root, "state.sqlite");
+  const fixture = join(workspace, "pi-sand-context-smoke.txt");
+  const codeword = "PI_NATIVE_CONTEXT_7X";
+  const service = new AgentService({ dbPath });
+  try {
+    const agent = service.createAgent({ name: "Real Pi context smoke", workspace });
+    const first = service.sendMessage(agent.agent.id, [
+      `Memorize this exact codeword for our next conversation turn: ${codeword}.`,
+      "Do not create or modify any files. Reply with a brief acknowledgement.",
+    ].join(" "));
+    const firstResult = await waitForTurn(service, agent.agent.id, first.id);
+    assert.equal(firstResult.turns.find((turn) => turn.id === first.id).status, "completed");
+    await assertWorkspaceDoesNotContain(workspace, codeword);
+
+    const second = service.sendMessage(agent.agent.id, [
+      "Using only the conversation context from the previous turn, write pi-sand-context-smoke.txt",
+      "in the current workspace. Its complete contents must be exactly the codeword you were asked",
+      "to memorize. Do not derive it from any file or from pi-sand's durable transcript. Reply after writing.",
+    ].join(" "));
+    const secondResult = await waitForTurn(service, agent.agent.id, second.id);
+    assert.equal(secondResult.turns.find((turn) => turn.id === second.id).status, "completed");
+    assert.equal(await readFile(fixture, "utf8"), codeword);
+    assert.equal(secondResult.messages.filter((message) => message.role === "assistant").length, 2);
+  } finally {
+    service.close();
+    await rm(root, { recursive: true, force: true });
   }
 });
