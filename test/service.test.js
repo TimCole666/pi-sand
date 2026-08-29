@@ -446,6 +446,20 @@ test("tilde and filesystem aliases persist one canonical workspace and cannot by
   }
 });
 
+test("Agent roster summaries expose stable order and the latest durable message preview", async () => withService(async (service) => {
+  const first = service.createAgent({ name: "First", workspace: "/tmp" });
+  const second = service.createAgent({ name: "Second", workspace: "/tmp" });
+  const initial = service.listAgents();
+  assert.deepEqual(initial.map((agent) => agent.id), [first.agent.id, second.agent.id]);
+  assert.equal(initial[0].recentPreview, null);
+
+  service.sendMessage(first.agent.id, "first request");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const afterTurn = service.listAgents();
+  assert.equal(afterTurn[0].recentPreview, "Done.");
+  assert.equal(afterTurn[1].recentPreview, null);
+}), fakePi);
+
 test("independent Agents run concurrently while completion, failure, and interruption stay isolated", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-sand-parallel-turns-"));
   const path = join(directory, "state.sqlite");

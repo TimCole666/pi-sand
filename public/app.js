@@ -1,3 +1,16 @@
+const SELECTED_AGENT_KEY = "pi-sand-agent";
+const DRAFTS_KEY = "pi-sand-drafts";
+
+function readDrafts(storage) {
+  try {
+    const value = JSON.parse(storage.getItem(DRAFTS_KEY) ?? "{}");
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    return Object.fromEntries(Object.entries(value).filter(([, draft]) => typeof draft === "string"));
+  } catch {
+    return {};
+  }
+}
+
 export function mountDesktop({
   document = window.document,
   fetchImpl = window.fetch.bind(window),
@@ -9,7 +22,35 @@ export function mountDesktop({
 } = {}) {
   const $ = (selector) => document.querySelector(selector);
   let agent = null;
+  let selectedAgentId = null;
   let source = null;
+  let roster = [];
+  const drafts = readDrafts(localStorage);
+
+  function escapeHtml(value) {
+    return String(value ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
+  }
+
+  function composerInput() {
+    return $("#send")?.message || $("#message") || $("#send")?.querySelector?.('[name="message"]');
+  }
+
+  function persistDrafts() {
+    try { localStorage.setItem(DRAFTS_KEY, JSON.stringify(drafts)); } catch { /* Storage may be unavailable; the current input remains usable. */ }
+  }
+
+  function setDraft(agentId, value) {
+    if (!agentId) return;
+    if (value) drafts[agentId] = value;
+    else delete drafts[agentId];
+    persistDrafts();
+    renderAgentList(roster);
+  }
 
   function setConnectionState(state, message) {
     const element = $("#connection");
@@ -29,12 +70,46 @@ export function mountDesktop({
     return data;
   }
 
+  function previewFor(item) {
+    const draft = drafts[item.id];
+    return draft?.trim() ? draft : item.recentPreview?.trim() || "No messages yet.";
+  }
+
+  function renderAgentList(agents) {
+    roster = agents;
+    const selected = selectedAgentId || agent?.id;
+    const select = $("#agents");
+    if (select) {
+      select.innerHTML = '<option value="">Open an existing Agent…</option>' + agents.map((item) =>
+        `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)} — ${escapeHtml(previewFor(item))}</option>`
+      ).join("");
+      if (selected) select.value = selected;
+    }
+
+    const list = $("#agent-list");
+    if (list) {
+      list.innerHTML = agents.map((item) => {
+        const name = item.name?.trim() || "Agent";
+        const marker = name[0]?.toUpperCase() || "A";
+        const active = item.id === selected ? " selected" : "";
+        return `<button type="button" class="agent-row${active}" data-agent-id="${escapeHtml(item.id)}" aria-pressed="${item.id === selected}">`+
+          `<span class="agent-marker" aria-hidden="true">${escapeHtml(marker)}</span>`+
+          `<span class="agent-row-copy"><strong>${escapeHtml(name)}</strong><small>${escapeHtml(previewFor(item))}</small></span>`+
+          `</button>`;
+      }).join("");
+      for (const button of list.querySelectorAll?.("[data-agent-id]") ?? []) {
+        button.addEventListener("click", () => openAgent(button.dataset.agentId).catch((error) => alertImpl(error.message)));
+      }
+    }
+    const empty = $("#empty-state");
+    if (empty) empty.hidden = agents.length !== 0;
+  }
+
   async function refreshAgents() {
     setConnectionState("connecting", "Connecting to your computer…");
     try {
       const agents = await request("/api/agents");
-      $("#agents").innerHTML = '<option value="">Open an existing Agent…</option>' + agents.map((item) => `<option value="${item.id}">${item.name} — ${item.workspace}</option>`).join("");
-      if ($("#empty-state")) $("#empty-state").hidden = agents.length !== 0;
+      renderAgentList(agents);
       setConnectionState("connected", "");
       return agents;
     } catch (error) {
@@ -52,25 +127,29 @@ export function mountDesktop({
 
   function render(snapshot) {
     agent = snapshot.agent;
+    selectedAgentId = snapshot.agent.id;
     $("#setup").hidden = false;
     $("#conversation").hidden = false;
     $("#agent-meta").textContent = `${agent.name} · ${agent.workspace}`;
-    $("#messages").innerHTML = snapshot.messages.map((message) => `<div class="message ${message.role}" data-id="${message.id}">${escapeHtml(message.content)}</div>`).join("");
+    $("#messages").innerHTML = snapshot.messages.map((message) =>
+      `<div class="message ${escapeHtml(message.role)}" data-id="${escapeHtml(message.id)}">${escapeHtml(message.content)}</div>`
+    ).join("");
     $("#status").textContent = snapshot.state === "active" ? "Pi is working…" : terminalStatus(snapshot);
     $("#status").className = snapshot.state === "active" ? "running" : snapshot.turns.at(-1)?.status === "failed" ? "error" : "";
     $("#interrupt").hidden = !snapshot.activeTurnId;
-  }
-
-  function escapeHtml(value) {
-    return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+    renderAgentList(roster);
   }
 
   async function openAgent(id) {
     source?.close();
-    const snapshot = await request(`/api/agents/${id}`);
-    localStorage.setItem("pi-sand-agent", id);
+    source = null;
+    const snapshot = await request(`/api/agents/${encodeURIComponent(id)}`);
+    selectedAgentId = id;
+    localStorage.setItem(SELECTED_AGENT_KEY, id);
     render(snapshot);
-    source = new EventSourceImpl(`${apiBase}/api/agents/${id}/events`);
+    const input = composerInput();
+    if (input) input.value = drafts[id] ?? "";
+    source = new EventSourceImpl(`${apiBase}/api/agents/${encodeURIComponent(id)}/events`);
     source.onopen = () => setConnectionState("connected", "");
     source.onerror = () => setConnectionState("reconnecting", "Reconnecting to your computer…");
     source.onmessage = (event) => {
@@ -79,7 +158,8 @@ export function mountDesktop({
     };
   }
 
-  $("#create").onsubmit = async (event) => {
+  const create = $("#create");
+  create.onsubmit = async (event) => {
     event.preventDefault();
     try {
       const data = await request("/api/agents", { method: "POST", body: JSON.stringify(Object.fromEntries(new FormDataImpl(event.target))) });
@@ -87,32 +167,42 @@ export function mountDesktop({
       await openAgent(data.agent.id);
     } catch (error) { alertImpl(error.message); }
   };
+
+  $("#new-chat")?.addEventListener("click", () => {
+    $("#create")?.classList.remove("hidden");
+    $("#name")?.focus();
+  });
   $("#agents").onchange = (event) => event.target.value && openAgent(event.target.value).catch((error) => alertImpl(error.message));
-  if ($("#retry")) $("#retry").onclick = () => refreshAgents().then(async () => {
-    const remembered = localStorage.getItem("pi-sand-agent");
-    if (remembered && [...$("#agents").options].some((option) => option.value === remembered)) await openAgent(remembered);
-  }).catch(() => {});
+  if ($("#retry")) $("#retry").onclick = () => refreshAgents().then((agents) => restoreSelection(agents)).catch(() => {});
+
+  const input = composerInput();
+  input?.addEventListener?.("input", () => setDraft(selectedAgentId, input.value));
   $("#send").onsubmit = async (event) => {
     event.preventDefault();
     if (!agent) return;
-    const input = event.target.message;
+    const messageInput = composerInput();
+    const message = messageInput?.value ?? "";
     try {
-      await request(`/api/agents/${agent.id}/turns`, { method: "POST", body: JSON.stringify({ message: input.value }) });
-      input.value = "";
+      await request(`/api/agents/${encodeURIComponent(agent.id)}/turns`, { method: "POST", body: JSON.stringify({ message }) });
+      if (messageInput) messageInput.value = "";
+      setDraft(agent.id, "");
     } catch (error) { alertImpl(error.message); }
   };
   $("#interrupt").onclick = async () => {
-    const active = (await request(`/api/agents/${agent.id}`)).activeTurnId;
-    if (active) await request(`/api/agents/${agent.id}/interrupt`, { method: "POST", body: JSON.stringify({ turnId: active }) });
+    const active = (await request(`/api/agents/${encodeURIComponent(agent.id)}`)).activeTurnId;
+    if (active) await request(`/api/agents/${encodeURIComponent(agent.id)}/interrupt`, { method: "POST", body: JSON.stringify({ turnId: active }) });
   };
 
-  const ready = refreshAgents().then(async () => {
-    const remembered = localStorage.getItem("pi-sand-agent");
-    if (remembered && [...$("#agents").options].some((option) => option.value === remembered)) {
-      $("#agents").value = remembered;
-      await openAgent(remembered);
+  async function restoreSelection(agents) {
+    const remembered = localStorage.getItem(SELECTED_AGENT_KEY);
+    const selected = agents.some((item) => item.id === remembered) ? remembered : agents[0]?.id;
+    if (selected) {
+      if ($("#agents")) $("#agents").value = selected;
+      await openAgent(selected);
     }
-  }).catch(() => {});
+  }
+
+  const ready = refreshAgents().then((agents) => restoreSelection(agents)).catch(() => {});
 
   function destroy() {
     source?.close();

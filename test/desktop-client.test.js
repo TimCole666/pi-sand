@@ -19,7 +19,16 @@ function eventually(predicate, message) {
 }
 
 class Element {
-  constructor() { this.hidden = false; this.textContent = ""; this.className = ""; this.value = ""; this.options = []; this.innerHtml = ""; }
+  constructor() { this.hidden = false; this.textContent = ""; this.className = ""; this.value = ""; this.options = []; this.innerHtml = ""; this.listeners = new Map(); }
+  addEventListener(type, listener) {
+    const listeners = this.listeners.get(type) ?? [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
+  }
+  dispatchEvent(event) {
+    for (const listener of this.listeners.get(event.type) ?? []) listener(event);
+  }
+  focus() {}
   set innerHTML(value) {
     this.innerHtml = value;
     if (this.isSelect) this.options = [...value.matchAll(/<option value="([^"]*)">/g)].map((match) => ({ value: match[1] }));
@@ -28,7 +37,7 @@ class Element {
 }
 
 function desktop({ base, storage = new Map() }) {
-  const elements = Object.fromEntries(["setup", "conversation", "agent-meta", "messages", "status", "interrupt", "agents", "create", "send"].map((id) => [id, new Element()]));
+  const elements = Object.fromEntries(["setup", "conversation", "agent-meta", "messages", "status", "interrupt", "agents", "agent-list", "empty-state", "connection", "retry", "new-chat", "name", "workspace", "message", "create", "send"].map((id) => [id, new Element()]));
   elements.agents.isSelect = true;
   elements.create.values = { name: "Agent", workspace: "" };
   elements.send.message = new Element();
@@ -149,6 +158,40 @@ test("Desktop interrupt renders the durable interruption explanation", async () 
   assert.equal(view.elements.status.textContent, "Turn interrupted: The Turn was interrupted by the user.");
   assert.equal(view.elements.interrupt.hidden, true);
 }, controlledPi));
+
+test("Desktop keeps independent drafts across Agent switching and restart with draft-first roster previews", async () => withDesktop(async ({ base, directory }) => {
+  const storage = new Map();
+  const first = desktop({ base, storage });
+  await first.client.ready;
+
+  first.elements.create.values = { name: "Alpha", workspace: directory };
+  await first.elements.create.onsubmit({ preventDefault() {}, target: first.elements.create });
+  const alphaId = storage.get("pi-sand-agent");
+  first.elements.send.message.value = "Alpha draft";
+  first.elements.send.message.dispatchEvent({ type: "input" });
+
+  first.elements.create.values = { name: "Beta", workspace: directory };
+  await first.elements.create.onsubmit({ preventDefault() {}, target: first.elements.create });
+  first.elements.send.message.value = "Beta draft";
+  first.elements.send.message.dispatchEvent({ type: "input" });
+
+  first.elements.agents.value = alphaId;
+  await first.elements.agents.onchange({ target: first.elements.agents });
+  assert.equal(first.elements.send.message.value, "Alpha draft");
+  assert.match(first.elements["agent-list"].innerHTML, /Alpha draft/);
+  assert.match(first.elements["agent-list"].innerHTML, /Beta draft/);
+
+  const reopened = desktop({ base, storage });
+  await reopened.client.ready;
+  assert.equal(storage.get("pi-sand-agent"), alphaId);
+  assert.equal(reopened.elements.send.message.value, "Alpha draft");
+  assert.match(reopened.elements["agent-list"].innerHTML, /Beta draft/);
+
+  storage.set("pi-sand-agent", "missing-agent");
+  const fallback = desktop({ base, storage });
+  await fallback.client.ready;
+  assert.equal(storage.get("pi-sand-agent"), alphaId);
+}, completedPi));
 
 test("Desktop renders unexpected Pi exit as a durable failed Turn", async () => withDesktop(async ({ service, base, directory }) => {
   const view = desktop({ base });

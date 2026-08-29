@@ -119,7 +119,25 @@ export class AgentService {
     return this.getAgent(id);
   }
 
-  listAgents() { return this.db.prepare("SELECT id, name, workspace, created_at AS createdAt, updated_at AS updatedAt FROM agents ORDER BY created_at").all(); }
+  listAgents() {
+    return this.db.prepare(`
+      SELECT
+        agents.id,
+        agents.name,
+        agents.workspace,
+        agents.created_at AS createdAt,
+        agents.updated_at AS updatedAt,
+        (
+          SELECT messages.content
+          FROM messages
+          WHERE messages.agent_id = agents.id
+          ORDER BY messages.sequence DESC
+          LIMIT 1
+        ) AS recentPreview
+      FROM agents
+      ORDER BY agents.created_at, agents.rowid
+    `).all();
+  }
 
   getAgent(id) {
     const agent = this.db.prepare("SELECT id, name, workspace, created_at AS createdAt, updated_at AS updatedAt FROM agents WHERE id = ?").get(id);
