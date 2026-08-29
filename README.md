@@ -28,6 +28,8 @@ The Local Agent Service owns durable Agents, Turns, user/assistant transcript me
 
 Pi owns reasoning, tools, skills, retries inside its autonomous loop, and its native conversational context. pi-sand does not add a planner, scheduler, queue, worker pool, provider abstraction, replay loop, or custom memory/context system. Independent Agents may run concurrently only when their canonical workspaces differ. Stop, unexpected Pi exit, and service-restart reconciliation produce explicit durable Turn outcomes; unfinished work after service restart is interrupted without replay or worker adoption.
 
+Process groups are best-effort cleanup, not complete containment: unrestricted Pi tools may create descendants outside the recorded PGID. After a Local Agent Service lifetime boundary in the same Linux boot, an unresolved real Pi worker keeps its workspace fail-closed and unavailable. A Linux reboot supplies the v0.1 complete process-lifetime proof through the kernel boot ID; pi-sand does not adopt, replay, or resume the old worker. Stronger cgroup-style containment is not part of v0.1.
+
 ## Test seams
 
 The v0.1.0 release proof has exactly three durable seams:

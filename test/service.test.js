@@ -565,6 +565,71 @@ test("a pre-v0.1 database migrates terminal history safe while unknown running h
   }
 });
 
+test("an immediately previous v0.1 schema migrates worker boot identity conservatively", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-sand-worker-boot-migration-"));
+  const dbPath = join(directory, "state.sqlite");
+  const workspace = join(directory, "workspace");
+  await mkdir(workspace);
+  const ids = { agent: randomUUID(), safe: randomUUID(), unresolved: randomUUID() };
+  const timestamp = new Date().toISOString();
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, workspace TEXT NOT NULL,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE turns (
+      id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id),
+      user_message TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('running','completed','failed','interrupted')),
+      started_at TEXT NOT NULL, finished_at TEXT, pi_session_id TEXT, terminal_detail TEXT,
+      worker_pid INTEGER, worker_pgid INTEGER, worker_start_identity TEXT,
+      worker_terminated INTEGER NOT NULL DEFAULT 1 CHECK(worker_terminated IN (0, 1))
+    );
+    CREATE TABLE messages (
+      id TEXT UNIQUE NOT NULL, agent_id TEXT NOT NULL REFERENCES agents(id), turn_id TEXT REFERENCES turns(id),
+      role TEXT NOT NULL CHECK(role IN ('user','assistant')), content TEXT NOT NULL,
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+  `);
+  db.prepare("INSERT INTO agents VALUES (?, ?, ?, ?, ?)").run(ids.agent, "Migrated", workspace, timestamp, timestamp);
+  db.prepare("INSERT INTO turns (id, agent_id, user_message, status, started_at, finished_at, worker_terminated) VALUES (?, ?, ?, 'completed', ?, ?, 1)").run(ids.safe, ids.agent, "Safe historical work", timestamp, timestamp);
+  db.prepare("INSERT INTO turns (id, agent_id, user_message, status, started_at, worker_terminated) VALUES (?, ?, ?, 'running', ?, 0)").run(ids.unresolved, ids.agent, "Unresolved historical work", timestamp);
+  db.close();
+
+  let first;
+  let second;
+  try {
+    first = new AgentService({ dbPath, piFactory: fakePi, bootId: "boot-A" });
+    const columns = first.db.prepare("PRAGMA table_info(turns)").all();
+    assert.equal(columns.some((column) => column.name === "worker_boot_id"), true, "the immediately previous schema must gain worker_boot_id");
+    const migrated = first.db.prepare("SELECT id, status, worker_boot_id AS workerBootId, worker_terminated AS workerTerminated FROM turns ORDER BY id").all();
+    const safe = migrated.find((turn) => turn.id === ids.safe);
+    const unresolved = migrated.find((turn) => turn.id === ids.unresolved);
+    assert.equal(safe.status, "completed");
+    assert.equal(safe.workerTerminated, 1, "safe terminal history must remain safe");
+    assert.equal(safe.workerBootId, null);
+    assert.equal(unresolved.status, "interrupted");
+    assert.equal(unresolved.workerBootId, "boot-A", "unresolved historical work must be assigned the current boot, not an invented older boot");
+    assert.equal(unresolved.workerTerminated, 0);
+    assert.throws(() => first.sendMessage(ids.agent, "Do not unlock same-boot migrated work"), /This workspace remains unavailable because a prior Pi execution may still be able to run/);
+    first.close();
+    first = null;
+
+    second = new AgentService({ dbPath, piFactory: fakePi, bootId: "boot-B" });
+    const released = second.db.prepare("SELECT worker_boot_id AS workerBootId, worker_terminated AS workerTerminated FROM turns WHERE id = ?").get(ids.unresolved);
+    assert.equal(released.workerBootId, "boot-A");
+    assert.equal(released.workerTerminated, 1, "the boot boundary must be the release proof");
+    const nextTurn = second.sendMessage(ids.agent, "Work after the proven reboot boundary");
+    assert.equal(nextTurn.status, "running");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(second.getAgent(ids.agent).turns.at(-1).status, "completed");
+  } finally {
+    second?.close();
+    first?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("Agent creation persists a canonical workspace and rejects missing or non-directory paths", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-sand-workspace-validation-"));
   const path = join(directory, "state.sqlite");

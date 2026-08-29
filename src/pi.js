@@ -28,9 +28,9 @@ const commonArgs = ["--mode", "rpc", "--no-session", "--approve"];
 
 /** Spawn the installed Pi RPC process using the concrete contract proven by the spike. */
 export function spawnPi({ cwd, onEvent, onClose, command = process.env.PI_BIN ?? "pi" }) {
-  // A detached process group gives restart reconciliation a concrete liveness
-  // boundary: terminating the Pi worker also terminates descendants that could
-  // still mutate the Agent workspace.
+  // A detached process group is only best-effort cleanup. Pi tools may create
+  // descendants outside this group, so group disappearance is not a complete
+  // workspace-safety proof; service reconciliation also uses the Linux boot ID.
   const child = spawn(command, commonArgs, { cwd, detached: true, stdio: ["pipe", "pipe", "pipe"] });
   let buffer = "";
   let closed = false;

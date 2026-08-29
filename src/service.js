@@ -9,8 +9,23 @@ import { checkPiCompatibility, PI_LIFECYCLE_ERROR, spawnPi } from "./pi.js";
 
 const TERMINAL = new Set(["completed", "failed", "interrupted"]);
 const WORKER_STOP_TIMEOUT_MS = 2_000;
+const WORKSPACE_UNAVAILABLE_MESSAGE = "This workspace remains unavailable because a prior Pi execution may still be able to run. pi-sand fails closed rather than risking concurrent workspace mutation. Restart the computer to establish a clean process boundary.";
+const LINUX_BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id";
 
 function now() { return new Date().toISOString(); }
+
+function readLinuxBootId() {
+  try {
+    const bootId = readFileSync(LINUX_BOOT_ID_PATH, "utf8").trim();
+    return bootId || null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeBootId(bootId) {
+  return typeof bootId === "string" && bootId.trim() ? bootId.trim() : null;
+}
 
 function sleepSync(milliseconds) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
@@ -89,7 +104,9 @@ function signalWorker(worker, signal) {
   return true;
 }
 
-function stopPriorWorker(worker) {
+function stopRecordedProcessGroup(worker) {
+  // This is best-effort cleanup of the recorded PGID only. A successful result
+  // never proves that a detached descendant outside that group is gone.
   if (!Number.isInteger(worker.workerPid) || !Number.isInteger(worker.workerPgid)) return false;
   if (workerIsGone(worker)) return true;
   // In particular, never kill the recorded process group after the leader PID
@@ -129,7 +146,10 @@ function canonicalWorkspace(workspace) {
 }
 
 export class AgentService {
-  constructor({ dbPath = process.env.PI_SAND_DB ?? defaultDatabasePath(), piFactory = spawnPi } = {}) {
+  constructor({ dbPath = process.env.PI_SAND_DB ?? defaultDatabasePath(), piFactory = spawnPi, bootId } = {}) {
+    // This is a concrete Linux safety seam, not a portable runtime
+    // abstraction. Cache one boot identity for this service lifetime.
+    this.bootId = bootId === undefined ? readLinuxBootId() : normalizeBootId(bootId);
     if (dbPath !== ":memory:") mkdirSync(dirname(dbPath), { recursive: true });
     this.databaseLock = acquireDatabaseLock(dbPath);
     try {
@@ -170,6 +190,7 @@ export class AgentService {
         user_message TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('running','completed','failed','interrupted')),
         started_at TEXT NOT NULL, finished_at TEXT, pi_session_id TEXT, terminal_detail TEXT,
         worker_pid INTEGER, worker_pgid INTEGER, worker_start_identity TEXT,
+        worker_boot_id TEXT,
         worker_terminated INTEGER NOT NULL DEFAULT 1 CHECK(worker_terminated IN (0, 1))
       );
       CREATE TABLE IF NOT EXISTS messages (
@@ -233,10 +254,14 @@ export class AgentService {
       && !names.has("worker_start_identity")
       && !names.has("worker_terminated");
     const addedWorkerTerminated = !names.has("worker_terminated");
-    const needsMigration = !names.has("worker_pid") || !names.has("worker_pgid") || !names.has("worker_start_identity") || addedWorkerTerminated;
-    if (!needsMigration) return;
+    const needsMigration = !names.has("worker_pid")
+      || !names.has("worker_pgid")
+      || !names.has("worker_start_identity")
+      || !names.has("worker_boot_id")
+      || addedWorkerTerminated;
+    if (!needsMigration && !this.bootId) return;
 
-    // Keep DDL and the safety-state rewrite atomic. A crash after adding the
+    // Keep DDL and the safety-state rewrite atomic. A crash after adding a
     // column but before classifying old running rows must not expose a durable
     // worker_terminated=1 default for work whose worker is unknown.
     this.db.exec("BEGIN");
@@ -244,6 +269,7 @@ export class AgentService {
       if (!names.has("worker_pid")) this.db.exec("ALTER TABLE turns ADD COLUMN worker_pid INTEGER");
       if (!names.has("worker_pgid")) this.db.exec("ALTER TABLE turns ADD COLUMN worker_pgid INTEGER");
       if (!names.has("worker_start_identity")) this.db.exec("ALTER TABLE turns ADD COLUMN worker_start_identity TEXT");
+      if (!names.has("worker_boot_id")) this.db.exec("ALTER TABLE turns ADD COLUMN worker_boot_id TEXT");
       if (addedWorkerTerminated) this.db.exec("ALTER TABLE turns ADD COLUMN worker_terminated INTEGER NOT NULL DEFAULT 1");
 
       // A row whose worker_terminated column did not exist cannot prove that a
@@ -254,6 +280,9 @@ export class AgentService {
       // are safe product history; historical running rows remain unsafe so
       // restart reconciliation cannot silently assume their worker is dead.
       if (preV01) this.db.exec("UPDATE turns SET worker_terminated = 1 WHERE status IN ('completed', 'failed', 'interrupted')");
+      // Never invent an older boot. Assigning the current boot only over-fences
+      // an unresolved historical row until the next real reboot proves it safe.
+      if (this.bootId) this.db.prepare("UPDATE turns SET worker_boot_id = ? WHERE worker_terminated = 0 AND worker_boot_id IS NULL").run(this.bootId);
       this.db.exec("COMMIT");
     } catch (error) {
       try { this.db.exec("ROLLBACK"); } catch { /* Preserve the migration failure. */ }
@@ -278,23 +307,43 @@ export class AgentService {
     if (!remaining) this.unsafeWorkspaces.delete(turn.workspace);
   }
 
+  workerBootBoundaryProvesGone(worker) {
+    return Boolean(worker.workerBootId && this.bootId && worker.workerBootId !== this.bootId);
+  }
+
+  reconcileWorkerSafety(worker) {
+    if (this.workerBootBoundaryProvesGone(worker)) {
+      // A boot boundary is the v0.1 proof. Do not signal numeric PID/PGID
+      // values because they may identify unrelated processes in this boot.
+      this.markWorkerTerminated(worker.id);
+      return;
+    }
+
+    // Same-boot and unknown-boot workers remain unresolved even when the
+    // recorded process group has disappeared. Cleanup is not containment.
+    this.unsafeWorkspaces.add(worker.workspace);
+    // Signalling is optional cleanup. When either boot identity is unknown,
+    // do not risk treating a reused PID/PGID as the recorded worker.
+    if (this.bootId && worker.workerBootId) stopRecordedProcessGroup(worker);
+  }
+
   reconcilePriorWorkers() {
     const workers = this.db.prepare(`
       SELECT turns.id, turns.worker_pid AS workerPid, turns.worker_pgid AS workerPgid,
-             turns.worker_start_identity AS workerStartIdentity, agents.workspace
+             turns.worker_start_identity AS workerStartIdentity, turns.worker_boot_id AS workerBootId,
+             agents.workspace
       FROM turns JOIN agents ON agents.id = turns.agent_id
       WHERE turns.worker_terminated = 0
     `).all();
-    for (const worker of workers) {
-      if (stopPriorWorker(worker)) this.markWorkerTerminated(worker.id);
-      else this.unsafeWorkspaces.add(worker.workspace);
-    }
+    for (const worker of workers) this.reconcileWorkerSafety(worker);
   }
 
   ensureWorkspaceSafe(workspace) {
+    if (this.unsafeWorkspaces.has(workspace)) throw new Error(WORKSPACE_UNAVAILABLE_MESSAGE);
     const workers = this.db.prepare(`
       SELECT turns.id, turns.agent_id AS agentId, turns.worker_pid AS workerPid, turns.worker_pgid AS workerPgid,
-             turns.worker_start_identity AS workerStartIdentity
+             turns.worker_start_identity AS workerStartIdentity, turns.worker_boot_id AS workerBootId,
+             agents.workspace
       FROM turns JOIN agents ON agents.id = turns.agent_id
       WHERE agents.workspace = ? AND turns.worker_terminated = 0
     `).all(workspace);
@@ -303,12 +352,9 @@ export class AgentService {
       // a later Turn, not an orphan from an earlier service lifetime. Only
       // reconcile workers for which this service has no owning session.
       if (this.agentSessions.has(worker.agentId)) continue;
-      if (stopPriorWorker(worker)) this.markWorkerTerminated(worker.id);
-      else this.unsafeWorkspaces.add(workspace);
+      this.reconcileWorkerSafety(worker);
     }
-    if (this.unsafeWorkspaces.has(workspace)) {
-      throw new Error("This workspace remains unavailable while a prior Pi worker may still be running.");
-    }
+    if (this.unsafeWorkspaces.has(workspace)) throw new Error(WORKSPACE_UNAVAILABLE_MESSAGE);
   }
 
   // Older databases can hold a pre-canonical workspace spelling. Normalize
@@ -540,7 +586,7 @@ export class AgentService {
     try {
       // A running Turn is unsafe until the worker identity is durably recorded
       // (or the injected execution proves that no OS worker exists).
-      this.db.prepare("INSERT INTO turns (id, agent_id, user_message, status, started_at, worker_terminated) VALUES (?, ?, ?, 'running', ?, 0)").run(turnId, agentId, message, timestamp);
+      this.db.prepare("INSERT INTO turns (id, agent_id, user_message, status, started_at, worker_terminated, worker_boot_id) VALUES (?, ?, ?, 'running', ?, 0, ?)").run(turnId, agentId, message, timestamp, this.bootId);
       this.db.prepare("INSERT INTO messages (id, agent_id, turn_id, role, content, created_at, updated_at) VALUES (?, ?, ?, 'user', ?, ?, ?)").run(messageId, agentId, turnId, message, timestamp, timestamp);
       for (const [position, attachment] of attachments.entries()) {
         this.db.prepare("INSERT INTO message_attachments (message_id, attachment_id, position) VALUES (?, ?, ?)").run(messageId, attachment.id, position);
@@ -645,14 +691,12 @@ export class AgentService {
   reconcileAgentWorkers(agentId) {
     const workers = this.db.prepare(`
       SELECT turns.id, turns.worker_pid AS workerPid, turns.worker_pgid AS workerPgid,
-             turns.worker_start_identity AS workerStartIdentity, agents.workspace
+             turns.worker_start_identity AS workerStartIdentity, turns.worker_boot_id AS workerBootId,
+             agents.workspace
       FROM turns JOIN agents ON agents.id = turns.agent_id
       WHERE turns.agent_id = ? AND turns.worker_terminated = 0
     `).all(agentId);
-    for (const worker of workers) {
-      if (stopPriorWorker(worker)) this.markWorkerTerminated(worker.id);
-      else this.unsafeWorkspaces.add(worker.workspace);
-    }
+    for (const worker of workers) this.reconcileWorkerSafety(worker);
   }
 
   handlePiClose(agentId, turnId, { code = null, signal = null, error } = {}) {
@@ -662,7 +706,8 @@ export class AgentService {
     // proven gone before its workspace can become safe.
     const turn = turnId ? this.db.prepare(`
       SELECT turns.id, turns.status, turns.worker_pid AS workerPid, turns.worker_pgid AS workerPgid,
-             turns.worker_start_identity AS workerStartIdentity, turns.worker_terminated AS workerTerminated, agents.workspace
+             turns.worker_start_identity AS workerStartIdentity, turns.worker_boot_id AS workerBootId,
+             turns.worker_terminated AS workerTerminated, agents.workspace
       FROM turns JOIN agents ON agents.id = turns.agent_id
       WHERE turns.id = ?
     `).get(turnId) : null;
@@ -678,11 +723,10 @@ export class AgentService {
         : `Pi exited with code ${code}`;
     const interruptedBeforeSettlement = this.interruptingTurns.has(turnId);
     if (turn.workerTerminated === 1 || (!Number.isInteger(turn.workerPid) && !Number.isInteger(turn.workerPgid))) {
-      this.markWorkerTerminated(turnId);
-    } else if (stopPriorWorker(turn)) {
+      // An in-process deterministic fake has no OS descendant to fence.
       this.markWorkerTerminated(turnId);
     } else {
-      this.unsafeWorkspaces.add(turn.workspace);
+      this.reconcileWorkerSafety(turn);
     }
     this.agentSessions.delete(agentId);
     this.finishTurn(
