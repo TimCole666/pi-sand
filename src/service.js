@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdirSync, realpathSync, statSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -8,8 +8,95 @@ import { acquireDatabaseLock } from "./database-lock.js";
 import { spawnPi } from "./pi.js";
 
 const TERMINAL = new Set(["completed", "failed", "interrupted"]);
+const WORKER_STOP_TIMEOUT_MS = 2_000;
 
 function now() { return new Date().toISOString(); }
+
+function sleepSync(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+// Linux exposes a process start identity in /proc. A PID alone can be reused;
+// retaining this value lets restart reconciliation distinguish the former Pi
+// child from an unrelated process that inherited its number.
+function processStartIdentity(pid) {
+  try {
+    const stat = requireProcStat(pid);
+    const closingParen = stat.lastIndexOf(")");
+    if (closingParen < 0) return null;
+    return stat.slice(closingParen + 2).trim().split(/\s+/)[19] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function requireProcStat(pid) {
+  return readFileSync(`/proc/${pid}/stat`, "utf8");
+}
+
+function workerMetadata(execution) {
+  const pid = Number(execution?.pid);
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  const processGroupId = Number(execution?.processGroupId ?? pid);
+  if (!Number.isInteger(processGroupId) || processGroupId <= 0) return null;
+  return { pid, processGroupId, startIdentity: processStartIdentity(pid) };
+}
+
+function processGroupIsAlive(processGroupId) {
+  if (!Number.isInteger(processGroupId) || processGroupId <= 0) return false;
+  try {
+    process.kill(-processGroupId, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+function workerIsGone(worker) {
+  if (!processIsAlive(worker.workerPid)) return !processGroupIsAlive(worker.workerPgid);
+  const currentIdentity = processStartIdentity(worker.workerPid);
+  if (worker.workerStartIdentity && currentIdentity && currentIdentity !== worker.workerStartIdentity) return true;
+  return false;
+}
+
+function signalWorker(worker, signal) {
+  try {
+    process.kill(-worker.workerPgid, signal);
+  } catch (error) {
+    if (error.code === "ESRCH") return true;
+    if (error.code === "EPERM") return false;
+    try { process.kill(worker.workerPid, signal); } catch (fallbackError) { return fallbackError.code === "ESRCH"; }
+  }
+  return true;
+}
+
+function stopPriorWorker(worker) {
+  if (!Number.isInteger(worker.workerPid) || !Number.isInteger(worker.workerPgid)) return false;
+  if (workerIsGone(worker)) return true;
+  if (!signalWorker(worker, "SIGTERM")) return false;
+  const deadline = Date.now() + WORKER_STOP_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (workerIsGone(worker)) return true;
+    sleepSync(25);
+  }
+  if (!signalWorker(worker, "SIGKILL")) return false;
+  const killDeadline = Date.now() + WORKER_STOP_TIMEOUT_MS;
+  while (Date.now() < killDeadline) {
+    if (workerIsGone(worker)) return true;
+    sleepSync(25);
+  }
+  return workerIsGone(worker);
+}
 
 export function defaultDatabasePath() {
   const dataHome = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
@@ -46,6 +133,7 @@ export class AgentService {
     this.assistantOutcomes = new Map();
     this.interruptingTurns = new Set();
     this.closed = false;
+    this.unsafeWorkspaces = new Set();
     this.db.exec(`
       PRAGMA foreign_keys = ON;
       CREATE TABLE IF NOT EXISTS agents (
@@ -55,7 +143,9 @@ export class AgentService {
       CREATE TABLE IF NOT EXISTS turns (
         id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id),
         user_message TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('running','completed','failed','interrupted')),
-        started_at TEXT NOT NULL, finished_at TEXT, pi_session_id TEXT, terminal_detail TEXT
+        started_at TEXT NOT NULL, finished_at TEXT, pi_session_id TEXT, terminal_detail TEXT,
+        worker_pid INTEGER, worker_pgid INTEGER, worker_start_identity TEXT,
+        worker_terminated INTEGER NOT NULL DEFAULT 1 CHECK(worker_terminated IN (0, 1))
       );
       CREATE TABLE IF NOT EXISTS messages (
         id TEXT UNIQUE NOT NULL, agent_id TEXT NOT NULL REFERENCES agents(id), turn_id TEXT REFERENCES turns(id),
@@ -66,13 +156,63 @@ export class AgentService {
       CREATE INDEX IF NOT EXISTS turns_agent_started ON turns(agent_id, started_at);
     `);
     this.ensureTerminalDetailColumn();
+    this.ensureWorkerColumns();
     this.canonicalizeStoredWorkspaces();
+    this.reconcilePriorWorkers();
     this.reconcileUnfinishedTurns();
   }
 
   ensureTerminalDetailColumn() {
     const columns = this.db.prepare("PRAGMA table_info(turns)").all();
     if (!columns.some((column) => column.name === "terminal_detail")) this.db.exec("ALTER TABLE turns ADD COLUMN terminal_detail TEXT");
+  }
+
+  ensureWorkerColumns() {
+    const columns = this.db.prepare("PRAGMA table_info(turns)").all();
+    const names = new Set(columns.map((column) => column.name));
+    if (!names.has("worker_pid")) this.db.exec("ALTER TABLE turns ADD COLUMN worker_pid INTEGER");
+    if (!names.has("worker_pgid")) this.db.exec("ALTER TABLE turns ADD COLUMN worker_pgid INTEGER");
+    if (!names.has("worker_start_identity")) this.db.exec("ALTER TABLE turns ADD COLUMN worker_start_identity TEXT");
+    if (!names.has("worker_terminated")) this.db.exec("ALTER TABLE turns ADD COLUMN worker_terminated INTEGER NOT NULL DEFAULT 0");
+  }
+
+  markWorkerTerminated(turnId) {
+    this.db.prepare("UPDATE turns SET worker_terminated = 1 WHERE id = ?").run(turnId);
+    const turn = this.db.prepare(`
+      SELECT agents.workspace AS workspace
+      FROM turns JOIN agents ON agents.id = turns.agent_id
+      WHERE turns.id = ?
+    `).get(turnId);
+    if (turn) this.unsafeWorkspaces.delete(turn.workspace);
+  }
+
+  reconcilePriorWorkers() {
+    const workers = this.db.prepare(`
+      SELECT turns.id, turns.worker_pid AS workerPid, turns.worker_pgid AS workerPgid,
+             turns.worker_start_identity AS workerStartIdentity, agents.workspace
+      FROM turns JOIN agents ON agents.id = turns.agent_id
+      WHERE turns.worker_terminated = 0
+    `).all();
+    for (const worker of workers) {
+      if (stopPriorWorker(worker)) this.markWorkerTerminated(worker.id);
+      else this.unsafeWorkspaces.add(worker.workspace);
+    }
+  }
+
+  ensureWorkspaceSafe(workspace) {
+    const workers = this.db.prepare(`
+      SELECT turns.id, turns.worker_pid AS workerPid, turns.worker_pgid AS workerPgid,
+             turns.worker_start_identity AS workerStartIdentity
+      FROM turns JOIN agents ON agents.id = turns.agent_id
+      WHERE agents.workspace = ? AND turns.worker_terminated = 0
+    `).all(workspace);
+    for (const worker of workers) {
+      if (stopPriorWorker(worker)) this.markWorkerTerminated(worker.id);
+      else this.unsafeWorkspaces.add(workspace);
+    }
+    if (this.unsafeWorkspaces.has(workspace)) {
+      throw new Error("This workspace remains unavailable while a prior Pi worker may still be running.");
+    }
   }
 
   // Older databases can hold a pre-canonical workspace spelling. Normalize
@@ -102,7 +242,13 @@ export class AgentService {
     // Turns remain running until the next service reconciles them; no work is
     // adopted or replayed by this instance after its database closes.
     this.closed = true;
-    for (const execution of this.executions.values()) execution.close?.();
+    for (const [turnId, execution] of this.executions.entries()) {
+      execution.close?.();
+      // Deterministic in-process fakes do not cross an OS lifetime boundary.
+      // A real Pi child remains unconfirmed until its close is observed or the
+      // next service lifetime proves it gone.
+      if (!workerMetadata(execution)) this.markWorkerTerminated(turnId);
+    }
     this.executions.clear();
     this.promptRequestIds.clear();
     this.assistantOutcomes.clear();
@@ -164,6 +310,7 @@ export class AgentService {
     const agent = this.db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
     if (!agent) throw new Error("agent not found");
     const workspace = canonicalWorkspace(agent.workspace);
+    this.ensureWorkspaceSafe(workspace);
     if (workspace !== agent.workspace) {
       this.db.prepare("UPDATE agents SET workspace = ?, updated_at = ? WHERE id = ?").run(workspace, now(), agentId);
       agent.workspace = workspace;
@@ -194,6 +341,12 @@ export class AgentService {
     });
     this.executions.set(turnId, execution);
     this.promptRequestIds.set(turnId, promptRequestId);
+    const worker = workerMetadata(execution);
+    if (worker) {
+      this.db.prepare("UPDATE turns SET worker_pid = ?, worker_pgid = ?, worker_start_identity = ?, worker_terminated = 0 WHERE id = ? AND status = 'running'").run(worker.pid, worker.processGroupId, worker.startIdentity, turnId);
+    } else {
+      this.markWorkerTerminated(turnId);
+    }
     try { execution.prompt({ id: promptRequestId, message }); } catch (error) { this.finishTurn(agentId, turnId, "failed", error.message); }
     return this.db.prepare("SELECT id, agent_id AS agentId, user_message AS userMessage, status, started_at AS startedAt, finished_at AS finishedAt, pi_session_id AS piSessionId, terminal_detail AS terminalDetail FROM turns WHERE id = ?").get(turnId);
   }
@@ -258,6 +411,7 @@ export class AgentService {
         ? `Pi exited with ${signal}`
         : `Pi exited with code ${code}`;
     const interruptedBeforeSettlement = this.interruptingTurns.has(turnId);
+    this.markWorkerTerminated(turnId);
     this.finishTurn(
       agentId,
       turnId,
