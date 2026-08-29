@@ -149,6 +149,7 @@ function slowPiFactory(control) {
 async function browserState(browser) {
   return browser.evaluate(`({
     status: document.querySelector("#status")?.textContent || "",
+    headerStatus: document.querySelector("#header-status")?.textContent || "",
     draft: document.querySelector("#message")?.value || "",
     messages: [...document.querySelectorAll("#messages .message")].map((element) => ({ id: element.dataset.id, text: element.textContent })),
     selectedAgent: localStorage.getItem("pi-sand-agent"),
@@ -183,7 +184,7 @@ test("supported Desktop process closes and reopens around one active service Tur
       document.querySelector("#send").requestSubmit();
     })()`);
     const turn = await eventually(() => service.getAgent(agent.id).turns[0], "Desktop did not start a Turn");
-    await eventually(async () => (await browserState(firstDesktop)).status === "Pi is working…", "Desktop did not render Working");
+    await eventually(async () => (await browserState(firstDesktop)).headerStatus === "Working", "Desktop did not render Working");
     await eventually(async () => (await browserState(firstDesktop)).messages.some((message) => message.text.includes("Working: Keep this Turn running")), "Desktop did not render streamed output");
 
     // The draft is Desktop-owned presentation state, independent from the active Turn.
@@ -205,7 +206,7 @@ test("supported Desktop process closes and reopens around one active service Tur
     reopenedDesktop = await launchChromium(base, profile);
     await eventually(async () => {
       const state = await browserState(reopenedDesktop);
-      return state.status === "Pi is working…" && state.selectedAgent === agent.id && state.draft === "Unsent draft survives Desktop restart";
+      return state.headerStatus === "Working" && state.selectedAgent === agent.id && state.draft === "Unsent draft survives Desktop restart";
     }, "reopened Desktop did not restore active state, selection, and draft");
     const duringReopen = await browserState(reopenedDesktop);
     assert.equal(duringReopen.messages.filter((message) => message.text.includes("Working: Keep this Turn running")).length, 1);

@@ -162,7 +162,7 @@ test("Actual Chromium Desktop sends a request, streams, settles, and disables a 
   await eventually(() => desktop.evaluate("Boolean(document.querySelector('#message')?.value === '')"), "Desktop composer did not load");
   await desktop.evaluate(`(() => { const input = document.querySelector('#message'); input.value = 'Fix the failing tests'; input.dispatchEvent(new Event('input', { bubbles: true })); document.querySelector('#send').requestSubmit(); })()`);
   await eventually(() => controls.length === 1, "Desktop did not submit a Turn");
-  await eventually(() => desktop.evaluate("document.querySelector('#status')?.textContent === 'Pi is working…'"), "Desktop did not show Working");
+  await eventually(() => desktop.evaluate("document.querySelector('#header-status')?.textContent === 'Working'"), "Desktop did not show Working in the conversation header");
   assert.equal(await desktop.evaluate("document.querySelector('#send-submit')?.disabled"), true);
   assert.equal(service.getAgent(service.listAgents()[0].id).turns.length, 1);
 

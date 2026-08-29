@@ -70,6 +70,37 @@ test("failed pre-commit submission leaves staged bytes live, while released orph
   }, withAttachmentPi([]));
 });
 
+test("service startup runs bounded orphan cleanup without deleting live draft or committed attachments", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-sand-attachment-maintenance-"));
+  const dbPath = join(directory, "state.sqlite");
+  const first = new AgentService({ dbPath, piFactory: withAttachmentPi([]) });
+  let second;
+  try {
+    const agent = first.createAgent({ workspace: "/tmp" });
+    const released = first.stageAttachment(agent.agent.id, { filename: "released.txt", bytes: Buffer.from("released") });
+    const staged = first.stageAttachment(agent.agent.id, { filename: "draft.txt", bytes: Buffer.from("draft") });
+    const committed = first.stageAttachment(agent.agent.id, { filename: "committed.txt", bytes: Buffer.from("committed") });
+    first.releaseAttachment(agent.agent.id, released.id);
+    first.sendMessage(agent.agent.id, "Commit the attachment", { attachments: [committed.id] });
+    const old = new Date(0).toISOString();
+    first.db.prepare("UPDATE attachments SET updated_at = ?").run(old);
+    const paths = first.db.prepare("SELECT id, storage_path AS path FROM attachments").all();
+    first.close();
+
+    second = new AgentService({ dbPath, piFactory: withAttachmentPi([]) });
+    assert.equal(second.attachmentSnapshot(released.id), null, "released orphan should be cleaned on service startup");
+    assert.equal(existsSync(paths.find((row) => row.id === released.id).path), false);
+    assert.equal(second.attachmentSnapshot(staged.id).state, "staged", "a persisted draft attachment is live");
+    assert.equal(second.attachmentSnapshot(committed.id).state, "committed", "a sent attachment is durable");
+    assert.equal(existsSync(paths.find((row) => row.id === staged.id).path), true);
+    assert.equal(existsSync(paths.find((row) => row.id === committed.id).path), true);
+  } finally {
+    second?.close();
+    first.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("the Desktop upload and send endpoints stage bytes and reject arbitrary origins", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-sand-attachment-http-"));
   const service = new AgentService({ dbPath: join(directory, "state.sqlite"), piFactory: withAttachmentPi([]) });

@@ -5,8 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { acquireDatabaseLock } from "./database-lock.js";
-import { processIsAlive } from "./process.js";
-import { spawnPi } from "./pi.js";
+import { checkPiCompatibility, PI_LIFECYCLE_ERROR, spawnPi } from "./pi.js";
 
 const TERMINAL = new Set(["completed", "failed", "interrupted"]);
 const WORKER_STOP_TIMEOUT_MS = 2_000;
@@ -35,6 +34,17 @@ function requireProcStat(pid) {
   return readFileSync(`/proc/${pid}/stat`, "utf8");
 }
 
+function processGroupIdentity(pid) {
+  try {
+    const stat = requireProcStat(pid);
+    const closingParen = stat.lastIndexOf(")");
+    if (closingParen < 0) return null;
+    return Number(stat.slice(closingParen + 2).trim().split(/\s+/)[2]) || null;
+  } catch {
+    return null;
+  }
+}
+
 function workerMetadata(execution) {
   const pid = Number(execution?.pid);
   if (!Number.isInteger(pid) || pid <= 0) return null;
@@ -54,20 +64,27 @@ function processGroupIsAlive(processGroupId) {
 }
 
 function workerIsGone(worker) {
-  const groupAlive = processGroupIsAlive(worker.workerPgid);
-  if (!processIsAlive(worker.workerPid)) return !groupAlive;
-  const currentIdentity = processStartIdentity(worker.workerPid);
-  if (worker.workerStartIdentity && currentIdentity && currentIdentity !== worker.workerStartIdentity) return !groupAlive;
-  return false;
+  // A dead leader is not enough: a descendant can remain in the detached
+  // execution group and continue mutating the workspace.
+  return !processGroupIsAlive(worker.workerPgid);
+}
+
+function workerOwnershipIsProven(worker) {
+  // Without the recorded /proc start identity, a PID/PGID may have been
+  // reused. Failing closed is safer than signalling an unrelated process.
+  if (!worker.workerStartIdentity) return false;
+  return processStartIdentity(worker.workerPid) === worker.workerStartIdentity
+    && processGroupIdentity(worker.workerPid) === worker.workerPgid;
 }
 
 function signalWorker(worker, signal) {
+  if (!workerOwnershipIsProven(worker)) return false;
   try {
     process.kill(-worker.workerPgid, signal);
   } catch (error) {
     if (error.code === "ESRCH") return true;
     if (error.code === "EPERM") return false;
-    try { process.kill(worker.workerPid, signal); } catch (fallbackError) { return fallbackError.code === "ESRCH"; }
+    return false;
   }
   return true;
 }
@@ -75,6 +92,9 @@ function signalWorker(worker, signal) {
 function stopPriorWorker(worker) {
   if (!Number.isInteger(worker.workerPid) || !Number.isInteger(worker.workerPgid)) return false;
   if (workerIsGone(worker)) return true;
+  // In particular, never kill the recorded process group after the leader PID
+  // has been reused or the leader identity can no longer be verified.
+  if (!workerOwnershipIsProven(worker)) return false;
   if (!signalWorker(worker, "SIGTERM")) return false;
   const deadline = Date.now() + WORKER_STOP_TIMEOUT_MS;
   while (Date.now() < deadline) {
@@ -120,6 +140,7 @@ export class AgentService {
       throw new Error(`The Local Agent Service could not open its database: ${error.message}`, { cause: error });
     }
     this.piFactory = piFactory;
+    this.piCompatibilityChecked = false;
     this.attachmentDirectory = dbPath === ":memory:"
       ? join(tmpdir(), `pi-sand-attachments-${randomUUID()}`)
       : `${resolve(dbPath)}.attachments`;
@@ -180,6 +201,7 @@ export class AgentService {
     `);
     this.ensureTerminalDetailColumn();
     this.ensureWorkerColumns();
+    this.cleanupOrphanedAttachments();
     this.canonicalizeStoredWorkspaces();
     this.reconcilePriorWorkers();
     this.reconcileUnfinishedTurns();
@@ -193,10 +215,37 @@ export class AgentService {
   ensureWorkerColumns() {
     const columns = this.db.prepare("PRAGMA table_info(turns)").all();
     const names = new Set(columns.map((column) => column.name));
-    if (!names.has("worker_pid")) this.db.exec("ALTER TABLE turns ADD COLUMN worker_pid INTEGER");
-    if (!names.has("worker_pgid")) this.db.exec("ALTER TABLE turns ADD COLUMN worker_pgid INTEGER");
-    if (!names.has("worker_start_identity")) this.db.exec("ALTER TABLE turns ADD COLUMN worker_start_identity TEXT");
-    if (!names.has("worker_terminated")) this.db.exec("ALTER TABLE turns ADD COLUMN worker_terminated INTEGER NOT NULL DEFAULT 0");
+    const preV01 = !names.has("worker_pid")
+      && !names.has("worker_pgid")
+      && !names.has("worker_start_identity")
+      && !names.has("worker_terminated");
+    const addedWorkerTerminated = !names.has("worker_terminated");
+    const needsMigration = !names.has("worker_pid") || !names.has("worker_pgid") || !names.has("worker_start_identity") || addedWorkerTerminated;
+    if (!needsMigration) return;
+
+    // Keep DDL and the safety-state rewrite atomic. A crash after adding the
+    // column but before classifying old running rows must not expose a durable
+    // worker_terminated=1 default for work whose worker is unknown.
+    this.db.exec("BEGIN");
+    try {
+      if (!names.has("worker_pid")) this.db.exec("ALTER TABLE turns ADD COLUMN worker_pid INTEGER");
+      if (!names.has("worker_pgid")) this.db.exec("ALTER TABLE turns ADD COLUMN worker_pgid INTEGER");
+      if (!names.has("worker_start_identity")) this.db.exec("ALTER TABLE turns ADD COLUMN worker_start_identity TEXT");
+      if (addedWorkerTerminated) this.db.exec("ALTER TABLE turns ADD COLUMN worker_terminated INTEGER NOT NULL DEFAULT 1");
+
+      // A row whose worker_terminated column did not exist cannot prove that a
+      // running worker is absent. Keep those rows unsafe even when a partially
+      // upgraded database already has one of the identity columns.
+      if (addedWorkerTerminated) this.db.exec("UPDATE turns SET worker_terminated = 0 WHERE status = 'running'");
+      // A pre-v0.1 row has no worker identity at all. Historical terminal rows
+      // are safe product history; historical running rows remain unsafe so
+      // restart reconciliation cannot silently assume their worker is dead.
+      if (preV01) this.db.exec("UPDATE turns SET worker_terminated = 1 WHERE status IN ('completed', 'failed', 'interrupted')");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch { /* Preserve the migration failure. */ }
+      throw error;
+    }
   }
 
   markWorkerTerminated(turnId) {
@@ -206,7 +255,14 @@ export class AgentService {
       FROM turns JOIN agents ON agents.id = turns.agent_id
       WHERE turns.id = ?
     `).get(turnId);
-    if (turn) this.unsafeWorkspaces.delete(turn.workspace);
+    if (!turn) return;
+    const remaining = this.db.prepare(`
+      SELECT 1 FROM turns
+      JOIN agents ON agents.id = turns.agent_id
+      WHERE agents.workspace = ? AND turns.worker_terminated = 0
+      LIMIT 1
+    `).get(turn.workspace);
+    if (!remaining) this.unsafeWorkspaces.delete(turn.workspace);
   }
 
   reconcilePriorWorkers() {
@@ -288,6 +344,13 @@ export class AgentService {
     this.databaseLock = null;
   }
 
+  ensurePiCompatibility(cwd) {
+    if (this.piFactory !== spawnPi || this.piCompatibilityChecked) return;
+    const result = checkPiCompatibility({ cwd });
+    if (!result.compatible) throw new Error(PI_LIFECYCLE_ERROR);
+    this.piCompatibilityChecked = true;
+  }
+
   createAgent({ name = "Agent", workspace }) {
     const canonicalWorkspacePath = canonicalWorkspace(workspace);
     const id = randomUUID(); const timestamp = now();
@@ -364,9 +427,17 @@ export class AgentService {
     return this.attachmentSnapshot(attachmentId);
   }
 
-  cleanupOrphanedAttachments({ olderThanMs = 24 * 60 * 60 * 1000 } = {}) {
+  cleanupOrphanedAttachments({ olderThanMs = 24 * 60 * 60 * 1000, maxItems = 100 } = {}) {
     const cutoff = Date.now() - Math.max(0, Number(olderThanMs) || 0);
-    const rows = this.db.prepare("SELECT id, storage_path AS storagePath, updated_at AS updatedAt FROM attachments WHERE state = 'released'").all();
+    const limit = Math.max(0, Math.floor(Number(maxItems) || 0));
+    if (!limit) return 0;
+    const rows = this.db.prepare(`
+      SELECT id, storage_path AS storagePath, updated_at AS updatedAt
+      FROM attachments
+      WHERE state = 'released'
+      ORDER BY updated_at, id
+      LIMIT ?
+    `).all(limit);
     let removed = 0;
     for (const row of rows) {
       if (Date.parse(row.updatedAt) > cutoff) continue;
@@ -450,10 +521,13 @@ export class AgentService {
     `).get(workspace);
     if (activeForWorkspace) throw new Error("This workspace already has a running Turn.");
     if (typeof message !== "string" || !message.trim()) throw new Error("message is required");
+    this.ensurePiCompatibility(agent.workspace);
     const turnId = randomUUID(); const timestamp = now(); const messageId = randomUUID();
     this.db.exec("BEGIN");
     try {
-      this.db.prepare("INSERT INTO turns (id, agent_id, user_message, status, started_at) VALUES (?, ?, ?, 'running', ?)").run(turnId, agentId, message, timestamp);
+      // A running Turn is unsafe until the worker identity is durably recorded
+      // (or the injected execution proves that no OS worker exists).
+      this.db.prepare("INSERT INTO turns (id, agent_id, user_message, status, started_at, worker_terminated) VALUES (?, ?, ?, 'running', ?, 0)").run(turnId, agentId, message, timestamp);
       this.db.prepare("INSERT INTO messages (id, agent_id, turn_id, role, content, created_at, updated_at) VALUES (?, ?, ?, 'user', ?, ?, ?)").run(messageId, agentId, turnId, message, timestamp, timestamp);
       for (const [position, attachment] of attachments.entries()) {
         this.db.prepare("INSERT INTO message_attachments (message_id, attachment_id, position) VALUES (?, ?, ?)").run(messageId, attachment.id, position);
@@ -466,32 +540,41 @@ export class AgentService {
     const promptRequestId = `prompt-${randomUUID()}`;
     let execution = this.agentSessions.get(agentId);
     if (!execution) {
-      execution = this.piFactory({
-        cwd: agent.workspace,
-        // One long-lived RPC process is Pi's native conversation context for
-        // this Agent. Route every event to the currently active product Turn;
-        // durable transcript content is never sent back to Pi by pi-sand.
-        onEvent: (event) => {
-          const activeTurnId = this.activeTurns.get(agentId);
-          if (activeTurnId) this.handlePiEvent(agentId, activeTurnId, event);
-        },
-        onClose: (result) => this.handlePiClose(agentId, this.activeTurns.get(agentId), result),
-      });
+      try {
+        execution = this.piFactory({
+          cwd: agent.workspace,
+          // One long-lived RPC process is Pi's native conversation context for
+          // this Agent. Route every event to the currently active product Turn;
+          // durable transcript content is never sent back to Pi by pi-sand.
+          onEvent: (event) => {
+            const activeTurnId = this.activeTurns.get(agentId);
+            if (activeTurnId) this.handlePiEvent(agentId, activeTurnId, event);
+          },
+          onClose: (result) => this.handlePiClose(agentId, this.activeTurns.get(agentId), result),
+        });
+      } catch (error) {
+        this.finishTurn(agentId, turnId, "failed", piStartupDetail(error));
+        return this.db.prepare("SELECT id, agent_id AS agentId, user_message AS userMessage, status, started_at AS startedAt, finished_at AS finishedAt, pi_session_id AS piSessionId, terminal_detail AS terminalDetail FROM turns WHERE id = ?").get(turnId);
+      }
       this.agentSessions.set(agentId, execution);
     }
     this.turnExecutions.set(turnId, execution);
     this.activeTurns.set(agentId, turnId);
     this.promptRequestIds.set(turnId, promptRequestId);
     const worker = workerMetadata(execution);
-    if (worker) {
-      this.db.prepare("UPDATE turns SET worker_pid = ?, worker_pgid = ?, worker_start_identity = ?, worker_terminated = 0 WHERE id = ? AND status = 'running'").run(worker.pid, worker.processGroupId, worker.startIdentity, turnId);
-    } else {
-      this.markWorkerTerminated(turnId);
-    }
     try {
+      if (worker) {
+        // Keep worker_terminated = 0 while recording metadata. A crash before
+        // this write leaves an intentionally unidentifiable, unavailable
+        // workspace rather than a falsely released one.
+        this.db.prepare("UPDATE turns SET worker_pid = ?, worker_pgid = ?, worker_start_identity = ?, worker_terminated = 0 WHERE id = ? AND status = 'running'").run(worker.pid, worker.processGroupId, worker.startIdentity, turnId);
+      } else {
+        // Deterministic fakes without an OS PID have no orphan to fence.
+        this.markWorkerTerminated(turnId);
+      }
       execution.prompt({ id: promptRequestId, message: promptWithAttachments(message, attachments) });
     } catch (error) {
-      this.finishTurn(agentId, turnId, "failed", error.message);
+      this.finishTurn(agentId, turnId, "failed", piStartupDetail(error));
     }
     return this.db.prepare("SELECT id, agent_id AS agentId, user_message AS userMessage, status, started_at AS startedAt, finished_at AS finishedAt, pi_session_id AS piSessionId, terminal_detail AS terminalDetail FROM turns WHERE id = ?").get(turnId);
   }
@@ -540,22 +623,38 @@ export class AgentService {
       this.finishTurn(
         agentId,
         turnId,
-        interrupted ? "interrupted" : failed ? "failed" : "completed",
-        interrupted ? "The Turn was interrupted by the user." : failed ? assistantErrorDetail(outcome) : assistant?.content || "",
+        failed ? "failed" : interrupted ? "interrupted" : "completed",
+        failed ? assistantErrorDetail(outcome) : interrupted ? "The Turn was interrupted by the user." : assistant?.content || "",
       );
+    }
+  }
+
+  reconcileAgentWorkers(agentId) {
+    const workers = this.db.prepare(`
+      SELECT turns.id, turns.worker_pid AS workerPid, turns.worker_pgid AS workerPgid,
+             turns.worker_start_identity AS workerStartIdentity, agents.workspace
+      FROM turns JOIN agents ON agents.id = turns.agent_id
+      WHERE turns.agent_id = ? AND turns.worker_terminated = 0
+    `).all(agentId);
+    for (const worker of workers) {
+      if (stopPriorWorker(worker)) this.markWorkerTerminated(worker.id);
+      else this.unsafeWorkspaces.add(worker.workspace);
     }
   }
 
   handlePiClose(agentId, turnId, { code = null, signal = null, error } = {}) {
     if (this.closed) return;
     // A session can close while idle between Turns. There is no product Turn
-    // to fail in that case; the next request will establish a new Pi context.
-    if (!turnId) {
-      this.agentSessions.delete(agentId);
-      return;
-    }
-    const turn = this.db.prepare("SELECT status FROM turns WHERE id = ?").get(turnId);
-    if (turn?.status !== "running") {
+    // to fail in that case, but every recorded execution group still has to be
+    // proven gone before its workspace can become safe.
+    const turn = turnId ? this.db.prepare(`
+      SELECT turns.id, turns.status, turns.worker_pid AS workerPid, turns.worker_pgid AS workerPgid,
+             turns.worker_start_identity AS workerStartIdentity, turns.worker_terminated AS workerTerminated, agents.workspace
+      FROM turns JOIN agents ON agents.id = turns.agent_id
+      WHERE turns.id = ?
+    `).get(turnId) : null;
+    if (!turn || turn.status !== "running") {
+      this.reconcileAgentWorkers(agentId);
       this.agentSessions.delete(agentId);
       return;
     }
@@ -565,8 +664,14 @@ export class AgentService {
         ? `Pi exited with ${signal}`
         : `Pi exited with code ${code}`;
     const interruptedBeforeSettlement = this.interruptingTurns.has(turnId);
+    if (turn.workerTerminated === 1 || (!Number.isInteger(turn.workerPid) && !Number.isInteger(turn.workerPgid))) {
+      this.markWorkerTerminated(turnId);
+    } else if (stopPriorWorker(turn)) {
+      this.markWorkerTerminated(turnId);
+    } else {
+      this.unsafeWorkspaces.add(turn.workspace);
+    }
     this.agentSessions.delete(agentId);
-    this.markWorkerTerminated(turnId);
     this.finishTurn(
       agentId,
       turnId,

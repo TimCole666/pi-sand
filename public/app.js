@@ -265,11 +265,17 @@ export function mountDesktop({
     $("#setup").hidden = false;
     $("#conversation").hidden = false;
     $("#agent-meta").textContent = `${agent.name} · ${agent.workspace}`;
+    const working = snapshot.state === "active";
+    const headerStatus = $("#header-status");
+    if (headerStatus) {
+      headerStatus.textContent = working ? "Working" : "";
+      headerStatus.className = working ? "working" : "";
+    }
     $("#messages").innerHTML = snapshot.messages.map((message) =>
       `<div class="message ${escapeHtml(message.role)}" data-id="${escapeHtml(message.id)}">${escapeHtml(message.content)}${(message.attachments ?? []).map((attachment) => `<span class="message-attachment">📎 ${escapeHtml(attachment.filename)}</span>`).join("")}</div>`
     ).join("");
-    $("#status").textContent = snapshot.state === "active" ? "Pi is working…" : terminalStatus(snapshot);
-    $("#status").className = snapshot.state === "active" ? "running" : snapshot.turns.at(-1)?.status === "failed" ? "error" : "";
+    $("#status").textContent = working ? "" : terminalStatus(snapshot);
+    $("#status").className = snapshot.turns.at(-1)?.status === "failed" ? "error" : "";
     $("#interrupt").hidden = !snapshot.activeTurnId;
     updateComposerState(Boolean(snapshot.activeTurnId));
     renderAttachments();
@@ -297,17 +303,19 @@ export function mountDesktop({
   }
 
   const create = $("#create");
+  if (create) create.hidden = true;
   create.onsubmit = async (event) => {
     event.preventDefault();
     try {
       const data = await request("/api/agents", { method: "POST", body: JSON.stringify(Object.fromEntries(new FormDataImpl(event.target))) });
       await refreshAgents();
       await openAgent(data.agent.id);
+      create.hidden = true;
     } catch (error) { alertImpl(error.message); }
   };
 
   $("#new-chat")?.addEventListener("click", () => {
-    $("#create")?.classList.remove("hidden");
+    create.hidden = false;
     $("#name")?.focus();
   });
   $("#agents").onchange = (event) => event.target.value && openAgent(event.target.value).catch((error) => alertImpl(error.message));

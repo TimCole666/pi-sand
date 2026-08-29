@@ -1,4 +1,25 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+
+export const SUPPORTED_PI_VERSION = "0.84.2";
+export const PI_LIFECYCLE_ERROR = "Pi is unavailable or incompatible with the required lifecycle contract.";
+
+/**
+ * The production adapter is intentionally pinned to the Pi release whose RPC
+ * prompt/abort/agent_settled contract was probed in the v0.1 spike. This is a
+ * narrow product preflight, not a provider/runtime compatibility layer.
+ */
+export function checkPiCompatibility({ command = process.env.PI_BIN ?? "pi", cwd } = {}) {
+  let result;
+  try {
+    result = spawnSync(command, ["--version"], { cwd, encoding: "utf8" });
+  } catch (error) {
+    return { compatible: false, version: null, error };
+  }
+  if (result.error || result.status !== 0) return { compatible: false, version: null, error: result.error };
+  const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+  const version = output.match(/\b\d+\.\d+\.\d+\b/)?.[0] ?? null;
+  return { compatible: version === SUPPORTED_PI_VERSION, version, error: null };
+}
 
 // The product invokes Pi with the user's normal installed tools, extensions, and skills.
 // The isolated spike keeps its restrictive flags because it intentionally probes a

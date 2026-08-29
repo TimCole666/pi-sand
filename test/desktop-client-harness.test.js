@@ -37,7 +37,7 @@ class Element {
 }
 
 function desktop({ base, storage = new Map() }) {
-  const elements = Object.fromEntries(["setup", "conversation", "agent-meta", "messages", "status", "interrupt", "agents", "agent-list", "empty-state", "connection", "retry", "new-chat", "name", "workspace", "message", "create", "send"].map((id) => [id, new Element()]));
+  const elements = Object.fromEntries(["setup", "conversation", "agent-meta", "header-status", "messages", "status", "interrupt", "agents", "agent-list", "empty-state", "connection", "retry", "new-chat", "name", "workspace", "message", "create", "send"].map((id) => [id, new Element()]));
   elements.agents.isSelect = true;
   elements.create.values = { name: "Agent", workspace: "" };
   elements.send.message = new Element();
@@ -106,6 +106,14 @@ async function createAndSend(view, directory, message = "Fix the failing tests")
   return view.storage.get("pi-sand-agent");
 }
 
+test("New chat reveals the durable Agent creation form", async () => withDesktop(async ({ base }) => {
+  const view = desktop({ base });
+  await view.client.ready;
+  assert.equal(view.elements.create.hidden, true);
+  view.elements["new-chat"].dispatchEvent({ type: "click" });
+  assert.equal(view.elements.create.hidden, false);
+}));
+
 test("Desktop client harness creates, opens, sends, streams, and renders a completed Turn", async () => withDesktop(async ({ service, base, directory }) => {
   const view = desktop({ base });
   const agentId = await createAndSend(view, directory);
@@ -136,13 +144,15 @@ test("Desktop client harness reconnects to the same active Turn and one result",
   const agentId = await createAndSend(first, directory, "Keep working");
   first.sources[0].deliver(service.getAgent(agentId));
   assert.match(first.elements.messages.innerHTML, /Working: Keep working/);
-  assert.equal(first.elements.status.textContent, "Pi is working…");
+  assert.equal(first.elements["header-status"].textContent, "Working");
+  assert.equal(first.elements.status.textContent, "");
   first.sources[0].close();
   assert.equal(service.getAgent(agentId).state, "active");
   const reopened = desktop({ base, storage });
   await reopened.client.ready;
   await eventually(() => reopened.sources.length === 1, "reopened Desktop did not load active Agent");
-  assert.equal(reopened.elements.status.textContent, "Pi is working…");
+  assert.equal(reopened.elements["header-status"].textContent, "Working");
+  assert.equal(reopened.elements.status.textContent, "");
   service.turnExecutions.get(service.getAgent(agentId).activeTurnId).release();
   reopened.sources[0].deliver(service.getAgent(agentId));
   assert.equal(reopened.elements.status.textContent, "Turn completed.");

@@ -18,7 +18,7 @@ The supported Linux entry point starts or connects to the loopback-only Local Ag
 
 `npm start` remains a developer-oriented service-only entry point; it is not the normal product experience. The service binds only to `127.0.0.1`, protects mutation requests from unrelated browser origins, and allows only one Local Agent Service process to own a database at a time.
 
-By default the SQLite database is stored at `${XDG_DATA_HOME:-~/.local/share}/pi-sand/pi-sand.sqlite`. Set `PI_SAND_DB` to choose another database, `PORT` to choose the fixed local endpoint, or `PI_BIN` to choose the Pi executable. The service creates its database and parent directory on first start.
+By default the SQLite database is stored at `${XDG_DATA_HOME:-~/.local/share}/pi-sand/pi-sand.sqlite`. Set `PI_SAND_DB` to choose another database, `PORT` to choose the fixed local endpoint, or `PI_BIN` to choose the Pi executable. The v0.1 production adapter supports Pi `0.84.2` exactly and preflights `PI_BIN --version` before the first Turn; an unavailable or incompatible Pi is reported as a product-level error. The service creates its database and parent directory on first start.
 
 Create an Agent with a workspace directory, then submit ordinary natural-language requests. Workspace input accepts absolute paths and `~`/`~/...`; other relative paths are rejected. Accepted paths are verified directories, realpathed, and persisted as one canonical workspace identity, so symlink aliases share the same execution exclusion.
 

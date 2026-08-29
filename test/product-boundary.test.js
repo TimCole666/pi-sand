@@ -140,6 +140,22 @@ test("launchProduct bootstraps a detached service on the fixed loopback endpoint
   await rm(directory, { recursive: true, force: true });
 });
 
+test("failed service bootstrap still opens the Desktop for product-level Retry", async () => {
+  const calls = [];
+  const child = { pid: 4321, exitCode: null, unref() {} };
+  await assert.rejects(
+    launchProduct({
+      port: 4318,
+      fetchImpl: async () => { throw new Error("connection refused"); },
+      spawnImpl: () => child,
+      openDesktopImpl: (url) => calls.push(url),
+      timeoutMs: 10,
+    }),
+    /could not be reached during product launch/,
+  );
+  assert.deepEqual(calls, ["http://127.0.0.1:4318"], "the Desktop must open even when bootstrap cannot establish the service");
+});
+
 test("cold launch starts a real detached Local Agent Service without manual port selection", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-sand-cold-launch-"));
   const probeServer = createServer();

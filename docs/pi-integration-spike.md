@@ -26,6 +26,10 @@ The probe uses these safety/reproducibility flags:
 
 The observations below were made with Pi `0.84.2`, Node `v26.7.0`, on Linux (`x86_64`). The exact model/provider is environment configuration and is not a product contract.
 
+### Production compatibility gate
+
+The v0.1 production adapter supports Pi **0.84.2 exactly**, the pinned release used for the RPC/lifecycle observations below. Before the first production Turn, the Local Agent Service runs `PI_BIN --version` and rejects an unavailable, unparsable, or different Pi version with the product-level error `Pi is unavailable or incompatible with the required lifecycle contract.` This narrow version gate prevents a CLI with different RPC or `agent_settled` behavior from leaving a Turn running indefinitely; it is not a generic provider/runtime compatibility abstraction.
+
 ### Start, stream, and completion (`--mode json`)
 
 - Pi writes one JSON object per line to stdout. `stderr` was empty for successful runs.

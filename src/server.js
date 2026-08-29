@@ -109,7 +109,7 @@ function controlPlaneDenied(res) {
  * The semantic local Desktop boundary. Tests inject a deterministic service;
  * the executable entrypoint below constructs the production service.
  */
-export function createAgentServer(service) {
+export function createAgentServer(service, { getService = () => service } = {}) {
   return createServer(async (req, res) => {
     try {
       const url = new URL(req.url, "http://localhost");
@@ -124,29 +124,33 @@ export function createAgentServer(service) {
       }
       if (parts[0] !== "api") return json(res, 404, { error: "not found" });
       if (isProtectedMutation(req) && !isAllowedLocalOrigin(req)) return controlPlaneDenied(res);
-      if (req.method === "GET" && parts.length === 2 && parts[1] === "health") return json(res, 200, { status: "ok" });
-      if (req.method === "GET" && parts.length === 2 && parts[1] === "agents") return json(res, 200, service.listAgents());
-      if (req.method === "POST" && parts.length === 2 && parts[1] === "agents") return json(res, 201, service.createAgent(await body(req)));
+      const currentService = getService();
+      if (req.method === "GET" && parts.length === 2 && parts[1] === "health") {
+        return currentService ? json(res, 200, { status: "ok" }) : json(res, 503, { status: "error", error: "The Local Agent Service is unavailable. Retry when it is available." });
+      }
+      if (!currentService) return json(res, 503, { error: "The Local Agent Service is unavailable. Retry when it is available." });
+      if (req.method === "GET" && parts.length === 2 && parts[1] === "agents") return json(res, 200, currentService.listAgents());
+      if (req.method === "POST" && parts.length === 2 && parts[1] === "agents") return json(res, 201, currentService.createAgent(await body(req)));
       if (parts[1] !== "agents" || !parts[2]) return json(res, 404, { error: "not found" });
       const agentId = parts[2];
       if (req.method === "GET" && parts.length === 3) {
-        const snapshot = service.getAgent(agentId);
+        const snapshot = currentService.getAgent(agentId);
         return snapshot ? json(res, 200, snapshot) : json(res, 404, { error: "agent not found" });
       }
       if (req.method === "GET" && parts[3] === "attachments" && parts.length === 4) {
-        return json(res, 200, service.listAttachments(agentId));
+        return json(res, 200, currentService.listAttachments(agentId));
       }
       if (req.method === "POST" && parts[3] === "attachments" && parts.length === 4) {
-        return json(res, 201, { attachment: service.stageAttachment(agentId, await attachmentBody(req)) });
+        return json(res, 201, { attachment: currentService.stageAttachment(agentId, await attachmentBody(req)) });
       }
       if (req.method === "DELETE" && parts[3] === "attachments" && parts.length === 5) {
-        return json(res, 200, { attachment: service.releaseAttachment(agentId, parts[4]) });
+        return json(res, 200, { attachment: currentService.releaseAttachment(agentId, parts[4]) });
       }
       if (req.method === "POST" && parts[3] === "turns" && parts.length === 4) {
         const request = await body(req);
-        return json(res, 201, service.sendMessage(agentId, request.message, { attachments: request.attachments }));
+        return json(res, 201, currentService.sendMessage(agentId, request.message, { attachments: request.attachments }));
       }
-      if (req.method === "POST" && parts[3] === "interrupt" && parts.length === 4) return json(res, 200, service.interrupt(agentId, (await body(req)).turnId));
+      if (req.method === "POST" && parts[3] === "interrupt" && parts.length === 4) return json(res, 200, currentService.interrupt(agentId, (await body(req)).turnId));
       if (req.method === "GET" && parts[3] === "events" && parts.length === 4) {
         res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
         // Subscribe before taking the snapshot so a turn update cannot land in
@@ -158,8 +162,8 @@ export function createAgentServer(service) {
             res.write(`data: ${JSON.stringify(event)}\n\n`);
           }
         };
-        const unsubscribe = service.subscribe(agentId, send);
-        send({ type: "snapshot", snapshot: service.getAgent(agentId) });
+        const unsubscribe = currentService.subscribe(agentId, send);
+        send({ type: "snapshot", snapshot: currentService.getAgent(agentId) });
         req.on("close", () => unsubscribe());
         return;
       }
@@ -172,16 +176,41 @@ export function createAgentServer(service) {
 
 export function startServer({
   port = Number(process.env.PORT ?? 4317),
-  service = new AgentService(),
+  service,
 } = {}) {
-  const server = createAgentServer(service);
+  let runningService = service;
+  let startupError = null;
+  const getService = () => {
+    if (runningService) return runningService;
+    try {
+      runningService = new AgentService();
+      startupError = null;
+    } catch (error) {
+      startupError = error;
+    }
+    return runningService;
+  };
+  const server = createAgentServer(runningService, { getService });
   server.listen(port, LOCAL_HOST, () => {
     const address = server.address();
     const actualPort = typeof address === "object" && address ? address.port : port;
-    console.log(`pi-sand listening on http://${LOCAL_HOST}:${actualPort}`);
+    const suffix = startupError ? " (Local Agent Service unavailable; Desktop Retry is available)" : "";
+    console.log(`pi-sand listening on http://${LOCAL_HOST}:${actualPort}${suffix}`);
   });
-  return { server, service };
+  return {
+    server,
+    get service() { return runningService; },
+    get startupError() { return startupError; },
+  };
 }
 
 const invokedPath = process.argv[1] && resolve(process.argv[1]);
-if (invokedPath === fileURLToPath(import.meta.url)) startServer();
+if (invokedPath === fileURLToPath(import.meta.url)) {
+  const runtime = startServer();
+  const shutdown = () => {
+    runtime.service?.close();
+    runtime.server.close(() => process.exit(0));
+  };
+  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", shutdown);
+}

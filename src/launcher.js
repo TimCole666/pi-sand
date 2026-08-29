@@ -65,12 +65,21 @@ export async function launchProduct({
   } catch {
     const environment = { ...process.env, PORT: String(port) };
     if (dbPath) environment.PI_SAND_DB = dbPath;
-    serviceProcess = spawnImpl(process.execPath, [serverPath], { detached: true, stdio: "ignore", env: environment });
-    serviceProcess.unref?.();
-    started = true;
+    try {
+      serviceProcess = spawnImpl(process.execPath, [serverPath], { detached: true, stdio: "ignore", env: environment });
+      serviceProcess.unref?.();
+      started = true;
+    } catch (error) {
+      // The Desktop is the product surface for bootstrap failures too. Open it
+      // before surfacing the launcher error so it can render Connecting/Error
+      // and Retry instead of leaving the user with only launcher stderr.
+      if (openBrowser) openDesktopImpl(baseUrl);
+      throw error;
+    }
+    if (openBrowser) openDesktopImpl(baseUrl);
     await waitForService({ baseUrl, fetchImpl, child: serviceProcess, timeoutMs });
   }
-  if (openBrowser) openDesktopImpl(baseUrl);
+  if (!started && openBrowser) openDesktopImpl(baseUrl);
   return { url: baseUrl, started, pid: serviceProcess?.pid ?? null };
 }
 

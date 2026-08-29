@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { chmod, mkdir, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { AgentService, defaultDatabasePath } from "../src/service.js";
 
 function fakePi({ onEvent, onClose }) {
@@ -217,6 +219,54 @@ test("an unavailable Pi executable becomes an understandable product failure", a
     assert.equal(snapshot.turns[0].terminalDetail, "Pi is unavailable or incompatible with the required lifecycle contract.");
     assert.doesNotMatch(snapshot.turns[0].terminalDetail, /spawn pi|ENOENT/);
   }, piFactory);
+});
+
+test("Stop plus a settled assistant error is failed and keeps the partial transcript", async () => {
+  const piFactory = ({ onEvent }) => ({
+    prompt() {
+      onEvent({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Partial answer" } });
+    },
+    abort() {
+      onEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Partial answer" }], stopReason: "error", errorMessage: "upstream timeout" } });
+      onEvent({ type: "agent_settled" });
+    },
+    close() {},
+  });
+  await withService(async (service) => {
+    const agent = service.createAgent({ workspace: "/tmp" });
+    const turn = service.sendMessage(agent.agent.id, "Stop while the provider is failing");
+    service.interrupt(agent.agent.id, turn.id);
+    const snapshot = service.getAgent(agent.agent.id);
+    assert.equal(snapshot.turns[0].status, "failed");
+    assert.equal(snapshot.turns[0].terminalDetail, "Pi assistant error: upstream timeout");
+    assert.deepEqual(snapshot.messages.map((message) => message.content), [
+      "Stop while the provider is failing",
+      "Partial answer",
+    ]);
+  }, piFactory);
+});
+
+test("the production Pi preflight rejects an incompatible lifecycle version before creating a Turn", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-sand-pi-preflight-"));
+  const binary = join(directory, "incompatible-pi");
+  const oldPiBin = process.env.PI_BIN;
+  await writeFile(binary, "#!/bin/sh\nprintf '0.84.1\\n'\n");
+  await chmod(binary, 0o755);
+  process.env.PI_BIN = binary;
+  const service = new AgentService({ dbPath: join(directory, "state.sqlite") });
+  try {
+    const agent = service.createAgent({ workspace: directory });
+    assert.throws(
+      () => service.sendMessage(agent.agent.id, "This must not hang"),
+      /Pi is unavailable or incompatible with the required lifecycle contract/,
+    );
+    assert.deepEqual(service.getAgent(agent.agent.id).turns, []);
+  } finally {
+    service.close();
+    if (oldPiBin === undefined) delete process.env.PI_BIN;
+    else process.env.PI_BIN = oldPiBin;
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("a settled final assistant error fails one Turn and preserves its final text", async () => {
@@ -456,6 +506,63 @@ test("service restart interrupts persisted running work without replay and accep
     assert.equal(new Set(afterNewTurn.messages.map((message) => message.id)).size, afterNewTurn.messages.length);
     second.close();
   } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("a pre-v0.1 database migrates terminal history safe while unknown running history stays unavailable", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-sand-pre-v01-migration-"));
+  const dbPath = join(directory, "state.sqlite");
+  const safeWorkspace = join(directory, "safe-workspace");
+  const unknownWorkspace = join(directory, "unknown-workspace");
+  await mkdir(safeWorkspace);
+  await mkdir(unknownWorkspace);
+  const ids = { agent: randomUUID(), unknown: randomUUID() };
+  const db = new DatabaseSync(dbPath);
+  const timestamp = new Date().toISOString();
+  db.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, workspace TEXT NOT NULL,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE turns (
+      id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id),
+      user_message TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('running','completed','failed','interrupted')),
+      started_at TEXT NOT NULL, finished_at TEXT, pi_session_id TEXT
+    );
+    CREATE TABLE messages (
+      id TEXT UNIQUE NOT NULL, agent_id TEXT NOT NULL REFERENCES agents(id), turn_id TEXT REFERENCES turns(id),
+      role TEXT NOT NULL CHECK(role IN ('user','assistant')), content TEXT NOT NULL,
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+  `);
+  db.prepare("INSERT INTO agents VALUES (?, ?, ?, ?, ?)").run(ids.agent, "Historical", safeWorkspace, timestamp, timestamp);
+  db.prepare("INSERT INTO agents VALUES (?, ?, ?, ?, ?)").run(ids.unknown, "Unknown worker", unknownWorkspace, timestamp, timestamp);
+  for (const [status, content] of [["completed", "completed history"], ["failed", "failed history"], ["interrupted", "interrupted history"]]) {
+    const turnId = randomUUID();
+    db.prepare("INSERT INTO turns (id, agent_id, user_message, status, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?)").run(turnId, ids.agent, `old ${status}`, status, timestamp, timestamp);
+    db.prepare("INSERT INTO messages (id, agent_id, turn_id, role, content, created_at, updated_at) VALUES (?, ?, ?, 'user', ?, ?, ?)").run(randomUUID(), ids.agent, turnId, content, timestamp, timestamp);
+  }
+  const runningId = randomUUID();
+  db.prepare("INSERT INTO turns (id, agent_id, user_message, status, started_at) VALUES (?, ?, ?, 'running', ?)").run(runningId, ids.unknown, "old running work", timestamp);
+  db.close();
+
+  const service = new AgentService({ dbPath, piFactory: fakePi });
+  try {
+    const historical = service.getAgent(ids.agent);
+    assert.deepEqual(historical.turns.map((turn) => turn.status), ["completed", "failed", "interrupted"]);
+    assert.equal(service.db.prepare("SELECT worker_terminated FROM turns WHERE agent_id = ? ORDER BY started_at LIMIT 1").get(ids.agent).worker_terminated, 1);
+    const newTurn = service.sendMessage(ids.agent, "Start new work after migration");
+    assert.equal(newTurn.status, "running");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(service.getAgent(ids.agent).turns.at(-1).status, "completed");
+
+    const restoredUnknown = service.getAgent(ids.unknown);
+    assert.equal(restoredUnknown.turns[0].status, "interrupted");
+    assert.equal(service.db.prepare("SELECT worker_terminated FROM turns WHERE id = ?").get(runningId).worker_terminated, 0);
+    assert.throws(() => service.sendMessage(ids.unknown, "Do not risk old concurrent work"), /workspace remains unavailable/);
+  } finally {
+    service.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("Agent creation persists a canonical workspace and rejects missing or non-directory paths", async () => {

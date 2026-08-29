@@ -59,7 +59,7 @@ class FetchEventSource {
 }
 
 function publicDesktop({ base, storage }) {
-  const elements = Object.fromEntries(["setup", "conversation", "agent-meta", "messages", "status", "interrupt", "agents", "create", "send"].map((id) => [id, new Element()]));
+  const elements = Object.fromEntries(["setup", "conversation", "agent-meta", "header-status", "messages", "status", "interrupt", "agents", "create", "send"].map((id) => [id, new Element()]));
   elements.agents.isSelect = true;
   elements.create.values = { name: "Agent", workspace: "" };
   elements.send.message = new Element();
@@ -142,7 +142,7 @@ async function createAndSend(view, directory, message = "Fix the failing tests")
 test("Desktop client harness over HTTP creates, sends, streams, and completes", async () => withPublicDesktopServer(async ({ controls, directory, openDesktop }) => {
   const view = openDesktop();
   await createAndSend(view, directory);
-  await eventually(() => view.elements.status.textContent === "Pi is working…" && /Working: Fix the failing tests/.test(view.elements.messages.innerHTML), "Desktop did not render its real SSE stream");
+  await eventually(() => view.elements["header-status"].textContent === "Working" && /Working: Fix the failing tests/.test(view.elements.messages.innerHTML), "Desktop did not render its real SSE stream");
   controls[0].release();
   await eventually(() => view.elements.status.textContent === "Turn completed.", "Desktop did not render completion from real SSE");
   assert.equal((view.elements.messages.innerHTML.match(/class="message/g) ?? []).length, 2);
@@ -165,14 +165,14 @@ test("Desktop client harness over HTTP restores a durable transcript after resta
 test("Desktop client harness over HTTP reconnects to the same result", async () => withPublicDesktopServer(async ({ controls, directory, openDesktop, service }) => {
   const first = openDesktop();
   await createAndSend(first, directory, "Keep working");
-  await eventually(() => first.elements.status.textContent === "Pi is working…", "first Desktop did not show active work");
+  await eventually(() => first.elements["header-status"].textContent === "Working", "first Desktop did not show active work");
   first.desktop.destroy();
   assert.equal(service.listAgents().length, 1);
   assert.equal(service.getAgent(service.listAgents()[0].id).state, "active");
 
   const reopened = openDesktop();
   await reopened.desktop.ready;
-  await eventually(() => reopened.elements.status.textContent === "Pi is working…", "reopened Desktop did not reconnect to the active Turn");
+  await eventually(() => reopened.elements["header-status"].textContent === "Working", "reopened Desktop did not reconnect to the active Turn");
   controls[0].release();
   await eventually(() => reopened.elements.status.textContent === "Turn completed.", "reopened Desktop did not render completion");
   assert.equal((reopened.elements.messages.innerHTML.match(/Completed result\./g) ?? []).length, 1);

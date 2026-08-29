@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,7 @@ import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { AgentService } from "../src/service.js";
 import { createAgentServer } from "../src/server.js";
+import { launchProduct } from "../src/launcher.js";
 
 const chromiumPath = "/usr/bin/chromium";
 const canDriveChromium = existsSync(chromiumPath) && typeof WebSocket === "function";
@@ -157,7 +158,7 @@ test("actual Chromium Desktop isolates concurrent Agents and stops only the sele
     const send = async (name, message) => {
       const id = await idFor(name);
       await evaluate(`(async () => { document.querySelector('[data-agent-id="${id}"]').click(); await new Promise((resolve) => setTimeout(resolve, 20)); const input = document.querySelector('#message'); input.value = ${JSON.stringify(message)}; input.dispatchEvent(new Event('input', { bubbles: true })); document.querySelector('#send').requestSubmit(); })()`);
-      await waitFor(() => evaluate("document.querySelector('#status').textContent") .then((status) => status === "Pi is working…"), `${name} did not enter Working state`);
+      await waitFor(() => evaluate("document.querySelector('#header-status').textContent") .then((status) => status === "Working"), `${name} did not enter Working state`);
     };
     await send("A", "A running");
     await send("B", "B running");
@@ -167,7 +168,7 @@ test("actual Chromium Desktop isolates concurrent Agents and stops only the sele
     await waitFor(() => evaluate("document.querySelector('#status').textContent") .then((status) => status.startsWith("Turn interrupted:")), "Desktop did not render A interruption");
     const agentBId = await idFor("B");
     await evaluate(`document.querySelector('[data-agent-id="${agentBId}"]').click()`);
-    await waitFor(() => evaluate("document.querySelector('#status').textContent") .then((status) => status === "Pi is working…"), "Stopping A affected B");
+    await waitFor(() => evaluate("document.querySelector('#header-status').textContent") .then((status) => status === "Working"), "Stopping A affected B");
 
     controls.get("B running").release();
     await waitFor(() => evaluate("document.querySelector('#status').textContent") .then((status) => status === "Turn completed."), "B did not complete after A stopped");
@@ -178,6 +179,115 @@ test("actual Chromium Desktop isolates concurrent Agents and stops only the sele
     await desktop?.close();
     service.close();
     await new Promise((resolve) => server.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("actual Desktop cold-launches the Local Agent Service through the product launcher", { skip: !canDriveChromium }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-sand-actual-cold-launch-"));
+  const workspace = join(directory, "workspace");
+  const browserData = join(directory, "chromium-profile");
+  const fakePi = join(directory, "fake-pi");
+  await mkdir(workspace);
+  await writeFile(fakePi, `#!/usr/bin/env node
+if (process.argv.includes("--version")) { console.log("0.84.2"); process.exit(0); }
+let buffer = "";
+const emit = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) >= 0) {
+    const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+    if (!line.trim()) continue;
+    const request = JSON.parse(line);
+    if (request.type !== "prompt") continue;
+    emit({ id: request.id, command: "prompt", success: true });
+    emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Working from the launched product" } });
+    setTimeout(() => {
+      emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Cold launch completed." }], stopReason: "stop" } });
+      emit({ type: "agent_settled" });
+    }, 250);
+  }
+});
+`);
+  await chmod(fakePi, 0o755);
+  const oldPiBin = process.env.PI_BIN;
+  process.env.PI_BIN = fakePi;
+  const port = await reservePort();
+  let desktop;
+  let desktopPromise;
+  let launched;
+  try {
+    launched = await launchProduct({
+      port,
+      dbPath: join(directory, "state.sqlite"),
+      openDesktopImpl: (url) => {
+        desktopPromise = (async () => browserDebugger(await reservePort(), browserData, url))();
+      },
+    });
+    assert.equal(launched.started, true);
+    desktop = await desktopPromise;
+    await waitFor(() => desktop.evaluate("document.querySelector('#connection').hidden === true"), "launched Desktop did not connect to the cold-started service");
+    await desktop.evaluate(`(() => {
+      document.querySelector('#new-chat').click();
+      document.querySelector('#name').value = 'Cold launch Agent';
+      document.querySelector('#workspace').value = ${JSON.stringify(workspace)};
+      document.querySelector('#create').requestSubmit();
+    })()`);
+    await waitFor(() => desktop.evaluate("document.querySelector('[data-agent-id]')?.textContent.includes('Cold launch Agent')"), "cold-launched Desktop did not create an Agent");
+    await desktop.evaluate(`(() => {
+      const input = document.querySelector('#message');
+      input.value = 'Do work after cold bootstrap';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelector('#send').requestSubmit();
+    })()`);
+    await waitFor(() => desktop.evaluate("document.querySelector('#header-status')?.textContent === 'Working'"), "cold-launched Desktop did not show Working in the conversation header");
+    await waitFor(() => desktop.evaluate("document.querySelector('#status')?.textContent === 'Turn completed.'"), "cold-launched Desktop did not show the completed Turn");
+    assert.match(await desktop.evaluate("document.querySelector('#messages')?.textContent"), /Cold launch completed/);
+  } finally {
+    await desktop?.close().catch(() => {});
+    if (launched?.pid) {
+      try { process.kill(launched.pid, "SIGTERM"); } catch (error) { if (error.code !== "ESRCH") throw error; }
+    }
+    if (oldPiBin === undefined) delete process.env.PI_BIN;
+    else process.env.PI_BIN = oldPiBin;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("actual Desktop shows Retry when cold service bootstrap fails", { skip: !canDriveChromium }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-sand-actual-bootstrap-error-"));
+  const browserData = join(directory, "chromium-profile");
+  const port = await reservePort();
+  let desktop;
+  let desktopPromise;
+  let serverProcess;
+  try {
+    await assert.rejects(
+      launchProduct({
+        port,
+        // /dev/null is a file, so the child cannot create the requested DB
+        // parent. The server still hosts the static Desktop shell in degraded
+        // mode while the product-level connection state is rendered.
+        dbPath: "/dev/null/pi-sand.sqlite",
+        spawnImpl: (...args) => {
+          serverProcess = spawn(...args);
+          return serverProcess;
+        },
+        openDesktopImpl: (url) => {
+          desktopPromise = (async () => browserDebugger(await reservePort(), browserData, url))();
+        },
+        timeoutMs: 250,
+      }),
+      /could not be reached during product launch/,
+    );
+    desktop = await desktopPromise;
+    await waitFor(() => desktop.evaluate("document.querySelector('#connection')?.textContent === 'Can’t reach your computer'"), "bootstrap failure was not rendered in the Desktop");
+    assert.equal(await desktop.evaluate("document.querySelector('#retry')?.hidden"), false);
+  } finally {
+    await desktop?.close().catch(() => {});
+    if (serverProcess?.exitCode === null) serverProcess.kill("SIGTERM");
     await rm(directory, { recursive: true, force: true });
   }
 });
