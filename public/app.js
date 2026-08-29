@@ -11,6 +11,17 @@ export function mountDesktop({
   let agent = null;
   let source = null;
 
+  function setConnectionState(state, message) {
+    const element = $("#connection");
+    const retry = $("#retry");
+    if (element) {
+      element.hidden = state === "connected";
+      element.textContent = message;
+      element.className = state;
+    }
+    if (retry) retry.hidden = state === "connected";
+  }
+
   async function request(url, options) {
     const response = await fetchImpl(`${apiBase}${url}`, { headers: { "content-type": "application/json" }, ...options });
     const data = await response.json();
@@ -19,8 +30,17 @@ export function mountDesktop({
   }
 
   async function refreshAgents() {
-    const agents = await request("/api/agents");
-    $("#agents").innerHTML = '<option value="">Open an existing Agent…</option>' + agents.map((item) => `<option value="${item.id}">${item.name} — ${item.workspace}</option>`).join("");
+    setConnectionState("connecting", "Connecting to your computer…");
+    try {
+      const agents = await request("/api/agents");
+      $("#agents").innerHTML = '<option value="">Open an existing Agent…</option>' + agents.map((item) => `<option value="${item.id}">${item.name} — ${item.workspace}</option>`).join("");
+      if ($("#empty-state")) $("#empty-state").hidden = agents.length !== 0;
+      setConnectionState("connected", "");
+      return agents;
+    } catch (error) {
+      setConnectionState("error", "Can’t reach your computer");
+      throw error;
+    }
   }
 
   function terminalStatus(snapshot) {
@@ -51,6 +71,8 @@ export function mountDesktop({
     localStorage.setItem("pi-sand-agent", id);
     render(snapshot);
     source = new EventSourceImpl(`${apiBase}/api/agents/${id}/events`);
+    source.onopen = () => setConnectionState("connected", "");
+    source.onerror = () => setConnectionState("reconnecting", "Reconnecting to your computer…");
     source.onmessage = (event) => {
       const update = JSON.parse(event.data);
       if (update.snapshot) render(update.snapshot);
@@ -66,6 +88,10 @@ export function mountDesktop({
     } catch (error) { alertImpl(error.message); }
   };
   $("#agents").onchange = (event) => event.target.value && openAgent(event.target.value).catch((error) => alertImpl(error.message));
+  if ($("#retry")) $("#retry").onclick = () => refreshAgents().then(async () => {
+    const remembered = localStorage.getItem("pi-sand-agent");
+    if (remembered && [...$("#agents").options].some((option) => option.value === remembered)) await openAgent(remembered);
+  }).catch(() => {});
   $("#send").onsubmit = async (event) => {
     event.preventDefault();
     if (!agent) return;
@@ -86,7 +112,7 @@ export function mountDesktop({
       $("#agents").value = remembered;
       await openAgent(remembered);
     }
-  }).catch((error) => alertImpl(error.message));
+  }).catch(() => {});
 
   function destroy() {
     source?.close();

@@ -4,6 +4,7 @@ import { mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { acquireDatabaseLock } from "./database-lock.js";
 import { spawnPi } from "./pi.js";
 
 const TERMINAL = new Set(["completed", "failed", "interrupted"]);
@@ -30,7 +31,14 @@ function canonicalWorkspace(workspace) {
 export class AgentService {
   constructor({ dbPath = process.env.PI_SAND_DB ?? defaultDatabasePath(), piFactory = spawnPi } = {}) {
     if (dbPath !== ":memory:") mkdirSync(dirname(dbPath), { recursive: true });
-    this.db = new DatabaseSync(dbPath);
+    this.databaseLock = acquireDatabaseLock(dbPath);
+    try {
+      this.db = new DatabaseSync(dbPath);
+    } catch (error) {
+      this.databaseLock?.release();
+      this.databaseLock = null;
+      throw new Error(`The Local Agent Service could not open its database: ${error.message}`, { cause: error });
+    }
     this.piFactory = piFactory;
     this.events = new EventEmitter();
     this.executions = new Map();
@@ -100,6 +108,8 @@ export class AgentService {
     this.assistantOutcomes.clear();
     this.interruptingTurns.clear();
     this.db.close();
+    this.databaseLock?.release();
+    this.databaseLock = null;
   }
 
   createAgent({ name = "Agent", workspace }) {
