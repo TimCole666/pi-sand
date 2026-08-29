@@ -67,6 +67,34 @@ test("real Pi writes a controlled workspace fixture through the Local Agent Serv
   }
 });
 
+test("real Pi consumes a staged attachment and produces an externally verifiable workspace result", { skip: enabled ? false : "set PI_SAND_REAL_PI=1 with a configured pi CLI to run the real-Pi acceptance scenario" }, async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "pi-sand-real-pi-attachment-"));
+  const dbPath = join(workspace, "state.sqlite");
+  const output = join(workspace, "pi-sand-attachment-smoke.txt");
+  const service = new AgentService({ dbPath });
+  try {
+    const agent = service.createAgent({ name: "Real Pi attachment smoke", workspace });
+    const attachment = service.stageAttachment(agent.agent.id, {
+      filename: "source-note.txt",
+      contentType: "text/plain",
+      bytes: Buffer.from("PI_ATTACHMENT_7X"),
+    });
+    const turn = service.sendMessage(agent.agent.id, [
+      "Read the attached source-note.txt from the stable local path supplied by pi-sand.",
+      "Create pi-sand-attachment-smoke.txt in the current workspace with exactly the attachment's contents.",
+      "Do not use the pi-sand durable transcript as a source. Reply after the file is written.",
+    ].join(" "), { attachments: [attachment.id] });
+    const completed = await waitForTurn(service, agent.agent.id, turn.id);
+    assert.equal(completed.turns.find((candidate) => candidate.id === turn.id).status, "completed");
+    assert.equal(await readFile(output, "utf8"), "PI_ATTACHMENT_7X");
+    assert.equal(completed.messages.find((message) => message.turnId === turn.id && message.role === "user").attachments[0].id, attachment.id);
+    assert.equal(service.attachmentSnapshot(attachment.id).state, "committed");
+  } finally {
+    service.close();
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("real Pi preserves ordinary follow-up context in one Agent session", { skip: enabled ? false : "set PI_SAND_REAL_PI=1 with a configured pi CLI to run the real-Pi acceptance scenario" }, async () => {
   const workspace = await mkdtemp(join(tmpdir(), "pi-sand-real-pi-context-"));
   const dbPath = join(workspace, "state.sqlite");

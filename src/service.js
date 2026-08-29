@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { acquireDatabaseLock } from "./database-lock.js";
 import { spawnPi } from "./pi.js";
@@ -127,6 +127,10 @@ export class AgentService {
       throw new Error(`The Local Agent Service could not open its database: ${error.message}`, { cause: error });
     }
     this.piFactory = piFactory;
+    this.attachmentDirectory = dbPath === ":memory:"
+      ? join(tmpdir(), `pi-sand-attachments-${randomUUID()}`)
+      : `${resolve(dbPath)}.attachments`;
+    mkdirSync(this.attachmentDirectory, { recursive: true, mode: 0o700 });
     this.events = new EventEmitter();
     // A Pi RPC process owns conversational context for one Agent while it is
     // alive. The process is an execution detail, not the durable Agent
@@ -161,6 +165,25 @@ export class AgentService {
       );
       CREATE INDEX IF NOT EXISTS messages_agent_sequence ON messages(agent_id, sequence);
       CREATE INDEX IF NOT EXISTS turns_agent_started ON turns(agent_id, started_at);
+      CREATE TABLE IF NOT EXISTS attachments (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        filename TEXT NOT NULL,
+        content_type TEXT NOT NULL,
+        byte_size INTEGER NOT NULL,
+        storage_path TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK(state IN ('staged','committed','released')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS message_attachments (
+        message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        attachment_id TEXT NOT NULL REFERENCES attachments(id),
+        position INTEGER NOT NULL,
+        PRIMARY KEY(message_id, attachment_id)
+      );
+      CREATE INDEX IF NOT EXISTS attachments_agent_state ON attachments(agent_id, state);
+      CREATE INDEX IF NOT EXISTS message_attachments_message_position ON message_attachments(message_id, position);
     `);
     this.ensureTerminalDetailColumn();
     this.ensureWorkerColumns();
@@ -275,6 +298,76 @@ export class AgentService {
     return this.getAgent(id);
   }
 
+  stageAttachment(agentId, { filename, contentType = "application/octet-stream", bytes } = {}) {
+    if (this.closed) throw new Error("service is closed");
+    if (!this.db.prepare("SELECT id FROM agents WHERE id = ?").get(agentId)) throw new Error("agent not found");
+    const data = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes instanceof Uint8Array ? bytes : bytes ?? "");
+    if (!data.length) throw new Error("attachment is empty");
+    if (data.length > 25 * 1024 * 1024) throw new Error("attachment exceeds the 25 MB limit");
+    const originalName = typeof filename === "string" ? basename(filename).trim() : "";
+    if (!originalName) throw new Error("attachment filename is required");
+    const id = randomUUID();
+    const safeName = originalName.replaceAll(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120) || "attachment";
+    const storagePath = join(this.attachmentDirectory, `${id}-${safeName}`);
+    const temporaryPath = `${storagePath}.tmp`;
+    const timestamp = now();
+    writeFileSync(temporaryPath, data, { mode: 0o600 });
+    try {
+      renameSync(temporaryPath, storagePath);
+      this.db.prepare(`
+        INSERT INTO attachments (id, agent_id, filename, content_type, byte_size, storage_path, state, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'staged', ?, ?)
+      `).run(id, agentId, originalName, String(contentType || "application/octet-stream"), data.length, storagePath, timestamp, timestamp);
+    } catch (error) {
+      try { unlinkSync(temporaryPath); } catch { /* best effort cleanup */ }
+      try { unlinkSync(storagePath); } catch { /* best effort cleanup */ }
+      throw error;
+    }
+    return this.attachmentSnapshot(id);
+  }
+
+  attachmentSnapshot(id) {
+    const row = this.db.prepare(`
+      SELECT id, filename, content_type AS contentType, byte_size AS byteSize,
+             state, created_at AS createdAt, updated_at AS updatedAt
+      FROM attachments WHERE id = ?
+    `).get(id);
+    return row ? { ...row } : null;
+  }
+
+  attachmentForSend(agentId, id) {
+    const row = this.db.prepare(`
+      SELECT id, agent_id AS agentId, filename, content_type AS contentType,
+             byte_size AS byteSize, storage_path AS storagePath, state
+      FROM attachments WHERE id = ? AND agent_id = ?
+    `).get(id, agentId);
+    if (!row) throw new Error("attachment not found");
+    if (row.state !== "staged") throw new Error("attachment is no longer available in the draft");
+    if (!existsSync(row.storagePath)) throw new Error("staged attachment bytes are unavailable");
+    return row;
+  }
+
+  releaseAttachment(agentId, attachmentId) {
+    const attachment = this.db.prepare("SELECT state FROM attachments WHERE id = ? AND agent_id = ?").get(attachmentId, agentId);
+    if (!attachment) throw new Error("attachment not found");
+    if (attachment.state === "committed") throw new Error("sent attachments cannot be removed from the transcript");
+    this.db.prepare("UPDATE attachments SET state = 'released', updated_at = ? WHERE id = ?").run(now(), attachmentId);
+    return this.attachmentSnapshot(attachmentId);
+  }
+
+  cleanupOrphanedAttachments({ olderThanMs = 24 * 60 * 60 * 1000 } = {}) {
+    const cutoff = Date.now() - Math.max(0, Number(olderThanMs) || 0);
+    const rows = this.db.prepare("SELECT id, storage_path AS storagePath, updated_at AS updatedAt FROM attachments WHERE state = 'released'").all();
+    let removed = 0;
+    for (const row of rows) {
+      if (Date.parse(row.updatedAt) > cutoff) continue;
+      try { unlinkSync(row.storagePath); } catch (error) { if (error.code !== "ENOENT") continue; }
+      this.db.prepare("DELETE FROM attachments WHERE id = ? AND state = 'released'").run(row.id);
+      removed += 1;
+    }
+    return removed;
+  }
+
   listAgents() {
     return this.db.prepare(`
       SELECT
@@ -304,7 +397,17 @@ export class AgentService {
   snapshot(id, agent = this.db.prepare("SELECT id, name, workspace, created_at AS createdAt, updated_at AS updatedAt FROM agents WHERE id = ?").get(id)) {
     if (!agent) return null;
     const turns = this.db.prepare("SELECT id, agent_id AS agentId, user_message AS userMessage, status, started_at AS startedAt, finished_at AS finishedAt, pi_session_id AS piSessionId, terminal_detail AS terminalDetail FROM turns WHERE agent_id = ? ORDER BY started_at").all(id);
-    const messages = this.db.prepare("SELECT id, turn_id AS turnId, role, content, created_at AS createdAt, updated_at AS updatedAt FROM messages WHERE agent_id = ? ORDER BY sequence").all(id);
+    const messages = this.db.prepare("SELECT id, turn_id AS turnId, role, content, created_at AS createdAt, updated_at AS updatedAt FROM messages WHERE agent_id = ? ORDER BY sequence").all(id).map((message) => ({
+      ...message,
+      attachments: this.db.prepare(`
+        SELECT attachments.id, attachments.filename, attachments.content_type AS contentType,
+               attachments.byte_size AS byteSize, attachments.created_at AS createdAt
+        FROM message_attachments
+        JOIN attachments ON attachments.id = message_attachments.attachment_id
+        WHERE message_attachments.message_id = ?
+        ORDER BY message_attachments.position
+      `).all(message.id),
+    }));
     const activeTurn = turns.find((turn) => turn.status === "running") ?? null;
     return { agent, turns, messages, state: activeTurn ? "active" : "idle", activeTurnId: activeTurn?.id ?? null };
   }
@@ -315,12 +418,16 @@ export class AgentService {
     return () => this.events.off("update", event);
   }
 
-  sendMessage(agentId, message) {
+  sendMessage(agentId, message, options = {}) {
     if (this.closed) throw new Error("service is closed");
+    const attachmentIds = Array.isArray(options) ? options : options?.attachments ?? options?.attachmentIds ?? [];
+    if (!Array.isArray(attachmentIds) || attachmentIds.some((id) => typeof id !== "string")) throw new Error("attachments must be attachment IDs");
+    const uniqueAttachmentIds = [...new Set(attachmentIds)];
     const agent = this.db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
     if (!agent) throw new Error("agent not found");
     const workspace = canonicalWorkspace(agent.workspace);
     this.ensureWorkspaceSafe(workspace);
+    const attachments = uniqueAttachmentIds.map((id) => this.attachmentForSend(agentId, id));
     if (workspace !== agent.workspace) {
       this.db.prepare("UPDATE agents SET workspace = ?, updated_at = ? WHERE id = ?").run(workspace, now(), agentId);
       agent.workspace = workspace;
@@ -339,6 +446,10 @@ export class AgentService {
     try {
       this.db.prepare("INSERT INTO turns (id, agent_id, user_message, status, started_at) VALUES (?, ?, ?, 'running', ?)").run(turnId, agentId, message, timestamp);
       this.db.prepare("INSERT INTO messages (id, agent_id, turn_id, role, content, created_at, updated_at) VALUES (?, ?, ?, 'user', ?, ?, ?)").run(messageId, agentId, turnId, message, timestamp, timestamp);
+      for (const [position, attachment] of attachments.entries()) {
+        this.db.prepare("INSERT INTO message_attachments (message_id, attachment_id, position) VALUES (?, ?, ?)").run(messageId, attachment.id, position);
+        this.db.prepare("UPDATE attachments SET state = 'committed', updated_at = ? WHERE id = ? AND state = 'staged'").run(timestamp, attachment.id);
+      }
       this.db.prepare("UPDATE agents SET updated_at = ? WHERE id = ?").run(timestamp, agentId);
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
@@ -368,7 +479,11 @@ export class AgentService {
     } else {
       this.markWorkerTerminated(turnId);
     }
-    try { execution.prompt({ id: promptRequestId, message }); } catch (error) { this.finishTurn(agentId, turnId, "failed", error.message); }
+    try {
+      execution.prompt({ id: promptRequestId, message: promptWithAttachments(message, attachments) });
+    } catch (error) {
+      this.finishTurn(agentId, turnId, "failed", error.message);
+    }
     return this.db.prepare("SELECT id, agent_id AS agentId, user_message AS userMessage, status, started_at AS startedAt, finished_at AS finishedAt, pi_session_id AS piSessionId, terminal_detail AS terminalDetail FROM turns WHERE id = ?").get(turnId);
   }
 
@@ -485,6 +600,12 @@ export class AgentService {
   }
 
   publish(agentId, type, data) { this.events.emit("update", { id: randomUUID(), agentId, type, ...data, snapshot: this.snapshot(agentId) }); }
+}
+
+function promptWithAttachments(message, attachments) {
+  if (!attachments.length) return message;
+  const files = attachments.map((attachment) => `- ${attachment.filename}: ${attachment.storagePath}`).join("\n");
+  return `${message}\n\nThe user attached these local files. Read them from the listed paths when relevant:\n${files}`;
 }
 
 function assistantText(message) {
