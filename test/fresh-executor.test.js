@@ -5,6 +5,7 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startFreshExecutor, FRESH_EXECUTOR_ARGS } from "../src/fresh-executor.js";
+import { processGroupStatus } from "../src/process.js";
 
 const FAKE_PI_SOURCE = `#!/usr/bin/env node
 const fs = require("node:fs");
@@ -141,6 +142,25 @@ test("Fresh Executor gates the exact Pi 0.84.4 version before spawn", async () =
     await assert.rejects(start(fake, taskCwd), (error) => error.code === "INCOMPATIBLE_PI_VERSION");
     assert.equal(existsSync(fake.log), false, "an incompatible version must not spawn a worker");
   }, "0.84.3");
+});
+
+test("Fresh Executor callback failure after spawn is captured and safely retires the worker", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+  await withExecutor({}, async ({ fake, taskCwd }) => {
+    let spawned;
+    await assert.rejects(start(fake, taskCwd, {
+      onWorkerSpawn: (metadata) => {
+        spawned = metadata;
+        throw new Error("spawn callback failed");
+      },
+    }), (error) => {
+      assert.equal(error.code, "RPC_STARTUP_FAILED");
+      assert.equal(error.workerMetadata.pid, spawned.pid);
+      assert.equal(error.workerMetadata.processGroupId, spawned.processGroupId);
+      assert.equal(error.workerTerminated, true);
+      return /RPC startup failed/.test(error.message);
+    });
+    assert.equal(processGroupStatus(spawned.processGroupId), "gone");
+  });
 });
 
 test("Fresh Executor uses the controlled profile, caller cwd, and detached process metadata", async () => {

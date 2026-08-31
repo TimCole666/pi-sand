@@ -171,6 +171,7 @@ export class RuntimeClient {
       try {
         return await this.requestSocket(method, params, version);
       } catch (error) {
+        if (error.code === "ambiguous_mutation" || (MUTATING_METHODS.has(method) && error.sent)) throw error;
         lastError = error;
         await delay(50);
       }

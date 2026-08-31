@@ -122,8 +122,8 @@ class FreshExecutorClient {
       });
     }
 
-    this.#spawn();
     try {
+      this.#spawn();
       const modelResponse = await this.#request("set_model", {
         provider: this.#options.provider,
         modelId: this.#options.modelId,
@@ -188,7 +188,6 @@ class FreshExecutorClient {
       throw startupError("Fresh Executor could not be spawned.", { code: "SPAWN_FAILED", cause: error });
     }
     this.#metadata = processMetadata(this.#child);
-    this.#options.onWorkerSpawn?.(this.#metadata);
     this.#child.stdout?.setEncoding?.("utf8");
     this.#child.stdout?.on("data", (chunk) => this.#onStdout(chunk));
     this.#child.stderr?.on("data", () => {
@@ -219,6 +218,10 @@ class FreshExecutorClient {
       }
       for (const listener of this.#closeListeners) listener({ code, signal });
     });
+    // Install every transport and cleanup handler before notifying the daemon
+    // that the worker exists. If that callback fails, start() can still
+    // retire the recorded process group without losing the worker identity.
+    this.#options.onWorkerSpawn?.(this.#metadata);
   }
 
   #onStdout(chunk) {

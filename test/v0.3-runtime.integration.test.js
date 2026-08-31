@@ -160,6 +160,45 @@ test("a sent mutating request reports an unknown outcome without automatic repla
   }
 });
 
+test("autostart does not replay a transmitted mutation after the daemon disconnects", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+  for (const [method, params] of [["task.create", { goal: "create once" }], ["task.stop", { id: "task-1" }], ["task.retry", { id: "task-1" }]]) {
+    const parent = await mkdtemp(join(tmpdir(), `pi-sand-v03-autostart-${method.replace(".", "-")}-`));
+    const env = environment(parent);
+    const socketPath = runtimeSocketPath({ env });
+    await mkdir(dirname(socketPath), { recursive: true });
+    await chmod(dirname(socketPath), 0o700);
+    let daemonServer;
+    let daemonStarts = 0;
+    const received = [];
+    const client = new RuntimeClient({
+      env,
+      requestTimeoutMs: 250,
+      startTimeoutMs: 500,
+      spawnImpl: () => {
+        daemonStarts += 1;
+        daemonServer = createServer((socket) => socket.once("data", (chunk) => {
+          received.push(JSON.parse(String(chunk).trim()));
+          socket.destroy();
+        }));
+        daemonServer.listen(socketPath);
+        return {};
+      },
+    });
+    try {
+      await assert.rejects(client.request(method, params), (error) => {
+        assert.equal(error.code, "ambiguous_mutation");
+        return /outcome is unknown/.test(error.message);
+      });
+      assert.equal(daemonStarts, 1);
+      assert.equal(received.length, 1, `${method} must not be replayed after transmission`);
+      assert.equal(received[0].method, method);
+    } finally {
+      await new Promise((resolveServer) => daemonServer?.close(resolveServer));
+      await rm(parent, { recursive: true, force: true });
+    }
+  }
+});
+
 test("the Extension exposes /tasks through an IPC client and never owns runtime storage", async () => {
   const harness = createExtensionHarness();
   const clients = [];
