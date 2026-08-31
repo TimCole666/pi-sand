@@ -1,6 +1,6 @@
 import { chmodSync, mkdirSync, realpathSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { dirname, join, resolve } from "node:path";
 import { acquireDatabaseLock } from "./database-lock.js";
@@ -29,6 +29,7 @@ export const MAX_TASK_RESULT_LENGTH = 4 * 1024;
 export const MAX_TASK_DETAIL_LENGTH = 2 * 1024;
 export const MAX_TERMINAL_DETAIL_LENGTH = 1_000;
 export const MAX_EVIDENCE_OUTPUT_LENGTH = 8 * 1024;
+export const MAX_EVIDENCE_PAYLOAD_LENGTH = 64 * 1024;
 export const MAX_LOCAL_GATE_COUNT = 16;
 export const MAX_LOCAL_GATE_COMMAND_LENGTH = 4 * 1024;
 export const MAX_LOCAL_GATE_TIMEOUT_MS = 60_000;
@@ -51,6 +52,17 @@ const git = (cwd, args, options = {}) =>
   }).trim();
 const canonicalPath = (path) => realpathSync.native(resolve(path));
 const bounded = (value, limit) => String(value ?? "").slice(0, limit);
+const appendBounded = (value, chunk, limit) => {
+  const current = String(value ?? "");
+  const bytes = Buffer.from(String(chunk ?? ""), "utf8");
+  const remaining = limit - Buffer.byteLength(current, "utf8");
+  if (remaining <= 0) return current;
+  if (bytes.byteLength <= remaining) return current + bytes.toString("utf8");
+  let addition = bytes.subarray(0, remaining).toString("utf8");
+  while (Buffer.byteLength(addition, "utf8") > remaining)
+    addition = addition.slice(0, -1);
+  return current + addition;
+};
 
 function assertTaskWorktreeIdentity(task) {
   if (canonicalPath(task.sourceRepoRoot) !== task.sourceRepoRoot)
@@ -187,7 +199,7 @@ function localGatesFromContract(contract) {
     if (
       !Array.isArray(command) ||
       command.length === 0 ||
-      command.some((part) => typeof part !== "string" || !part || part.includes("\\0"))
+      command.some((part) => typeof part !== "string" || !part || part.includes("\0"))
     )
       throw new Error(
         "Each local gate must provide a non-empty executable command array.",
@@ -1198,6 +1210,8 @@ export class RuntimeStore {
       pendingClose: null,
       stopRequested: false,
       workerMetadata: null,
+      gateProcess: null,
+      gateCancellation: null,
     };
     this.active = active;
     try {
@@ -1464,7 +1478,7 @@ export class RuntimeStore {
     dedupeKey,
   }) {
     const payloadText = JSON.stringify(payload);
-    if (Buffer.byteLength(payloadText, "utf8") > MAX_TASK_PACKET_LENGTH)
+    if (Buffer.byteLength(payloadText, "utf8") > MAX_EVIDENCE_PAYLOAD_LENGTH)
       throw new Error("Evidence payload exceeds its bounded size limit.");
     const id = randomUUID();
     const observedAt = now();
@@ -1532,7 +1546,7 @@ export class RuntimeStore {
       "--quiet",
       "--format=%H%x00%an%x00%ae%x00%cn%x00%ce",
       candidateSha,
-    ]).split("\\0");
+    ]).split("\0");
     if (fields[0] !== candidateSha || branch !== task.taskBranch)
       throw new Error("Task candidate identity changed");
     return {
@@ -1594,77 +1608,156 @@ export class RuntimeStore {
     }
   }
 
-  #runLocalGate(task, candidateSha, gate) {
+  #runLocalGate(active, task, candidateSha, gate) {
     const startedAt = now();
-    let stdout = "";
-    let stderr = "";
-    let exitCode = 0;
-    let signal = null;
-    let exitCategory = "passed";
-    try {
-      stdout = execFileSync(gate.command[0], gate.command.slice(1), {
-        cwd: task.taskWorktree,
-        encoding: "utf8",
-        timeout: gate.timeoutMs,
-        maxBuffer: MAX_EVIDENCE_OUTPUT_LENGTH * 2,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-    } catch (error) {
-      stdout = error.stdout ?? "";
-      stderr = error.stderr ?? "";
-      exitCode = Number.isInteger(error.status) ? error.status : null;
-      signal = error.signal ?? null;
-      if (error.timedOut || error.code === "ETIMEDOUT") exitCategory = "timeout";
-      else if (signal) exitCategory = "signal";
-      else if (Number.isInteger(error.status)) exitCategory = "nonzero";
-      else exitCategory = "error";
-    }
-    const finishedAt = now();
-    stdout = bounded(stdout, MAX_EVIDENCE_OUTPUT_LENGTH);
-    stderr = bounded(stderr, MAX_EVIDENCE_OUTPUT_LENGTH);
-    const postCandidateSha = this.currentBranchHead(task.taskWorktree);
-    let postStatus = "";
-    try {
-      postStatus = git(task.taskWorktree, [
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-      ]);
-    } catch {
-      postStatus = "<unavailable>";
-    }
-    if (postCandidateSha !== candidateSha) exitCategory = "candidate_changed";
-    else if (postStatus) exitCategory = "working_tree_changed";
-    const resultDigest = digest(
-      JSON.stringify({
-        candidateSha,
-        criterion: gate.id,
-        command: gate.command,
-        cwd: task.taskWorktree,
-        exitCategory,
-        exitCode,
-        signal,
-        stdout,
-        stderr,
-      }),
-    );
-    return {
-      criterion: gate.id,
-      command: gate.command,
-      cwd: task.taskWorktree,
-      candidateSha,
-      startedAt,
-      finishedAt,
-      exitCategory,
-      exitCode,
-      signal,
-      stdout,
-      stderr,
-      postCandidateSha,
-      postStatus,
-      resultDigest,
-      passed: exitCategory === "passed",
-    };
+    return new Promise((resolve) => {
+      let child = null;
+      let timer = null;
+      let metadata = null;
+      let stdout = "";
+      let stderr = "";
+      let exitCode = null;
+      let signal = null;
+      let errorDetail = null;
+      let timedOut = false;
+      let cancelled = false;
+      let processTerminated = true;
+      let terminationResult = null;
+      let settled = false;
+
+      const terminate = () => {
+        if (terminationResult !== null) return terminationResult;
+        if (!metadata) {
+          terminationResult = false;
+          processTerminated = false;
+          return terminationResult;
+        }
+        terminationResult = stopOwnedProcessGroupSync(metadata, {
+          timeoutMs: this.workerStopTimeoutMs,
+          currentBootId: this.bootId,
+        });
+        processTerminated = terminationResult;
+        return terminationResult;
+      };
+
+      const finish = ({ code = exitCode, signal: exitSignal = signal, error = null } = {}) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        exitCode = code;
+        signal = exitSignal;
+        if (error) errorDetail = bounded(commandError(error), MAX_TASK_DETAIL_LENGTH);
+        if (terminationResult === null)
+          processTerminated =
+            !child?.pid || child.exitCode !== null || child.signalCode !== null;
+        if (active.gateCancellation === cancel) active.gateCancellation = null;
+        if (active.gateProcess?.child === child) active.gateProcess = null;
+
+        let exitCategory;
+        if (cancelled)
+          exitCategory = processTerminated ? "cancelled" : "gate_termination_ambiguous";
+        else if (timedOut)
+          exitCategory = processTerminated
+            ? "timeout"
+            : "timeout_termination_ambiguous";
+        else if (error) exitCategory = "error";
+        else if (signal) exitCategory = "signal";
+        else if (exitCode === 0) exitCategory = "passed";
+        else exitCategory = "nonzero";
+
+        const finishedAt = now();
+        const postCandidateSha = this.currentBranchHead(task.taskWorktree);
+        let postStatus = "";
+        try {
+          postStatus = git(task.taskWorktree, [
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+          ]);
+        } catch {
+          postStatus = "<unavailable>";
+        }
+        if (postCandidateSha !== candidateSha) exitCategory = "candidate_changed";
+        else if (postStatus) exitCategory = "working_tree_changed";
+        const resultDigest = digest(
+          JSON.stringify({
+            candidateSha,
+            criterion: gate.id,
+            command: gate.command,
+            cwd: task.taskWorktree,
+            exitCategory,
+            exitCode,
+            signal,
+            error: errorDetail,
+            stdout,
+            stderr,
+            processTerminated,
+          }),
+        );
+        resolve({
+          criterion: gate.id,
+          command: gate.command,
+          cwd: task.taskWorktree,
+          candidateSha,
+          startedAt,
+          finishedAt,
+          exitCategory,
+          exitCode,
+          signal,
+          error: errorDetail,
+          stdout,
+          stderr,
+          postCandidateSha,
+          postStatus,
+          processTerminated,
+          resultDigest,
+          passed: exitCategory === "passed" && processTerminated,
+        });
+      };
+
+      const cancel = () => {
+        if (settled) return true;
+        cancelled = true;
+        const terminated = terminate();
+        if (!terminated)
+          finish({ error: new Error("Local gate process could not be safely terminated.") });
+        return terminated;
+      };
+
+      try {
+        child = spawn(gate.command[0], gate.command.slice(1), {
+          cwd: task.taskWorktree,
+          detached: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        metadata = workerMetadata({
+          pid: child.pid,
+          processGroupId: child.pid,
+          workerBootId: this.bootId,
+        });
+        active.gateProcess = { child, metadata };
+        active.gateCancellation = cancel;
+        child.stdout?.setEncoding?.("utf8");
+        child.stderr?.setEncoding?.("utf8");
+        child.stdout?.on("data", (chunk) => {
+          stdout = appendBounded(stdout, chunk, MAX_EVIDENCE_OUTPUT_LENGTH);
+        });
+        child.stderr?.on("data", (chunk) => {
+          stderr = appendBounded(stderr, chunk, MAX_EVIDENCE_OUTPUT_LENGTH);
+        });
+        child.once("error", (error) => finish({ error }));
+        child.once("close", (code, closeSignal) =>
+          finish({ code, signal: closeSignal }),
+        );
+        timer = setTimeout(() => {
+          timedOut = true;
+          if (!terminate()) finish();
+        }, gate.timeoutMs);
+        if (active.stopRequested) cancel();
+      } catch (error) {
+        finish({ error });
+      }
+    });
   }
 
   #recordLocalGateEvidence(active, gateResult) {
@@ -1688,14 +1781,18 @@ export class RuntimeStore {
       state = "failed",
       reason,
       detail,
-      candidateSha = null,
-      finalBranchHead = candidateSha,
-      evidenceIds = [],
+      observedCandidateSha = null,
+      recordedCandidateSha = null,
+      finalBranchHead = observedCandidateSha,
       workerTerminated,
     },
   ) {
     const timestamp = now();
     const finalResult = active.finalAssistant?.result ?? null;
+    const revisionFence =
+      recordedCandidateSha === null
+        ? "AND final_revision IS NULL"
+        : "AND final_revision = ?";
     this.db.exec("BEGIN");
     try {
       const taskUpdate = this.db
@@ -1704,21 +1801,20 @@ export class RuntimeStore {
           terminal_reason = ?, completion_evidence_ref = NULL
           WHERE id = ? AND latest_attempt_id = ? AND state IN ('accepted', 'running')
           AND control_version = ? AND contract_version = ?
-          AND (? IS NULL OR final_revision = ?)`)
+          ${revisionFence}`)
         .run(
           state,
           timestamp,
           finalResult,
           bounded(detail, MAX_TASK_DETAIL_LENGTH),
           finalBranchHead,
-          candidateSha,
+          recordedCandidateSha,
           reason,
           active.taskId,
           active.attemptId,
           active.controlVersion,
           active.contractVersion,
-          candidateSha,
-          candidateSha,
+          ...(recordedCandidateSha === null ? [] : [recordedCandidateSha]),
         );
       if (taskUpdate.changes !== 1) {
         this.db.exec("COMMIT");
@@ -1819,7 +1915,8 @@ export class RuntimeStore {
   async superviseSettled(active) {
     if (this.active !== active || active.stopRequested || active.finalizing) return;
     active.finalizing = true;
-    let candidateSha = null;
+    let observedCandidateSha = null;
+    let recordedCandidateSha = null;
     let candidateEvidenceIds = [];
     let localGateEvidenceIds = [];
     try {
@@ -1851,14 +1948,25 @@ export class RuntimeStore {
       ]);
       if (cleanStatus)
         throw new Error("Task worktree remained dirty after checkpoint.");
-      candidateSha = this.currentBranchHead(task.taskWorktree);
-      if (!/^[0-9a-f]{40}$/i.test(candidateSha ?? ""))
+      observedCandidateSha = this.currentBranchHead(task.taskWorktree);
+      if (!/^[0-9a-f]{40}$/i.test(observedCandidateSha ?? ""))
         throw new Error("Exact Task candidate commit SHA is unavailable.");
-      const candidate = this.#recordCandidate(active, task, candidateSha);
+      const candidate = this.#recordCandidate(
+        active,
+        task,
+        observedCandidateSha,
+      );
       candidateEvidenceIds = candidate.evidenceIds;
+      recordedCandidateSha = candidate.identity.candidateSha;
       for (const gate of gates) {
         if (!this.#supervisorState(active) || active.stopRequested) return;
-        const gateResult = this.#runLocalGate(task, candidateSha, gate);
+        const gateResult = await this.#runLocalGate(
+          active,
+          task,
+          recordedCandidateSha,
+          gate,
+        );
+        if (!this.#supervisorState(active) || active.stopRequested) return;
         this.db.exec("BEGIN");
         try {
           const evidenceId = this.#recordLocalGateEvidence(active, gateResult);
@@ -1877,14 +1985,21 @@ export class RuntimeStore {
             active.workerMetadata,
           );
           if (this.active !== active || active.stopRequested) return;
-          if (!retired) {
+          if (!retired || gateResult.processTerminated !== true) {
             this.#verificationFailure(active, {
               state: "blocked",
-              reason: "worker_retirement_ambiguous",
-              detail: "Required local gate failed and the Fresh Executor could not be safely retired.",
-              candidateSha,
-              finalBranchHead: gateResult.postCandidateSha ?? candidateSha,
-              evidenceIds: [...candidateEvidenceIds, ...localGateEvidenceIds],
+              reason:
+                gateResult.processTerminated !== true
+                  ? "gate_termination_ambiguous"
+                  : "worker_retirement_ambiguous",
+              detail:
+                gateResult.processTerminated !== true
+                  ? "Required local gate failed and its process could not be safely retired."
+                  : "Required local gate failed and the Fresh Executor could not be safely retired.",
+              observedCandidateSha,
+              recordedCandidateSha,
+              finalBranchHead:
+                gateResult.postCandidateSha ?? recordedCandidateSha,
               workerTerminated: false,
             });
             return;
@@ -1892,9 +2007,10 @@ export class RuntimeStore {
           this.#verificationFailure(active, {
             reason: "local_gate_failed",
             detail: `Required local gate failed: ${gateResult.criterion} (${gateResult.exitCategory}).`,
-            candidateSha,
-            finalBranchHead: gateResult.postCandidateSha ?? candidateSha,
-            evidenceIds: [...candidateEvidenceIds, ...localGateEvidenceIds],
+            observedCandidateSha,
+            recordedCandidateSha,
+            finalBranchHead:
+              gateResult.postCandidateSha ?? recordedCandidateSha,
             workerTerminated: true,
           });
           return;
@@ -1902,7 +2018,7 @@ export class RuntimeStore {
       }
       if (!this.#supervisorState(active) || active.stopRequested) return;
       assertTaskWorktreeIdentity(task);
-      if (this.currentBranchHead(task.taskWorktree) !== candidateSha)
+      if (this.currentBranchHead(task.taskWorktree) !== recordedCandidateSha)
         throw new Error("Task candidate commit changed during local verification.");
       const finalStatus = git(task.taskWorktree, [
         "status",
@@ -1921,13 +2037,13 @@ export class RuntimeStore {
           state: "blocked",
           reason: "worker_retirement_ambiguous",
           detail: "Required local gates passed but the Fresh Executor could not be safely retired.",
-          candidateSha,
-          evidenceIds: [...candidateEvidenceIds, ...localGateEvidenceIds],
+          observedCandidateSha,
+          recordedCandidateSha,
           workerTerminated: false,
         });
         return;
       }
-      this.#completeVerified(active, candidateSha, [
+      this.#completeVerified(active, recordedCandidateSha, [
         ...candidateEvidenceIds,
         ...localGateEvidenceIds,
       ]);
@@ -1942,11 +2058,21 @@ export class RuntimeStore {
         state: retired ? "failed" : "blocked",
         reason: retired ? "local_verification_failed" : "worker_retirement_ambiguous",
         detail: `Task local verification failed: ${commandError(error)}`,
-        candidateSha,
+        observedCandidateSha,
+        recordedCandidateSha,
         workerTerminated: retired,
       });
     } finally {
       active.finalizing = false;
+    }
+  }
+
+  #cancelLocalGate(active) {
+    if (!active?.gateCancellation) return true;
+    try {
+      return active.gateCancellation();
+    } catch {
+      return false;
     }
   }
 
@@ -2155,16 +2281,18 @@ export class RuntimeStore {
     if (!attempt || !ACTIVE_ATTEMPT_STATES.has(attempt.state))
       throw new Error(`Task ${id} has no active Attempt to stop.`);
     const worker = attempt;
-    if (this.active?.attemptId === attempt.id) this.active.stopRequested = true;
+    const active =
+      this.active?.attemptId === attempt.id ? this.active : null;
+    if (active) active.stopRequested = true;
+    const gateStopped = active ? this.#cancelLocalGate(active) : true;
     const stopped = await this.terminateOwnedWorker(worker);
-    if (!stopped) {
-      this.markBlocked(
-        task.id,
-        attempt.id,
-        `Task ${id} worker could not be safely terminated; ownership or group liveness was not proven.`,
-      );
+    if (!stopped || !gateStopped) {
+      const detail = !gateStopped
+        ? `Task ${id} local gate could not be safely terminated; ownership or group liveness was not proven.`
+        : `Task ${id} worker could not be safely terminated; ownership or group liveness was not proven.`;
+      this.markBlocked(task.id, attempt.id, detail);
       throw new Error(
-        `Task ${id} worker could not be safely terminated; no stopped outcome was recorded.`,
+        `${detail} No stopped outcome was recorded.`,
       );
     }
     const timestamp = now();
@@ -2347,16 +2475,25 @@ export class RuntimeStore {
     const active = this.active;
     if (active) {
       active.stopRequested = true;
+      const gateStopped = this.#cancelLocalGate(active);
       const attempt = this.db
         .prepare(`SELECT id, task_id AS taskId, state, worker_pid AS workerPid,
         worker_pgid AS workerPgid, worker_start_identity AS workerStartIdentity,
         worker_boot_id AS workerBootId, worker_terminated AS workerTerminated
         FROM attempts WHERE id = ?`)
         .get(active.attemptId);
-      const outcome =
+      let outcome =
         attempt && ["starting", "running"].includes(attempt.state)
           ? this.reconcileAttempt(attempt, { reason })
           : "orphaned";
+      if (!gateStopped && outcome === "interrupted") {
+        this.markBlocked(
+          active.taskId,
+          active.attemptId,
+          "The daemon shutdown could not safely terminate the active local gate; the Task is blocked and its worktree was retained.",
+        );
+        outcome = "orphaned";
+      }
       // FreshExecutor.close() is itself a signal operation. Never invoke it
       // after an uncertain ownership result; the orphan path leaves durable
       // metadata and any surviving worker untouched for next startup.

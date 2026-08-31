@@ -1,11 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { RuntimeStore } from "../src/runtime-store.js";
+import {
+  MAX_EVIDENCE_OUTPUT_LENGTH,
+  RuntimeStore,
+} from "../src/runtime-store.js";
 
 const wait = (milliseconds) =>
   new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
@@ -373,7 +377,7 @@ test("Supervisor preserves worker commits, checkpoints residual changes, and com
     assert.equal(completed.finalBranchHead, candidate);
     assert.equal(completed.terminalReason, "verified_local");
     assert.deepEqual(
-      git(completed.taskWorktree, ["log", "--format=%s", "-3"]).split("\\n"),
+      git(completed.taskWorktree, ["log", "--format=%s", "-3"]).split("\n"),
       [
         "pi-sand: checkpoint completed Task " + completed.id,
         "worker commit",
@@ -471,6 +475,223 @@ test("Supervisor rejects a gate that changes the candidate worktree", async () =
     assert.equal(JSON.parse(gate.payload).exitCategory, "working_tree_changed");
     assert.equal(JSON.parse(gate.payload).candidateSha, candidate);
     assert.equal(git(source, ["rev-parse", "HEAD"]), failed.baseCommit);
+  } finally {
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("local gate commands reject an actual NUL argument before Task acceptance", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-local-gate-nul-"));
+  const source = await repository(parent);
+  const runtime = new RuntimeStore({
+    dbPath: join(parent, "runtime.sqlite"),
+    piCommand: await versionCommand(parent),
+    worktreeRoot: join(parent, "worktrees"),
+    workerFactory: async () => ({ callbacksAttached: true, close() {} }),
+  });
+  try {
+    await assert.rejects(
+      runtime.createTask(
+        taskOptions(source, {
+          localGates: [
+            {
+              command: [process.execPath, "-e", "process.exit(0)", "bad\0arg"],
+            },
+          ],
+        }),
+      ),
+      /non-empty executable command array/,
+    );
+    assert.deepEqual(runtime.listTasks(), []);
+  } finally {
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("candidate recording failure ends the Attempt durably without requiring an unrecorded SHA", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-candidate-record-fail-"));
+  const source = await repository(parent);
+  let emit;
+  const runtime = new RuntimeStore({
+    dbPath: join(parent, "runtime.sqlite"),
+    piCommand: await versionCommand(parent),
+    worktreeRoot: join(parent, "worktrees"),
+    workerFactory: async ({ onEvent }) => {
+      emit = onEvent;
+      return { callbacksAttached: true, close() {} };
+    },
+  });
+  try {
+    const started = await runtime.createTask(
+      taskOptions(source, {
+        localGates: [
+          {
+            id: "required-test",
+            command: [process.execPath, "-e", "process.exit(0)"],
+          },
+        ],
+      }),
+    );
+    runtime.db.exec(`CREATE TRIGGER fail_candidate_record
+      BEFORE UPDATE OF final_revision ON tasks
+      WHEN NEW.state IN ('accepted', 'running') AND NEW.final_revision IS NOT OLD.final_revision
+      BEGIN SELECT RAISE(ABORT, 'injected candidate recording failure'); END`);
+    emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: "candidate could not be recorded",
+        stopReason: "stop",
+      },
+    });
+    emit({ type: "agent_settled" });
+
+    const failed = await eventually(
+      () => runtime.getTask(started.id),
+      (task) => task.state !== "running",
+      2_000,
+    );
+    assert.equal(failed.state, "failed");
+    assert.equal(failed.finalRevision, null);
+    assert.equal(
+      failed.finalBranchHead,
+      git(failed.taskWorktree, ["rev-parse", "HEAD"]),
+    );
+    assert.equal(failed.attempts[0].state, "failed");
+    assert.equal(failed.attempts[0].attemptRuns[0].state, "settled");
+    await wait(50);
+    assert.equal(runtime.getTask(started.id).state, "failed");
+    assert.equal(
+      runtime.db.prepare("SELECT COUNT(*) AS count FROM evidence WHERE task_id = ?").get(started.id).count,
+      0,
+    );
+  } finally {
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("Stop wins while a local gate is running and does not replay the gate", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-local-gate-stop-"));
+  const source = await repository(parent);
+  const marker = join(parent, "gate-started");
+  let gatePid = null;
+  let workerPid = null;
+  let emit;
+  const runtime = new RuntimeStore({
+    dbPath: join(parent, "runtime.sqlite"),
+    piCommand: await versionCommand(parent),
+    worktreeRoot: join(parent, "worktrees"),
+    workerFactory: async ({ onEvent, onWorkerSpawn }) => {
+      const worker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1_000)"], {
+        detached: true,
+        stdio: "ignore",
+      });
+      workerPid = worker.pid;
+      const handle = { pid: worker.pid, processGroupId: worker.pid, close() {} };
+      onWorkerSpawn(handle);
+      emit = onEvent;
+      return handle;
+    },
+  });
+  try {
+    const started = await runtime.createTask(
+      taskOptions(source, {
+        localGates: [
+          {
+            id: "slow-test",
+            timeoutMs: 5_000,
+            command: [
+              process.execPath,
+              "-e",
+              `require("node:fs").writeFileSync(${JSON.stringify(marker)}, String(process.pid)); setInterval(() => {}, 1_000);`,
+            ],
+          },
+        ],
+      }),
+    );
+    emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: "candidate ready",
+        stopReason: "stop",
+      },
+    });
+    emit({ type: "agent_settled" });
+    await eventually(() => existsSync(marker), Boolean, 2_000);
+    gatePid = Number(readFileSync(marker, "utf8"));
+    const stopStartedAt = Date.now();
+    const stopped = await runtime.stopTask(started.id);
+    assert.equal(stopped.state, "stopped");
+    assert.ok(Date.now() - stopStartedAt < 1_500);
+    await wait(100);
+    assert.equal(runtime.getTask(started.id).state, "stopped");
+    assert.equal(runtime.getTask(started.id).completionEvidenceRef, null);
+  } finally {
+    for (const pid of [gatePid, workerPid]) {
+      if (!pid) continue;
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    }
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("bounded local gate stdout and stderr persist in one evidence receipt", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-local-gate-output-"));
+  const source = await repository(parent);
+  const runtime = new RuntimeStore({
+    dbPath: join(parent, "runtime.sqlite"),
+    piCommand: await versionCommand(parent),
+    worktreeRoot: join(parent, "worktrees"),
+    workerFactory: async ({ onEvent }) => {
+      onEvent({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: "candidate ready",
+          stopReason: "stop",
+        },
+      });
+      onEvent({ type: "agent_settled" });
+      return { callbacksAttached: true, close() {} };
+    },
+  });
+  try {
+    const completed = await runtime.createTask(
+      taskOptions(source, {
+        localGates: [
+          {
+            id: "bounded-output",
+            command: [
+              process.execPath,
+              "-e",
+              `process.stdout.write("o".repeat(${MAX_EVIDENCE_OUTPUT_LENGTH})); process.stderr.write("e".repeat(${MAX_EVIDENCE_OUTPUT_LENGTH}));`,
+            ],
+          },
+        ],
+      }),
+    );
+    const settled = await eventually(
+      () => runtime.getTask(completed.id),
+      (task) => task.state === "completed",
+      2_000,
+    );
+    const gate = settled.evidence.find(
+      ({ kind }) => kind === "local_gate_result",
+    );
+    assert.ok(gate);
+    assert.equal(gate.subject, settled.finalRevision);
+    assert.equal(gate.payload.stdout.length, MAX_EVIDENCE_OUTPUT_LENGTH);
+    assert.equal(gate.payload.stderr.length, MAX_EVIDENCE_OUTPUT_LENGTH);
+    assert.equal(settled.attempts[0].attemptRuns[0].evidenceRefs.length, 2);
   } finally {
     runtime.close();
     await rm(parent, { recursive: true, force: true });
