@@ -72,8 +72,9 @@ async function handleRequest(request, store) {
       if (Object.keys(params).length === 0) throw Object.assign(new Error("method is not implemented in protocol v1 tracer bullet: task.create"), { code: "method_unimplemented" });
       return { task: await store.createTask(params) };
     case "task.stop":
+      return { task: await store.stopTask(params.id) };
     case "task.retry":
-      throw Object.assign(new Error(`method is not implemented in protocol v1 tracer bullet: ${request.method}`), { code: "method_unimplemented" });
+      return { task: await store.retryTask(params) };
     default:
       throw Object.assign(new Error(`unknown protocol method: ${request.method}`), { code: "unknown_method" });
   }

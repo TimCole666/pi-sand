@@ -359,9 +359,12 @@ class FreshExecutorClient {
 
   #handle() {
     const client = this;
+    if (typeof this.#options.onEvent === "function") this.#eventListeners.add(this.#options.onEvent);
+    if (typeof this.#options.onClose === "function") this.#closeListeners.add(this.#options.onClose);
     return {
       args: [...FRESH_EXECUTOR_ARGS],
       ...this.#metadata,
+      callbacksAttached: typeof this.#options.onEvent === "function" || typeof this.#options.onClose === "function",
       get events() { return [...client.#eventHistory]; },
       onEvent: (listener) => {
         client.#eventListeners.add(listener);

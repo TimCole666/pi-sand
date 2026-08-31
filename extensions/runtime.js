@@ -1,4 +1,5 @@
 import { RuntimeClient } from "../src/runtime-client.js";
+import { resolveGitRepositoryRoot } from "../src/runtime-store.js";
 
 const defaultRuntimeClientFactory = () => new RuntimeClient();
 const STATUS_KEY = "pi-sand";
@@ -21,11 +22,44 @@ class SessionRuntime {
 
 function notifyResult(ctx, result) { ctx.ui.notify(JSON.stringify(result), result.ok ? "info" : "error"); return result; }
 function configuredAuthAvailable(ctx) { const signal = ctx.modelRegistry?.hasConfiguredAuth; return typeof signal !== "function" || signal.call(ctx.modelRegistry, ctx.model) !== false; }
+function trustedProject(ctx, command) {
+  return typeof ctx.isProjectTrusted === "function" && ctx.isProjectTrusted() === true
+    ? null
+    : `${command} requires a trusted Pi project.`;
+}
+
+function modelSnapshot(ctx) {
+  return { provider: ctx.model?.provider, id: ctx.model?.id };
+}
+
 async function createTask(client, args, ctx) {
-  if (typeof ctx.isProjectTrusted !== "function" || ctx.isProjectTrusted() !== true) return notifyResult(ctx, { ok: false, error: "/task requires a trusted Pi project." });
+  const trustError = trustedProject(ctx, "/task");
+  if (trustError) return notifyResult(ctx, { ok: false, error: trustError });
   if (!configuredAuthAvailable(ctx)) return notifyResult(ctx, { ok: false, error: "/task requires configured authentication for the selected provider." });
-  try { return notifyResult(ctx, { ok: true, task: await client.createTask({ goal: args, cwd: ctx.cwd, trusted: true, model: { provider: ctx.model?.provider, id: ctx.model?.id }, thinkingLevel: ctx.thinkingLevel }) }); }
+  try { return notifyResult(ctx, { ok: true, task: await client.createTask({ goal: args, cwd: ctx.cwd, trusted: true, model: modelSnapshot(ctx), thinkingLevel: ctx.thinkingLevel }) }); }
   catch (error) { return notifyResult(ctx, { ok: false, error: error.message }); }
+}
+
+async function stopTask(client, args, ctx) {
+  try { return notifyResult(ctx, { ok: true, task: await client.stopTask(String(args ?? "").trim()) }); }
+  catch (error) { return notifyResult(ctx, { ok: false, error: error.message }); }
+}
+
+async function retryTask(client, args, ctx) {
+  const trustError = trustedProject(ctx, "/task-retry");
+  if (trustError) return notifyResult(ctx, { ok: false, error: trustError });
+  if (!configuredAuthAvailable(ctx)) return notifyResult(ctx, { ok: false, error: "/task-retry requires configured authentication for the selected provider." });
+  const id = String(args ?? "").trim();
+  try {
+    // Inspection is intentionally separate from the mutation. It lets the
+    // first-party client enforce the parent #38 same-source trust boundary
+    // without giving the daemon a second project-trust authority.
+    const task = await client.getTask(id);
+    if (resolveGitRepositoryRoot(ctx.cwd) !== task.sourceRepoRoot) {
+      return notifyResult(ctx, { ok: false, error: "/task-retry requires the current trusted Pi project to be the Task source repository." });
+    }
+    return notifyResult(ctx, { ok: true, task: await client.retryTask({ id, trusted: true, model: modelSnapshot(ctx), thinkingLevel: ctx.thinkingLevel }) });
+  } catch (error) { return notifyResult(ctx, { ok: false, error: error.message }); }
 }
 
 export function registerPiSandExtension(pi, { runtimeClientFactory } = {}) {
@@ -37,9 +71,14 @@ export function registerPiSandExtension(pi, { runtimeClientFactory } = {}) {
 
   pi.registerCommand("tasks", { description: "List durable background Tasks", handler: async (_args, ctx) => { try { return notifyResult(ctx, { ok: true, tasks: await currentRuntimeClient().listTasks() }); } catch (error) { return notifyResult(ctx, { ok: false, error: error.message }); } } });
   const supportsTaskMutations = !runtimeClientFactory || typeof injectedClient?.createTask === "function";
+  const supportsTaskControls = !runtimeClientFactory || (typeof injectedClient?.stopTask === "function" && typeof injectedClient?.retryTask === "function");
   if (supportsTaskMutations) {
     pi.registerCommand("task", { description: "Start one durable background Task in an isolated Fresh Executor", handler: async (args, ctx) => createTask(currentRuntimeClient(), args, ctx) });
-    pi.registerCommand("task-show", { description: "Show one durable background Task", handler: async (args, ctx) => { try { return notifyResult(ctx, { ok: true, task: await currentRuntimeClient().getTask(String(args).trim()) }); } catch (error) { return notifyResult(ctx, { ok: false, error: error.message }); } } });
+    pi.registerCommand("task-show", { description: "Show one durable background Task", handler: async (args, ctx) => { try { return notifyResult(ctx, { ok: true, task: await currentRuntimeClient().getTask(String(args ?? "").trim()) }); } catch (error) { return notifyResult(ctx, { ok: false, error: error.message }); } } });
+    if (supportsTaskControls) {
+      pi.registerCommand("task-stop", { description: "Stop an active durable background Task", handler: async (args, ctx) => stopTask(currentRuntimeClient(), args, ctx) });
+      pi.registerCommand("task-retry", { description: "Retry a failed, stopped, or interrupted Task with a fresh executor", handler: async (args, ctx) => retryTask(currentRuntimeClient(), args, ctx) });
+    }
   }
   pi.on("project_trust", async () => ({ trusted: "undecided" }));
   pi.on("session_start", async (_event, ctx) => { runtime = new SessionRuntime(ctx); runtime.render(ctx); });

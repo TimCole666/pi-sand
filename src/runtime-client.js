@@ -88,6 +88,18 @@ export class RuntimeClient {
     return result.task;
   }
 
+  async stopTask(id) {
+    const result = await this.request("task.stop", { id });
+    if (!result?.task) throw new Error("The runtime returned an invalid stopped Task.");
+    return result.task;
+  }
+
+  async retryTask(params) {
+    const result = await this.request("task.retry", params);
+    if (!result?.task) throw new Error("The runtime returned an invalid retried Task.");
+    return result.task;
+  }
+
   async request(method, params = {}, { version = PROTOCOL_VERSION } = {}) {
     if (process.platform !== "linux") throw new Error("The pi-sand runtime is supported only on Linux.");
     if (!isAbsolute(this.socketPath)) throw new Error("The pi-sand runtime socket path must be absolute.");

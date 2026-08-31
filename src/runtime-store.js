@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { chmodSync, mkdirSync, realpathSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
@@ -6,6 +6,14 @@ import { dirname, join, resolve } from "node:path";
 import { acquireDatabaseLock } from "./database-lock.js";
 import { checkFreshExecutorCompatibility, startFreshExecutor } from "./fresh-executor.js";
 import { runtimeDatabasePath } from "./runtime-ipc.js";
+import {
+  linuxBootIdentity,
+  processGroupIdentity,
+  processGroupIsAlive,
+  processStartIdentity,
+  recordedWorkerIsGone,
+  recordedWorkerIsOwned,
+} from "./process-group.js";
 
 export const RUNTIME_OWNERSHIP_ERROR = "The pi-sand runtime is already owned by another daemon.";
 export const TASK_RUNTIME_UNSUPPORTED_ERROR = "Fresh Executor Tasks are supported only on Linux.";
@@ -13,7 +21,10 @@ export const MAX_TASK_GOAL_LENGTH = 8 * 1024;
 export const MAX_TASK_PACKET_LENGTH = 16 * 1024;
 export const MAX_TASK_RESULT_LENGTH = 4 * 1024;
 export const MAX_TASK_DETAIL_LENGTH = 2 * 1024;
-
+export const MAX_TERMINAL_DETAIL_LENGTH = 1_000;
+export const WORKER_STOP_TIMEOUT_MS = 2_000;
+const ACTIVE_ATTEMPT_STATES = new Set(["starting", "running"]);
+const RETRYABLE_TASK_STATES = new Set(["failed", "stopped", "interrupted"]);
 const WORKER_RETIRE_TIMEOUT_MS = 2_000;
 const now = () => new Date().toISOString();
 const commandError = (error) => String(error?.stderr || error?.message || "command failed").trim();
@@ -25,6 +36,7 @@ const git = (cwd, args, options = {}) => execFileSync("git", args, {
 }).trim();
 const canonicalPath = (path) => realpathSync.native(resolve(path));
 const bounded = (value, limit) => String(value ?? "").slice(0, limit);
+const boundedDetail = (value) => bounded(value, MAX_TERMINAL_DETAIL_LENGTH);
 
 function assistantText(message) {
   if (typeof message?.content === "string") return message.content;
@@ -44,47 +56,19 @@ function assistantOutcome(event) {
   };
 }
 
-function processGroupGone(processGroupId) {
-  if (!Number.isInteger(processGroupId) || processGroupId <= 0) return true;
-  let entries;
-  try {
-    entries = readdirSync("/proc", { withFileTypes: true });
-  } catch {
-    return false;
-  }
-  let uncertain = false;
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
-    try {
-      const stat = readFileSync(`/proc/${entry.name}/stat`, "utf8");
-      const closingParen = stat.lastIndexOf(")");
-      if (closingParen < 0) { uncertain = true; continue; }
-      const fields = stat.slice(closingParen + 2).trim().split(/\s+/);
-      if (Number(fields[2]) === processGroupId && fields[0] !== "Z") return false;
-    } catch (error) {
-      if (error.code !== "ENOENT") uncertain = true;
-    }
-  }
-  return !uncertain;
-}
-
 function delay(milliseconds) {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
 }
 
-async function waitForProcessGroupGone(processGroupId, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  while (!processGroupGone(processGroupId)) {
-    if (Date.now() >= deadline) return false;
-    await delay(25);
-  }
-  return true;
+export function resolveGitRepositoryRoot(cwd) {
+  try { return canonicalPath(git(cwd, ["rev-parse", "--show-toplevel"])); }
+  catch (error) { throw new Error(`Git repository root could not be resolved: ${commandError(error)}`, { cause: error }); }
 }
 
 export function preflightGitWorkspace(cwd) {
   try {
     if (git(cwd, ["rev-parse", "--is-inside-work-tree"]) !== "true") throw new Error("workspace is not a Git worktree");
-    const sourceRepoRoot = canonicalPath(git(cwd, ["rev-parse", "--show-toplevel"]));
+    const sourceRepoRoot = resolveGitRepositoryRoot(cwd);
     if (git(sourceRepoRoot, ["status", "--porcelain=v1", "--untracked-files=all"])) throw new Error("the source Git worktree must be clean (including untracked files)");
     const baseCommit = git(sourceRepoRoot, ["rev-parse", "HEAD"]);
     if (!/^[0-9a-f]{7,64}$/i.test(baseCommit)) throw new Error("source HEAD is unavailable");
@@ -112,6 +96,8 @@ function attemptSnapshot(row) {
     terminalDetail: row.terminalDetail ?? null,
     finalBranchHead: row.finalBranchHead ?? null,
     workerTerminated: row.workerTerminated === 1,
+    workerStartIdentity: row.workerStartIdentity ?? null,
+    workerBootId: row.workerBootId ?? null,
   };
 }
 
@@ -134,8 +120,8 @@ function taskSnapshot(row, attempts = []) {
   };
 }
 
-export function buildTaskPacket({ taskId, attemptNumber, goal, taskBranch, taskWorktree, baseCommit }) {
-  const packet = [
+export function buildTaskPacket({ taskId, attemptNumber, goal, taskBranch, taskWorktree, baseCommit, priorState, priorDetail }) {
+  const lines = [
     "pi-sand Task Packet",
     `Task id: ${taskId}`,
     `Attempt: ${attemptNumber}`,
@@ -143,24 +129,43 @@ export function buildTaskPacket({ taskId, attemptNumber, goal, taskBranch, taskW
     `Task branch: ${taskBranch}`,
     `Task worktree: ${taskWorktree}`,
     `Base commit: ${baseCommit}`,
+  ];
+  if (priorState) lines.push(`Previous attempt outcome: ${priorState}`);
+  if (priorDetail) lines.push(`Previous attempt detail: ${boundedDetail(priorDetail)}`);
+  lines.push(
     "Execution rules:",
     "- Work only in the task worktree identified above.",
-    "- Inspect the current filesystem; this executor has no Manager conversation.",
-    "- Use Pi's normal tools, Skills, and context discovery as needed.",
-    "- Do not create or enqueue another pi-sand Task. You are not the foreground Manager.",
-  ].join("\n");
+    "- This is a fresh executor; inspect the current filesystem instead of expecting conversation history.",
+    "- Existing filesystem changes from earlier Attempts may remain; do not reset or clean them.",
+    "- Use Pi's normal built-in tools, Skills, and context discovery as needed.",
+    "- Do not create, enqueue, or run another pi-sand Task. You are not the foreground Manager.",
+  );
+  const packet = lines.join("\n");
   if (Buffer.byteLength(packet, "utf8") > MAX_TASK_PACKET_LENGTH) throw new Error("Task Packet exceeds its bounded size.");
   return packet;
 }
 
+function workerMetadata(worker) {
+  const workerPid = Number(worker?.workerPid ?? worker?.pid);
+  const workerPgid = Number(worker?.workerPgid ?? worker?.processGroupId ?? workerPid);
+  if (!Number.isInteger(workerPid) || workerPid <= 0 || !Number.isInteger(workerPgid) || workerPgid <= 0) return null;
+  return {
+    workerPid,
+    workerPgid,
+    workerStartIdentity: worker.workerStartIdentity ?? worker.startIdentity ?? processStartIdentity(workerPid),
+    workerBootId: worker.workerBootId ?? worker.bootId ?? linuxBootIdentity(),
+  };
+}
+
 export class RuntimeStore {
-  constructor({ dbPath = runtimeDatabasePath(), piCommand = process.env.PI_BIN ?? "pi", workerFactory = startFreshExecutor, workerEnv = process.env, worktreeRoot, workerRetireTimeoutMs = WORKER_RETIRE_TIMEOUT_MS } = {}) {
+  constructor({ dbPath = runtimeDatabasePath(), piCommand = process.env.PI_BIN ?? "pi", workerFactory = startFreshExecutor, workerEnv = process.env, worktreeRoot, workerRetireTimeoutMs = WORKER_RETIRE_TIMEOUT_MS, workerStopTimeoutMs = WORKER_STOP_TIMEOUT_MS } = {}) {
     this.dbPath = dbPath;
     this.piCommand = piCommand;
     this.workerFactory = workerFactory;
     this.workerEnv = workerEnv;
     this.worktreeRoot = worktreeRoot;
     this.workerRetireTimeoutMs = Math.max(0, Number(workerRetireTimeoutMs) || 0);
+    this.workerStopTimeoutMs = Math.max(0, Number(workerStopTimeoutMs) || 0);
     this.databaseLock = null;
     this.db = null;
     this.active = null;
@@ -180,6 +185,9 @@ export class RuntimeStore {
       if (!attemptColumns.has(name)) this.db.exec(`ALTER TABLE attempts ADD COLUMN ${name} ${type}`);
     }
     if (!attemptColumns.has("worker_terminated")) this.db.exec("ALTER TABLE attempts ADD COLUMN worker_terminated INTEGER NOT NULL DEFAULT 1");
+    for (const column of ["worker_start_identity", "worker_boot_id"]) {
+      if (!attemptColumns.has(column)) this.db.exec(`ALTER TABLE attempts ADD COLUMN ${column} TEXT`);
+    }
   }
 
   open() {
@@ -226,6 +234,7 @@ export class RuntimeStore {
     const attempts = this.db.prepare(`SELECT id, task_id AS taskId, number, provider, model_id AS modelId,
       thinking_level AS thinkingLevel, state, started_at AS startedAt, finished_at AS finishedAt,
       worker_pid AS workerPid, worker_pgid AS workerPgid, worker_terminated AS workerTerminated,
+      worker_start_identity AS workerStartIdentity, worker_boot_id AS workerBootId,
       final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead
       FROM attempts ORDER BY task_id, number`).all();
     const grouped = new Map();
@@ -244,6 +253,7 @@ export class RuntimeStore {
     const attempts = this.db.prepare(`SELECT id, task_id AS taskId, number, provider, model_id AS modelId,
       thinking_level AS thinkingLevel, state, started_at AS startedAt, finished_at AS finishedAt,
       worker_pid AS workerPid, worker_pgid AS workerPgid, worker_terminated AS workerTerminated,
+      worker_start_identity AS workerStartIdentity, worker_boot_id AS workerBootId,
       final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead
       FROM attempts WHERE task_id = ? ORDER BY number`).all(id);
     return taskSnapshot(row, attempts.map(attemptSnapshot));
@@ -307,52 +317,76 @@ export class RuntimeStore {
       throw error;
     }
 
+    const task = { id: taskId, sourceRepoRoot: preflight.sourceRepoRoot, baseCommit: preflight.baseCommit, taskBranch, taskWorktree, goal: cleanGoal };
+    return this.launchAttempt({ task, attemptId, number: 1, model, thinkingLevel, packet });
+  }
+
+  async launchAttempt({ task, attemptId, number, model, thinkingLevel, packet, priorState, priorDetail }) {
+    const taskPacket = packet ?? buildTaskPacket({
+      taskId: task.id,
+      attemptNumber: number,
+      goal: task.goal,
+      taskBranch: task.taskBranch,
+      taskWorktree: task.taskWorktree,
+      baseCommit: task.baseCommit,
+      priorState,
+      priorDetail,
+    });
     const active = {
-      taskId,
+      taskId: task.id,
       attemptId,
       worker: null,
-      packet,
+      packet: taskPacket,
       finalAssistant: null,
       settled: false,
       rpcCoherent: true,
       finalizing: false,
       pendingEvents: [],
       pendingClose: null,
+      stopRequested: false,
+      workerMetadata: null,
     };
     this.active = active;
     try {
       const worker = await this.workerFactory({
-        cwd: taskWorktree,
+        cwd: task.taskWorktree,
         command: this.piCommand,
         env: this.workerEnv,
         provider: model.provider,
         modelId: model.id,
         thinkingLevel,
-        taskPrompt: packet,
+        taskPrompt: taskPacket,
         onEvent: (event) => this.handleWorkerEvent(active, event),
         onClose: (details) => this.handleWorkerClose(active, details),
       });
-      if (this.active !== active) return this.getTask(taskId);
+      if (this.active !== active) return this.getTask(task.id);
       active.worker = worker;
-      // FreshExecutorClient exposes its stream on the accepted handle rather
-      // than accepting constructor callbacks. Replay its bounded event history
-      // and then subscribe so settlement does not depend on a live client.
-      if (Array.isArray(worker?.events)) for (const event of worker.events) this.handleWorkerEvent(active, event);
-      worker?.onEvent?.((event) => this.handleWorkerEvent(active, event));
-      worker?.onClose?.((details) => this.handleWorkerClose(active, details));
-      const workerPid = Number.isInteger(worker?.pid) ? worker.pid : null;
-      const workerPgid = Number.isInteger(worker?.processGroupId) ? worker.processGroupId : null;
-      this.db.prepare("UPDATE tasks SET state = 'running', updated_at = ? WHERE id = ? AND state = 'accepted'").run(now(), taskId);
-      this.db.prepare("UPDATE attempts SET state = 'running', worker_pid = ?, worker_pgid = ? WHERE id = ? AND state = 'starting'").run(workerPid, workerPgid, attemptId);
+      const metadata = workerMetadata(worker);
+      // Constructor callbacks are attached by the production Fresh Executor.
+      // Older deterministic handles expose callbacks only after startup, so
+      // replay their history before subscribing in that case.
+      if (worker?.callbacksAttached) {
+        for (const event of active.pendingEvents) this.handleWorkerEvent(active, event);
+        active.pendingEvents = [];
+      } else {
+        if (Array.isArray(worker?.events)) for (const event of worker.events) this.handleWorkerEvent(active, event);
+        worker?.onEvent?.((event) => this.handleWorkerEvent(active, event));
+        worker?.onClose?.((details) => this.handleWorkerClose(active, details));
+      }
+      const workerPid = metadata?.workerPid ?? (Number.isInteger(worker?.pid) ? worker.pid : null);
+      const workerPgid = metadata?.workerPgid ?? (Number.isInteger(worker?.processGroupId) ? worker.processGroupId : null);
+      this.db.prepare("UPDATE tasks SET state = 'running', updated_at = ? WHERE id = ? AND state IN ('accepted', 'running')").run(now(), task.id);
+      this.db.prepare("UPDATE attempts SET state = 'running', worker_pid = ?, worker_pgid = ?, worker_start_identity = ?, worker_boot_id = ? WHERE id = ? AND state = 'starting'").run(workerPid, workerPgid, metadata?.workerStartIdentity ?? null, metadata?.workerBootId ?? null, attemptId);
+      active.workerMetadata = metadata;
       // The production Fresh Executor has already accepted its packet before
       // returning. A small prompt method remains useful for deterministic
       // worker doubles without adding a second production transport path.
-      if (typeof worker?.prompt === "function") await worker.prompt({ id: `${taskId}-prompt`, message: packet });
+      if (typeof worker?.prompt === "function") await worker.prompt({ id: `${task.id}-prompt`, message: taskPacket });
       for (const event of active.pendingEvents) this.handleWorkerEvent(active, event);
       active.pendingEvents = [];
       if (active.pendingClose) this.handleWorkerClose(active, active.pendingClose);
       active.pendingClose = null;
-      return this.getTask(taskId);
+      return this.getTask(task.id);
     } catch (error) {
       if (this.active === active && !active.finalizing) {
         await this.settle(active, {
@@ -384,7 +418,7 @@ export class RuntimeStore {
   }
 
   handleWorkerClose(active, details) {
-    if (this.active !== active || active.finalizing) return;
+    if (this.active !== active || active.finalizing || active.stopRequested) return;
     if (!active.worker) {
       active.pendingClose = details;
       return;
@@ -419,12 +453,25 @@ export class RuntimeStore {
     });
   }
 
-  async retireWorker(worker) {
+  async retireWorker(worker, metadata) {
     if (!worker) return true;
-    try { worker.close?.(); } catch { return false; }
-    const processGroupId = Number.isInteger(worker.processGroupId) ? worker.processGroupId : null;
-    if (!processGroupId) return true;
-    return waitForProcessGroupGone(processGroupId, this.workerRetireTimeoutMs);
+    let processGroupId = null;
+    if (Number.isInteger(metadata?.workerPgid)) processGroupId = metadata.workerPgid;
+    else if (Number.isInteger(worker.processGroupId)) processGroupId = worker.processGroupId;
+    if (!processGroupId) {
+      try { worker.close?.(); } catch { return false; }
+      return true;
+    }
+    if (!metadata || !recordedWorkerIsGone(metadata)) {
+      if (!metadata || !recordedWorkerIsOwned(metadata)) return false;
+      try { worker.close?.(); } catch { return false; }
+    }
+    const deadline = Date.now() + this.workerRetireTimeoutMs;
+    while (processGroupIsAlive(processGroupId)) {
+      if (Date.now() >= deadline) return false;
+      await delay(25);
+    }
+    return true;
   }
 
   currentBranchHead(taskWorktree) {
@@ -457,7 +504,7 @@ export class RuntimeStore {
     active.finalizing = true;
     const task = this.getTask(active.taskId);
     if (!task) return;
-    let finalResult = result == null ? null : bounded(result, MAX_TASK_RESULT_LENGTH);
+    const finalResult = result == null ? null : bounded(result, MAX_TASK_RESULT_LENGTH);
     let finalDetail = bounded(detail, MAX_TASK_DETAIL_LENGTH);
     let finalBranchHead = this.currentBranchHead(task.taskWorktree);
     let terminalState = success ? "completed" : "failed";
@@ -473,7 +520,7 @@ export class RuntimeStore {
       }
     }
 
-    const retired = await this.retireWorker(active.worker);
+    const retired = await this.retireWorker(active.worker, active.workerMetadata);
     if (!retired) {
       terminalState = "blocked";
       attemptState = "orphaned";
@@ -494,6 +541,111 @@ export class RuntimeStore {
     if (retired) this.active = null;
   }
 
+  async terminateOwnedWorker(worker) {
+    if (recordedWorkerIsGone(worker)) return true;
+    if (!recordedWorkerIsOwned(worker)) return false;
+    try { process.kill(-worker.workerPgid, "SIGTERM"); }
+    catch (error) { if (error.code !== "ESRCH") return false; }
+    const termDeadline = Date.now() + this.workerStopTimeoutMs;
+    while (Date.now() < termDeadline) {
+      if (!processGroupIsAlive(worker.workerPgid)) return true;
+      await delay(25);
+    }
+    if (!recordedWorkerIsOwned(worker)) return false;
+    try { process.kill(-worker.workerPgid, "SIGKILL"); }
+    catch (error) { if (error.code !== "ESRCH") return false; }
+    const killDeadline = Date.now() + this.workerStopTimeoutMs;
+    while (Date.now() < killDeadline) {
+      if (!processGroupIsAlive(worker.workerPgid)) return true;
+      await delay(25);
+    }
+    return !processGroupIsAlive(worker.workerPgid);
+  }
+
+  markBlocked(taskId, attemptId, detail) {
+    const timestamp = now();
+    this.db.exec("BEGIN");
+    try {
+      this.db.prepare("UPDATE attempts SET state = 'orphaned', finished_at = ?, terminal_detail = ? WHERE id = ? AND state IN ('starting', 'running', 'failed', 'stopped', 'interrupted')").run(timestamp, boundedDetail(detail), attemptId);
+      this.db.prepare("UPDATE tasks SET state = 'blocked', updated_at = ?, terminal_detail = ? WHERE id = ? AND state IN ('accepted', 'running', 'failed', 'stopped', 'interrupted')").run(timestamp, boundedDetail(detail), taskId);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+    if (this.active?.attemptId === attemptId) this.active = null;
+  }
+
+  async stopTask(id) {
+    this.ensureSupported();
+    if (typeof id !== "string" || !id.trim()) throw new Error("/task-stop requires a Task id");
+    this.open();
+    const task = this.getTask(id.trim());
+    if (!task) throw new Error(`Task ${id} was not found.`);
+    if (task.state !== "running") throw new Error(`Task ${id} is already terminal (${task.state}); it is not active.`);
+    const attempt = task.attempts.find(({ id: attemptId }) => attemptId === task.latestAttemptId);
+    if (!attempt || !ACTIVE_ATTEMPT_STATES.has(attempt.state)) throw new Error(`Task ${id} has no active Attempt to stop.`);
+    const worker = attempt;
+    if (this.active?.attemptId === attempt.id) this.active.stopRequested = true;
+    const stopped = await this.terminateOwnedWorker(worker);
+    if (!stopped) {
+      this.markBlocked(task.id, attempt.id, `Task ${id} worker could not be safely terminated; ownership or group liveness was not proven.`);
+      throw new Error(`Task ${id} worker could not be safely terminated; no stopped outcome was recorded.`);
+    }
+    const timestamp = now();
+    this.db.exec("BEGIN");
+    try {
+      this.db.prepare("UPDATE attempts SET state = 'stopped', finished_at = ?, worker_terminated = 1, terminal_detail = ? WHERE id = ? AND state IN ('starting', 'running')").run(timestamp, "The Task was intentionally stopped by the user.", attempt.id);
+      this.db.prepare("UPDATE tasks SET state = 'stopped', terminal_detail = ?, updated_at = ? WHERE id = ? AND state = 'running'").run("The Task was intentionally stopped by the user.", timestamp, task.id);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+    if (this.active?.attemptId === attempt.id) this.active = null;
+    return this.getTask(task.id);
+  }
+
+  async retryTask({ id, trusted, model, thinkingLevel }) {
+    this.ensureSupported();
+    if (typeof id !== "string" || !id.trim()) throw new Error("/task-retry requires a Task id");
+    if (trusted !== true) throw new Error("/task-retry requires a trusted Pi project.");
+    if (!model?.provider || !model?.id) throw new Error("/task-retry requires a selected provider and model.");
+    if (!thinkingLevel) throw new Error("/task-retry requires a selected thinking level.");
+    this.open();
+    const task = this.getTask(id.trim());
+    if (!task) throw new Error(`Task ${id} was not found.`);
+    if (!RETRYABLE_TASK_STATES.has(task.state)) throw new Error(`Task ${id} is ${task.state} and cannot be retried in v0.3.`);
+    if (this.hasCapacityConflict()) throw new Error("A Fresh Executor is already active; v0.3 does not queue Tasks.");
+    try {
+      if (canonicalPath(task.taskWorktree) !== task.taskWorktree) throw new Error("worktree identity changed");
+    } catch (error) { throw new Error(`Task ${id} worktree is unavailable; retry was not started.`, { cause: error }); }
+    const prior = task.attempts.find(({ id: attemptId }) => attemptId === task.latestAttemptId);
+    if (!prior || !RETRYABLE_TASK_STATES.has(prior.state)) throw new Error(`Task ${id} previous Attempt is not terminal.`);
+    if (!((prior.workerPid == null && prior.workerPgid == null) || recordedWorkerIsGone(prior))) {
+      if (!await this.terminateOwnedWorker(prior)) {
+        this.markBlocked(task.id, prior.id, `Task ${id} previous worker is not safely gone; retry was not started.`);
+        throw new Error(`Task ${id} previous worker is not safely gone; retry was not started.`);
+      }
+    }
+    const compatibility = checkFreshExecutorCompatibility({ command: this.piCommand, cwd: task.taskWorktree, env: this.workerEnv });
+    if (!compatibility.compatible) throw new Error("/task-retry requires an installed Pi 0.84.4 executable.");
+    const attemptId = randomUUID();
+    const number = prior.number + 1;
+    const timestamp = now();
+    try {
+      this.db.exec("BEGIN");
+      this.db.prepare("INSERT INTO attempts (id, task_id, number, provider, model_id, thinking_level, state, started_at, worker_terminated) VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, 0)").run(attemptId, task.id, number, model.provider, model.id, thinkingLevel, timestamp);
+      this.db.prepare("UPDATE tasks SET state = 'running', latest_attempt_id = ?, terminal_detail = NULL, updated_at = ? WHERE id = ? AND state IN ('failed', 'stopped', 'interrupted')").run(attemptId, timestamp, task.id);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+    const retryTask = { id: task.id, sourceRepoRoot: task.sourceRepoRoot, baseCommit: task.baseCommit, taskBranch: task.taskBranch, taskWorktree: task.taskWorktree, goal: task.goal };
+    return this.launchAttempt({ task: retryTask, attemptId, number, model, thinkingLevel, priorState: prior.state, priorDetail: prior.terminalDetail });
+  }
+
   release() {
     if (this.closed) return;
     this.closed = true;
@@ -509,3 +661,12 @@ export class RuntimeStore {
 }
 
 export class TaskRuntime extends RuntimeStore {}
+
+export {
+  linuxBootIdentity,
+  processGroupIdentity,
+  processGroupIsAlive,
+  processStartIdentity,
+  recordedWorkerIsGone,
+  recordedWorkerIsOwned,
+};
