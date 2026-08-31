@@ -12,7 +12,7 @@ function createHarness() {
 test("factory only binds the status command and Pi lifecycle observers; Pi owns ordinary prompts", () => {
   const harness = createHarness();
 
-  assert.deepEqual([...harness.commands.keys()], ["task", "tasks", "pi-sand"]);
+  assert.deepEqual([...harness.commands.keys()], ["task", "tasks", "task-stop", "task-retry", "pi-sand"]);
   assert.deepEqual([...harness.handlers.keys()], [
     "project_trust",
     "session_start",
@@ -116,7 +116,7 @@ test("reload replacement starts one fresh projection without duplicate registrat
   await second.invoke("session_start", { type: "session_start", reason: "reload" }, replacementContext);
   await second.commands.get("pi-sand").handler("", replacementContext);
 
-  assert.deepEqual([...second.commands.keys()], ["task", "tasks", "pi-sand"]);
+  assert.deepEqual([...second.commands.keys()], ["task", "tasks", "task-stop", "task-retry", "pi-sand"]);
   assert.equal(second.status.filter(({ text }) => text === "pi-sand: idle").length, 2);
   assert.equal(first.status.filter(({ text }) => text === undefined).length, 1);
   assert.equal(JSON.parse(second.notifications[0].message).session, "same-session");

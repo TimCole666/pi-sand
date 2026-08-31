@@ -33,6 +33,30 @@ async function tasksCommand(taskRuntime, _args, ctx) {
   }
 }
 
+async function taskStopCommand(taskRuntime, args, ctx) {
+  try {
+    const result = { ok: true, task: taskRuntime.stopTask(String(args ?? "").trim()) };
+    ctx.ui.notify(JSON.stringify(result), "info");
+    return result;
+  } catch (error) {
+    const result = { ok: false, error: error.message };
+    ctx.ui.notify(JSON.stringify(result), "error");
+    return result;
+  }
+}
+
+async function taskRetryCommand(taskRuntime, args, ctx) {
+  try {
+    const result = { ok: true, task: taskRuntime.retryTask({ id: String(args ?? "").trim(), trusted: ctx.isProjectTrusted?.() === true, model: ctx.model, thinkingLevel: ctx.thinkingLevel }) };
+    ctx.ui.notify(JSON.stringify(result), "info");
+    return result;
+  } catch (error) {
+    const result = { ok: false, error: error.message };
+    ctx.ui.notify(JSON.stringify(result), "error");
+    return result;
+  }
+}
+
 function getSessionId(ctx) {
   return ctx.sessionManager.getSessionId();
 }
@@ -173,6 +197,16 @@ export function registerPiSandExtension(pi, { taskRuntimeFactory = () => new Tas
   pi.registerCommand("tasks", {
     description: "List durable background Tasks",
     handler: async (args, ctx) => tasksCommand(taskRuntime, args, ctx),
+  });
+
+  pi.registerCommand("task-stop", {
+    description: "Stop an active durable background Task",
+    handler: async (args, ctx) => taskStopCommand(taskRuntime, args, ctx),
+  });
+
+  pi.registerCommand("task-retry", {
+    description: "Retry a failed, stopped, or interrupted Task with a fresh executor",
+    handler: async (args, ctx) => taskRetryCommand(taskRuntime, args, ctx),
   });
 
   pi.registerCommand("pi-sand", {
