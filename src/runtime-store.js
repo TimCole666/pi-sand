@@ -1,5 +1,5 @@
 import { chmodSync, mkdirSync, realpathSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { dirname, join, resolve } from "node:path";
@@ -29,6 +29,9 @@ export const MAX_TASK_RESULT_LENGTH = 4 * 1024;
 export const MAX_TASK_DETAIL_LENGTH = 2 * 1024;
 export const MAX_TERMINAL_DETAIL_LENGTH = 1_000;
 export const WORKER_STOP_TIMEOUT_MS = 2_000;
+export const COMMITMENT_CONTRACT_VERSION = 1;
+export const COMMITMENT_CONTROL_VERSION = 1;
+const INITIAL_ATTEMPT_RUN_SEQUENCE = 1;
 const ACTIVE_ATTEMPT_STATES = new Set(["starting", "running"]);
 const RETRYABLE_TASK_STATES = new Set(["failed", "stopped", "interrupted"]);
 const WORKER_RETIRE_TIMEOUT_MS = 2_000;
@@ -75,11 +78,18 @@ const RESTART_DETAIL =
 const ORPHAN_DETAIL =
   "The prior Fresh Executor could not be safely identified or terminated. The Task is blocked and its worktree was retained.";
 const DAEMON_SHUTDOWN_REASON = "daemon-shutdown";
+const DEFAULT_AUTHORITY = { owner: "pi-sandd" };
+const DEFAULT_BUDGET = {};
+const DEFAULT_RETURN_ROUTE = { kind: "manager" };
 const TASK_SELECT = `SELECT id, source_repo_root AS sourceRepoRoot, base_commit AS baseCommit,
   task_branch AS taskBranch, task_worktree AS taskWorktree, goal, state,
   latest_attempt_id AS latestAttemptId, created_at AS createdAt, updated_at AS updatedAt,
   final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead,
-  shutdown_reason AS shutdownReason
+  shutdown_reason AS shutdownReason, completion_contract AS completionContract,
+  contract_version AS contractVersion, control_version AS controlVersion, authority,
+  budget, return_route AS returnRoute, accepted_at AS acceptedAt,
+  final_revision AS finalRevision, completion_evidence_ref AS completionEvidenceRef,
+  terminal_reason AS terminalReason
   FROM tasks`;
 const ATTEMPT_SELECT = `SELECT id, task_id AS taskId, number, applied_provider AS provider, applied_model_id AS modelId,
   applied_thinking_level AS thinkingLevel, state, started_at AS startedAt, finished_at AS finishedAt,
@@ -88,6 +98,11 @@ const ATTEMPT_SELECT = `SELECT id, task_id AS taskId, number, applied_provider A
   final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead,
   shutdown_reason AS shutdownReason
   FROM attempts`;
+const ATTEMPT_RUN_SELECT = `SELECT attempt_id AS attemptId, sequence, kind,
+  control_version AS controlVersion, contract_version AS contractVersion,
+  prompt_digest AS promptDigest, state, settled_outcome AS settledOutcome,
+  evidence_refs AS evidenceRefs, started_at AS startedAt, settled_at AS settledAt
+  FROM attempt_runs`;
 
 function assistantText(message) {
   if (typeof message?.content === "string") return message.content;
@@ -106,6 +121,36 @@ function assistantOutcome(event) {
     stopReason: String(event.message.stopReason ?? "").toLowerCase(),
     hasError: Boolean(event.message.error || event.message.errorMessage),
   };
+}
+
+function serialized(value, fallback) {
+  if (value == null) return JSON.stringify(fallback);
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+function parsed(value, fallback = null) {
+  if (value == null) return fallback;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+function promptDigest(prompt) {
+  return createHash("sha256").update(prompt, "utf8").digest("hex");
+}
+
+function defaultCompletionContract(goal) {
+  return { objective: goal };
+}
+
+function migratedAttemptRunState(state) {
+  if (state === "completed") return "settled";
+  if (state === "running") return "accepted";
+  if (state === "starting") return "pending";
+  if (state === "orphaned") return "ambiguous";
+  return "aborted";
 }
 
 export function resolveGitRepositoryRoot(cwd) {
@@ -142,7 +187,23 @@ export function preflightGitWorkspace(cwd) {
   }
 }
 
-function attemptSnapshot(row) {
+function attemptRunSnapshot(row) {
+  return {
+    attemptId: row.attemptId,
+    sequence: row.sequence,
+    kind: row.kind,
+    controlVersion: row.controlVersion,
+    contractVersion: row.contractVersion,
+    promptDigest: row.promptDigest ?? null,
+    state: row.state,
+    settledOutcome: row.settledOutcome ?? null,
+    evidenceRefs: parsed(row.evidenceRefs, []),
+    startedAt: row.startedAt,
+    settledAt: row.settledAt ?? null,
+  };
+}
+
+function attemptSnapshot(row, attemptRuns = []) {
   return {
     id: row.id,
     taskId: row.taskId,
@@ -162,6 +223,7 @@ function attemptSnapshot(row) {
     workerTerminated: row.workerTerminated === 1,
     workerStartIdentity: row.workerStartIdentity ?? null,
     workerBootId: row.workerBootId ?? null,
+    attemptRuns,
   };
 }
 
@@ -181,6 +243,16 @@ function taskSnapshot(row, attempts = []) {
     finalResult: row.finalResult ?? null,
     terminalDetail: row.terminalDetail ?? null,
     finalBranchHead: row.finalBranchHead ?? null,
+    completionContract: parsed(row.completionContract),
+    contractVersion: row.contractVersion ?? null,
+    controlVersion: row.controlVersion ?? null,
+    authority: parsed(row.authority),
+    budget: parsed(row.budget),
+    returnRoute: parsed(row.returnRoute),
+    acceptedAt: row.acceptedAt ?? null,
+    finalRevision: row.finalRevision ?? null,
+    completionEvidenceRef: row.completionEvidenceRef ?? null,
+    terminalReason: row.terminalReason ?? null,
     attempts,
   };
 }
@@ -363,6 +435,123 @@ export class RuntimeStore {
     }
   }
 
+  ensureCommitmentColumns() {
+    const columns = new Set(
+      this.db
+        .prepare("PRAGMA table_info(tasks)")
+        .all()
+        .map((row) => row.name),
+    );
+    for (const [name, type] of [
+      ["completion_contract", "TEXT"],
+      ["contract_version", "INTEGER NOT NULL DEFAULT 1"],
+      ["control_version", "INTEGER NOT NULL DEFAULT 1"],
+      ["authority", "TEXT"],
+      ["budget", "TEXT"],
+      ["return_route", "TEXT"],
+      ["accepted_at", "TEXT"],
+      ["final_revision", "TEXT"],
+      ["completion_evidence_ref", "TEXT"],
+      ["terminal_reason", "TEXT"],
+    ]) {
+      if (!columns.has(name))
+        this.db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${type}`);
+    }
+
+    const rows = this.db
+      .prepare(
+        `SELECT id, goal, created_at AS createdAt, state, terminal_detail AS terminalDetail,
+        final_branch_head AS finalBranchHead FROM tasks`,
+      )
+      .all();
+    if (rows.length === 0) return;
+    const update = this.db.prepare(`UPDATE tasks SET
+      completion_contract = COALESCE(completion_contract, ?),
+      contract_version = COALESCE(contract_version, ?),
+      control_version = COALESCE(control_version, ?),
+      authority = COALESCE(authority, ?),
+      budget = COALESCE(budget, ?),
+      return_route = COALESCE(return_route, ?),
+      accepted_at = COALESCE(accepted_at, ?),
+      final_revision = COALESCE(final_revision, ?),
+      terminal_reason = COALESCE(terminal_reason, ?)
+      WHERE id = ?`);
+    this.db.exec("BEGIN");
+    try {
+      for (const row of rows) {
+        const terminal = [
+          "completed",
+          "failed",
+          "stopped",
+          "interrupted",
+          "blocked",
+        ].includes(row.state);
+        update.run(
+          JSON.stringify(defaultCompletionContract(row.goal)),
+          COMMITMENT_CONTRACT_VERSION,
+          COMMITMENT_CONTROL_VERSION,
+          JSON.stringify(DEFAULT_AUTHORITY),
+          JSON.stringify(DEFAULT_BUDGET),
+          JSON.stringify(DEFAULT_RETURN_ROUTE),
+          row.createdAt,
+          row.finalBranchHead ?? null,
+          terminal ? row.terminalDetail ?? null : null,
+          row.id,
+        );
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+  }
+
+  ensureAttemptRuns() {
+    const rows = this.db
+      .prepare(
+        `SELECT a.id AS attemptId, a.task_id AS taskId, a.number,
+        a.state AS attemptState, a.started_at AS startedAt, a.finished_at AS finishedAt,
+        a.final_result AS finalResult, t.control_version AS controlVersion,
+        t.contract_version AS contractVersion
+        FROM attempts AS a
+        JOIN tasks AS t ON t.id = a.task_id
+        WHERE NOT EXISTS (
+          SELECT 1 FROM attempt_runs AS existing
+          WHERE existing.attempt_id = a.id AND existing.sequence = ?
+        )`,
+      )
+      .all(INITIAL_ATTEMPT_RUN_SEQUENCE);
+    if (rows.length === 0) return;
+    const insert = this.db.prepare(`INSERT INTO attempt_runs
+      (attempt_id, sequence, kind, control_version, contract_version, prompt_digest,
+       state, settled_outcome, evidence_refs, started_at, settled_at)
+      VALUES (?, ?, 'initial', ?, ?, NULL, ?, ?, '[]', ?, ?)`);
+    this.db.exec("BEGIN");
+    try {
+      for (const row of rows) {
+        const state = migratedAttemptRunState(row.attemptState);
+        insert.run(
+          row.attemptId,
+          INITIAL_ATTEMPT_RUN_SEQUENCE,
+          row.controlVersion ?? COMMITMENT_CONTROL_VERSION,
+          row.contractVersion ?? COMMITMENT_CONTRACT_VERSION,
+          state,
+          state === "settled" ? row.finalResult ?? null : null,
+          row.startedAt,
+          state === "settled" ? row.finishedAt ?? null : null,
+        );
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+  }
+
   open() {
     this.ensureSupported();
     if (this.closed) throw new Error("The pi-sand runtime is closed.");
@@ -378,7 +567,11 @@ export class RuntimeStore {
           id TEXT PRIMARY KEY, source_repo_root TEXT NOT NULL, base_commit TEXT NOT NULL,
           task_branch TEXT NOT NULL UNIQUE, task_worktree TEXT NOT NULL UNIQUE, goal TEXT NOT NULL,
           state TEXT NOT NULL, latest_attempt_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-          final_result TEXT, terminal_detail TEXT, final_branch_head TEXT, shutdown_reason TEXT
+          final_result TEXT, terminal_detail TEXT, final_branch_head TEXT, shutdown_reason TEXT,
+          completion_contract TEXT, contract_version INTEGER NOT NULL DEFAULT 1,
+          control_version INTEGER NOT NULL DEFAULT 1, authority TEXT, budget TEXT,
+          return_route TEXT, accepted_at TEXT, final_revision TEXT,
+          completion_evidence_ref TEXT, terminal_reason TEXT
         );
         CREATE TABLE IF NOT EXISTS attempts (
           id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), number INTEGER NOT NULL,
@@ -391,6 +584,17 @@ export class RuntimeStore {
         CREATE INDEX IF NOT EXISTS tasks_created ON tasks(created_at, id);
         CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id, number);`);
       this.ensureCompletionColumns();
+      this.ensureCommitmentColumns();
+      this.db.exec(`CREATE TABLE IF NOT EXISTS attempt_runs (
+        attempt_id TEXT NOT NULL REFERENCES attempts(id), sequence INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('initial', 'continue', 'local_repair', 'review')),
+        control_version INTEGER NOT NULL, contract_version INTEGER NOT NULL,
+        prompt_digest TEXT, state TEXT NOT NULL CHECK(state IN ('pending', 'accepted', 'settled', 'aborted', 'ambiguous')),
+        settled_outcome TEXT, evidence_refs TEXT NOT NULL DEFAULT '[]',
+        started_at TEXT NOT NULL, settled_at TEXT, UNIQUE(attempt_id, sequence)
+      );
+      CREATE INDEX IF NOT EXISTS attempt_runs_attempt ON attempt_runs(attempt_id, sequence);`);
+      this.ensureAttemptRuns();
       this.reconcilePriorAttempts();
       return this;
     } catch (error) {
@@ -428,13 +632,24 @@ export class RuntimeStore {
         );
       this.db
         .prepare(`UPDATE tasks SET state = ?, updated_at = ?, terminal_detail = ?,
-      shutdown_reason = COALESCE(?, shutdown_reason) WHERE id = ? AND latest_attempt_id = ?`)
+      terminal_reason = ?, shutdown_reason = COALESCE(?, shutdown_reason)
+      WHERE id = ? AND latest_attempt_id = ?`)
         .run(
           state === "orphaned" ? "blocked" : "interrupted",
           timestamp,
           boundedDetail(detail),
+          boundedDetail(detail),
           shutdownReason,
           attempt.taskId,
+          attempt.id,
+        );
+      this.db
+        .prepare(`UPDATE attempt_runs SET state = ?, settled_outcome = COALESCE(settled_outcome, ?),
+        settled_at = COALESCE(settled_at, ?) WHERE attempt_id = ? AND state IN ('pending', 'accepted')`)
+        .run(
+          state === "orphaned" ? "ambiguous" : "aborted",
+          boundedDetail(detail),
+          timestamp,
           attempt.id,
         );
       this.db.exec("COMMIT");
@@ -516,11 +731,20 @@ export class RuntimeStore {
     const attempts = this.db
       .prepare(`${ATTEMPT_SELECT} ORDER BY task_id, number`)
       .all();
+    const attemptRuns = this.db
+      .prepare(`${ATTEMPT_RUN_SELECT} ORDER BY attempt_id, sequence`)
+      .all();
+    const runsByAttempt = new Map();
+    for (const run of attemptRuns)
+      runsByAttempt.set(run.attemptId, [
+        ...(runsByAttempt.get(run.attemptId) ?? []),
+        attemptRunSnapshot(run),
+      ]);
     const grouped = new Map();
     for (const attempt of attempts)
       grouped.set(attempt.taskId, [
         ...(grouped.get(attempt.taskId) ?? []),
-        attemptSnapshot(attempt),
+        attemptSnapshot(attempt, runsByAttempt.get(attempt.id) ?? []),
       ]);
     return rows.map((row) => taskSnapshot(row, grouped.get(row.id) ?? []));
   }
@@ -535,11 +759,23 @@ export class RuntimeStore {
       .all(id);
   }
 
+  #attemptRunRows(attemptId) {
+    return this.db
+      .prepare(`${ATTEMPT_RUN_SELECT} WHERE attempt_id = ? ORDER BY sequence`)
+      .all(attemptId);
+  }
+
   getTask(id) {
     this.open();
     const row = this.#taskRow(id);
     if (!row) return null;
-    return taskSnapshot(row, this.#taskAttemptRows(id).map(attemptSnapshot));
+    const attempts = this.#taskAttemptRows(id).map((attempt) =>
+      attemptSnapshot(
+        attempt,
+        this.#attemptRunRows(attempt.id).map(attemptRunSnapshot),
+      ),
+    );
+    return taskSnapshot(row, attempts);
   }
 
   createWorktree({ repoRoot, baseCommit, taskId }) {
@@ -581,7 +817,17 @@ export class RuntimeStore {
     );
   }
 
-  async createTask({ goal, cwd, trusted, model, thinkingLevel }) {
+  async createTask({
+    goal,
+    cwd,
+    trusted,
+    model,
+    thinkingLevel,
+    completionContract,
+    authority,
+    budget,
+    returnRoute,
+  }) {
     this.ensureSupported();
     if (typeof goal !== "string" || !goal.trim())
       throw new Error("/task requires a goal");
@@ -617,6 +863,13 @@ export class RuntimeStore {
       taskId,
     });
     const cleanGoal = goal.trim();
+    const storedCompletionContract = serialized(
+      completionContract,
+      defaultCompletionContract(cleanGoal),
+    );
+    const storedAuthority = serialized(authority, DEFAULT_AUTHORITY);
+    const storedBudget = serialized(budget, DEFAULT_BUDGET);
+    const storedReturnRoute = serialized(returnRoute, DEFAULT_RETURN_ROUTE);
     let packet;
     try {
       packet = buildTaskPacket({
@@ -640,8 +893,12 @@ export class RuntimeStore {
     try {
       this.db.exec("BEGIN");
       this.db
-        .prepare(`INSERT INTO tasks (id, source_repo_root, base_commit, task_branch, task_worktree, goal, state, latest_attempt_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'accepted', ?, ?, ?)`)
+        .prepare(`INSERT INTO tasks (
+          id, source_repo_root, base_commit, task_branch, task_worktree, goal,
+          state, latest_attempt_id, created_at, updated_at, completion_contract,
+          contract_version, control_version, authority, budget, return_route,
+          accepted_at, final_revision, completion_evidence_ref, terminal_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`)
         .run(
           taskId,
           preflight.sourceRepoRoot,
@@ -652,11 +909,31 @@ export class RuntimeStore {
           attemptId,
           timestamp,
           timestamp,
+          storedCompletionContract,
+          COMMITMENT_CONTRACT_VERSION,
+          COMMITMENT_CONTROL_VERSION,
+          storedAuthority,
+          storedBudget,
+          storedReturnRoute,
+          timestamp,
         );
       this.db
         .prepare(`INSERT INTO attempts (id, task_id, number, provider, model_id, thinking_level, state, started_at, worker_terminated)
         VALUES (?, ?, 1, NULL, NULL, NULL, 'starting', ?, 0)`)
         .run(attemptId, taskId, timestamp);
+      this.db
+        .prepare(`INSERT INTO attempt_runs (
+          attempt_id, sequence, kind, control_version, contract_version,
+          prompt_digest, state, evidence_refs, started_at
+        ) VALUES (?, ?, 'initial', ?, ?, ?, 'pending', '[]', ?)`)
+        .run(
+          attemptId,
+          INITIAL_ATTEMPT_RUN_SEQUENCE,
+          COMMITMENT_CONTROL_VERSION,
+          COMMITMENT_CONTRACT_VERSION,
+          promptDigest(packet),
+          timestamp,
+        );
       this.db.exec("COMMIT");
     } catch (error) {
       try {
@@ -678,6 +955,8 @@ export class RuntimeStore {
       taskBranch,
       taskWorktree,
       goal: cleanGoal,
+      contractVersion: COMMITMENT_CONTRACT_VERSION,
+      controlVersion: COMMITMENT_CONTROL_VERSION,
     };
     return this.launchAttempt({
       task,
@@ -705,6 +984,60 @@ export class RuntimeStore {
     return metadata;
   }
 
+  #acceptAttemptRun(active, { provider, modelId, thinkingLevel, workerPid, workerPgid }) {
+    const timestamp = now();
+    this.db.exec("BEGIN");
+    try {
+      this.db
+        .prepare(`UPDATE tasks SET state = 'running', updated_at = ?
+          WHERE id = ? AND latest_attempt_id = ? AND state IN ('accepted', 'running')
+          AND contract_version = ? AND control_version = ?`)
+        .run(
+          timestamp,
+          active.taskId,
+          active.attemptId,
+          active.contractVersion,
+          active.controlVersion,
+        );
+      this.db
+        .prepare(`UPDATE attempts SET state = 'running', provider = ?, model_id = ?,
+          thinking_level = ?, applied_provider = ?, applied_model_id = ?,
+          applied_thinking_level = ?, worker_pid = ?, worker_pgid = ?,
+          worker_start_identity = ?, worker_boot_id = ?
+          WHERE id = ? AND state = 'starting'`)
+        .run(
+          provider,
+          modelId,
+          thinkingLevel,
+          provider,
+          modelId,
+          thinkingLevel,
+          workerPid,
+          workerPgid,
+          active.workerMetadata?.workerStartIdentity ?? null,
+          this.bootId ?? active.workerMetadata?.workerBootId ?? null,
+          active.attemptId,
+        );
+      this.db
+        .prepare(`UPDATE attempt_runs SET state = 'accepted'
+          WHERE attempt_id = ? AND sequence = ? AND state = 'pending'
+          AND control_version = ? AND contract_version = ?`)
+        .run(
+          active.attemptId,
+          active.runSequence,
+          active.controlVersion,
+          active.contractVersion,
+        );
+      this.db.exec("COMMIT");
+      active.runAccepted = true;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+  }
+
   async launchAttempt({
     task,
     attemptId,
@@ -730,10 +1063,15 @@ export class RuntimeStore {
     const active = {
       taskId: task.id,
       attemptId,
+      runSequence: INITIAL_ATTEMPT_RUN_SEQUENCE,
+      contractVersion: task.contractVersion ?? COMMITMENT_CONTRACT_VERSION,
+      controlVersion: task.controlVersion ?? COMMITMENT_CONTROL_VERSION,
       worker: null,
       packet: taskPacket,
       finalAssistant: null,
       settled: false,
+      runAccepted: false,
+      runSettled: false,
       rpcCoherent: true,
       finalizing: false,
       settlementPromise: null,
@@ -784,28 +1122,13 @@ export class RuntimeStore {
         (Number.isInteger(worker?.processGroupId)
           ? worker.processGroupId
           : null);
-      this.db
-        .prepare(
-          "UPDATE tasks SET state = 'running', updated_at = ? WHERE id = ? AND state IN ('accepted', 'running')",
-        )
-        .run(now(), task.id);
-      this.db
-        .prepare(
-          "UPDATE attempts SET state = 'running', provider = ?, model_id = ?, thinking_level = ?, applied_provider = ?, applied_model_id = ?, applied_thinking_level = ?, worker_pid = ?, worker_pgid = ?, worker_start_identity = ?, worker_boot_id = ? WHERE id = ? AND state = 'starting'",
-        )
-        .run(
-          model.provider,
-          model.id,
-          thinkingLevel,
-          model.provider,
-          model.id,
-          thinkingLevel,
-          workerPid,
-          workerPgid,
-          active.workerMetadata?.workerStartIdentity ?? null,
-          this.bootId ?? active.workerMetadata?.workerBootId ?? null,
-          attemptId,
-        );
+      this.#acceptAttemptRun(active, {
+        provider: model.provider,
+        modelId: model.id,
+        thinkingLevel,
+        workerPid,
+        workerPgid,
+      });
       // Constructor callbacks are attached by the production Fresh Executor.
       // Its event history covers the prompt response and agent_settled event
       // when both arrive before this startup promise resumes.
@@ -849,7 +1172,7 @@ export class RuntimeStore {
   }
 
   handleWorkerEvent(active, event) {
-    if (this.active !== active || active.finalizing) return;
+    if (this.active !== active || active.finalizing || active.runSettled) return;
     if (!active.worker) {
       active.pendingEvents.push(event);
       return;
@@ -874,7 +1197,12 @@ export class RuntimeStore {
   }
 
   handleWorkerClose(active, details) {
-    if (this.active !== active || active.finalizing || active.stopRequested)
+    if (
+      this.active !== active ||
+      active.finalizing ||
+      active.runSettled ||
+      active.stopRequested
+    )
       return;
     if (!active.worker) {
       active.pendingClose = details;
@@ -889,11 +1217,70 @@ export class RuntimeStore {
     });
   }
 
+  async settleInitialRun(active, outcome) {
+    if (
+      this.active !== active ||
+      active.finalizing ||
+      active.stopRequested ||
+      !active.rpcCoherent ||
+      !active.runAccepted ||
+      active.runSettled
+    )
+      return false;
+    try {
+      assertTaskWorktreeIdentity(this.getTask(active.taskId));
+    } catch (error) {
+      await this.settle(active, {
+        success: false,
+        result: outcome?.result,
+        detail: `Task Git finalization failed: ${commandError(error)}`,
+        checkpoint: false,
+      });
+      return false;
+    }
+    const timestamp = now();
+    const settledOutcome = bounded(outcome?.result, MAX_TASK_RESULT_LENGTH);
+    this.db.exec("BEGIN");
+    try {
+      const result = this.db
+        .prepare(`UPDATE attempt_runs SET state = 'settled', settled_outcome = ?,
+          settled_at = ? WHERE attempt_id = ? AND sequence = ? AND state = 'accepted'
+          AND control_version = ? AND contract_version = ?
+          AND EXISTS (
+            SELECT 1 FROM attempts AS a JOIN tasks AS t ON t.id = a.task_id
+            WHERE a.id = attempt_runs.attempt_id AND a.id = ?
+              AND a.state = 'running' AND t.latest_attempt_id = a.id
+              AND t.state IN ('accepted', 'running')
+              AND t.control_version = ? AND t.contract_version = ?
+          )`)
+        .run(
+          settledOutcome,
+          timestamp,
+          active.attemptId,
+          active.runSequence,
+          active.controlVersion,
+          active.contractVersion,
+          active.attemptId,
+          active.controlVersion,
+          active.contractVersion,
+        );
+      this.db.exec("COMMIT");
+      active.runSettled = result.changes === 1;
+      return active.runSettled;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+  }
+
   async finishSettled(active) {
     if (
       this.active !== active ||
       active.finalizing ||
       active.stopRequested ||
+      active.runSettled ||
       !active.rpcCoherent ||
       !active.settled ||
       !active.finalAssistant
@@ -913,12 +1300,7 @@ export class RuntimeStore {
       });
       return;
     }
-    await this.settle(active, {
-      success: true,
-      result: outcome.result,
-      detail: "Fresh Executor settled successfully.",
-      checkpoint: true,
-    });
+    await this.settleInitialRun(active, outcome);
   }
 
   async retireWorker(worker, metadata) {
@@ -1020,11 +1402,14 @@ export class RuntimeStore {
     }
 
     const timestamp = now();
+    let runState = "ambiguous";
+    if (retired) runState = active.runAccepted ? "settled" : "aborted";
     this.db.exec("BEGIN");
     try {
       this.db
         .prepare(
-          `UPDATE tasks SET state = ?, updated_at = ?, final_result = ?, terminal_detail = ?, final_branch_head = ? WHERE id = ?`,
+          `UPDATE tasks SET state = ?, updated_at = ?, final_result = ?, terminal_detail = ?,
+          final_branch_head = ?, final_revision = ?, terminal_reason = ? WHERE id = ?`,
         )
         .run(
           terminalState,
@@ -1032,6 +1417,8 @@ export class RuntimeStore {
           finalResult,
           finalDetail,
           finalBranchHead,
+          finalBranchHead,
+          finalDetail,
           active.taskId,
         );
       this.db
@@ -1046,6 +1433,17 @@ export class RuntimeStore {
           finalDetail,
           finalBranchHead,
           active.attemptId,
+        );
+      this.db
+        .prepare(`UPDATE attempt_runs SET state = ?, settled_outcome = COALESCE(settled_outcome, ?),
+          settled_at = COALESCE(settled_at, ?) WHERE attempt_id = ? AND sequence = ?
+          AND state IN ('pending', 'accepted')`)
+        .run(
+          runState,
+          finalResult,
+          timestamp,
+          active.attemptId,
+          active.runSequence,
         );
       this.db.exec("COMMIT");
     } catch (error) {
@@ -1076,9 +1474,13 @@ export class RuntimeStore {
         .run(timestamp, boundedDetail(detail), attemptId);
       this.db
         .prepare(
-          "UPDATE tasks SET state = 'blocked', updated_at = ?, terminal_detail = ? WHERE id = ? AND state IN ('accepted', 'running', 'failed', 'stopped', 'interrupted')",
+          "UPDATE tasks SET state = 'blocked', updated_at = ?, terminal_detail = ?, terminal_reason = ? WHERE id = ? AND state IN ('accepted', 'running', 'failed', 'stopped', 'interrupted')",
         )
-        .run(timestamp, boundedDetail(detail), taskId);
+        .run(timestamp, boundedDetail(detail), boundedDetail(detail), taskId);
+      this.db
+        .prepare(`UPDATE attempt_runs SET state = 'ambiguous', settled_outcome = COALESCE(settled_outcome, ?),
+          settled_at = COALESCE(settled_at, ?) WHERE attempt_id = ? AND state IN ('pending', 'accepted')`)
+        .run(boundedDetail(detail), timestamp, attemptId);
       this.db.exec("COMMIT");
     } catch (error) {
       try {
@@ -1132,12 +1534,21 @@ export class RuntimeStore {
         );
       this.db
         .prepare(
-          "UPDATE tasks SET state = 'stopped', terminal_detail = ?, updated_at = ? WHERE id = ? AND state IN ('accepted', 'running')",
+          "UPDATE tasks SET state = 'stopped', terminal_detail = ?, terminal_reason = ?, updated_at = ? WHERE id = ? AND state IN ('accepted', 'running')",
         )
         .run(
           "The Task was intentionally stopped by the user.",
+          "user_stopped",
           timestamp,
           task.id,
+        );
+      this.db
+        .prepare(`UPDATE attempt_runs SET state = 'aborted', settled_outcome = COALESCE(settled_outcome, ?),
+          settled_at = COALESCE(settled_at, ?) WHERE attempt_id = ? AND state IN ('pending', 'accepted')`)
+        .run(
+          "The Task was intentionally stopped by the user.",
+          timestamp,
+          attempt.id,
         );
       this.db.exec("COMMIT");
     } catch (error) {
@@ -1213,6 +1624,26 @@ export class RuntimeStore {
       );
     const attemptId = randomUUID();
     const number = prior.number + 1;
+    const retryTask = {
+      id: task.id,
+      sourceRepoRoot: task.sourceRepoRoot,
+      baseCommit: task.baseCommit,
+      taskBranch: task.taskBranch,
+      taskWorktree: task.taskWorktree,
+      goal: task.goal,
+      contractVersion: task.contractVersion ?? COMMITMENT_CONTRACT_VERSION,
+      controlVersion: task.controlVersion ?? COMMITMENT_CONTROL_VERSION,
+    };
+    const retryPacket = buildTaskPacket({
+      taskId: retryTask.id,
+      attemptNumber: number,
+      goal: retryTask.goal,
+      taskBranch: retryTask.taskBranch,
+      taskWorktree: retryTask.taskWorktree,
+      baseCommit: retryTask.baseCommit,
+      priorState: prior.state,
+      priorDetail: prior.terminalDetail,
+    });
     const timestamp = now();
     try {
       this.db.exec("BEGIN");
@@ -1222,8 +1653,24 @@ export class RuntimeStore {
         )
         .run(attemptId, task.id, number, timestamp);
       this.db
+        .prepare(`INSERT INTO attempt_runs (
+          attempt_id, sequence, kind, control_version, contract_version,
+          prompt_digest, state, evidence_refs, started_at
+        ) VALUES (?, ?, 'initial', ?, ?, ?, 'pending', '[]', ?)`)
+        .run(
+          attemptId,
+          INITIAL_ATTEMPT_RUN_SEQUENCE,
+          retryTask.controlVersion,
+          retryTask.contractVersion,
+          promptDigest(retryPacket),
+          timestamp,
+        );
+      this.db
         .prepare(
-          "UPDATE tasks SET state = 'accepted', latest_attempt_id = ?, terminal_detail = NULL, updated_at = ? WHERE id = ? AND state IN ('failed', 'stopped', 'interrupted')",
+          `UPDATE tasks SET state = 'accepted', latest_attempt_id = ?, terminal_detail = NULL,
+          final_result = NULL, final_branch_head = NULL, final_revision = NULL,
+          completion_evidence_ref = NULL, terminal_reason = NULL, updated_at = ?
+          WHERE id = ? AND state IN ('failed', 'stopped', 'interrupted')`,
         )
         .run(attemptId, timestamp, task.id);
       this.db.exec("COMMIT");
@@ -1233,20 +1680,13 @@ export class RuntimeStore {
       } catch {}
       throw error;
     }
-    const retryTask = {
-      id: task.id,
-      sourceRepoRoot: task.sourceRepoRoot,
-      baseCommit: task.baseCommit,
-      taskBranch: task.taskBranch,
-      taskWorktree: task.taskWorktree,
-      goal: task.goal,
-    };
     return this.launchAttempt({
       task: retryTask,
       attemptId,
       number,
       model,
       thinkingLevel,
+      packet: retryPacket,
       priorState: prior.state,
       priorDetail: prior.terminalDetail,
     });
