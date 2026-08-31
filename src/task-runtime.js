@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { acquireDatabaseLock } from "./database-lock.js";
 import { checkPiCompatibility, spawnFreshExecutor } from "./pi.js";
+import { processGroupIdentity, processGroupStatus, processStartIdentity, readLinuxBootId } from "./process.js";
 
 export const TASK_RUNTIME_OWNERSHIP_ERROR = "The pi-sand Task Runtime is already owned by another Pi process.";
 export const FRESH_EXECUTOR_UNSUPPORTED_ERROR = "Fresh Executor Tasks are supported only on Linux.";
@@ -13,10 +14,15 @@ export const TASK_RUNTIME_DB_ENV = "PI_SAND_RUNTIME_DB";
 export const MAX_TASK_GOAL_LENGTH = 4_000;
 
 const ACTIVE_STATES = "('starting', 'running')";
+const RECONCILABLE_STATES = "('starting', 'running', 'orphaned')";
+const WORKER_STOP_TIMEOUT_MS = 2_000;
+const RESTART_DETAIL = "The Task Runtime restarted before the Fresh Executor finished. The Attempt was not resumed or replayed.";
+const ORPHAN_DETAIL = "The prior Fresh Executor could not be safely identified or terminated. The Task is blocked and its worktree was retained.";
 const now = () => new Date().toISOString();
 const errorText = (error) => String(error?.stderr || error?.message || "command failed").trim();
 function git(cwd, args) { return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim(); }
 function canonical(path) { return realpathSync.native(resolve(path)); }
+function sleepSync(milliseconds) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds); }
 
 export function defaultTaskRuntimeDatabasePath() {
   return join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "pi-sand", "task-runtime.sqlite");
@@ -56,13 +62,16 @@ function attemptView(row) {
   return {
     id: row.id, taskId: row.taskId, number: row.number, provider: row.provider, modelId: row.modelId,
     thinkingLevel: row.thinkingLevel, state: row.state, startedAt: row.startedAt, finishedAt: row.finishedAt ?? null,
-    workerPid: row.workerPid ?? null, workerPgid: row.workerPgid ?? null,
+    terminalDetail: row.terminalDetail ?? null, workerPid: row.workerPid ?? null, workerPgid: row.workerPgid ?? null,
+    workerStartIdentity: row.workerStartIdentity ?? null, workerBootId: row.workerBootId ?? null,
   };
 }
 
 export class TaskRuntime {
-  constructor({ dbPath = process.env[TASK_RUNTIME_DB_ENV] ?? defaultTaskRuntimeDatabasePath(), piCommand = process.env.PI_BIN ?? "pi", workerFactory = spawnFreshExecutor, workerEnv, worktreeRoot } = {}) {
+  constructor({ dbPath = process.env[TASK_RUNTIME_DB_ENV] ?? defaultTaskRuntimeDatabasePath(), piCommand = process.env.PI_BIN ?? "pi", workerFactory = spawnFreshExecutor, workerEnv, worktreeRoot, bootId, workerStopTimeoutMs = WORKER_STOP_TIMEOUT_MS } = {}) {
     this.dbPath = dbPath; this.piCommand = piCommand; this.workerFactory = workerFactory; this.workerEnv = workerEnv; this.worktreeRoot = worktreeRoot;
+    this.bootId = bootId === undefined ? readLinuxBootId() : (typeof bootId === "string" && bootId.trim() ? bootId.trim() : null);
+    this.workerStopTimeoutMs = Math.max(0, Number(workerStopTimeoutMs) || 0);
     this.db = null; this.lock = null; this.active = null; this.closed = false;
   }
 
@@ -81,18 +90,21 @@ export class TaskRuntime {
         CREATE TABLE IF NOT EXISTS tasks (
           id TEXT PRIMARY KEY, source_repo_root TEXT NOT NULL, base_commit TEXT NOT NULL,
           task_branch TEXT NOT NULL UNIQUE, task_worktree TEXT NOT NULL UNIQUE, goal TEXT NOT NULL,
-          state TEXT NOT NULL CHECK(state IN ('accepted','running')), latest_attempt_id TEXT,
+          state TEXT NOT NULL CHECK(state IN ('accepted','running','interrupted','blocked')), latest_attempt_id TEXT,
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS attempts (
           id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), number INTEGER NOT NULL,
           provider TEXT NOT NULL, model_id TEXT NOT NULL, thinking_level TEXT NOT NULL,
-          state TEXT NOT NULL CHECK(state IN ('starting','running')), started_at TEXT NOT NULL,
-          finished_at TEXT, worker_pid INTEGER, worker_pgid INTEGER, UNIQUE(task_id, number)
+          state TEXT NOT NULL CHECK(state IN ('starting','running','completed','failed','stopped','interrupted','orphaned')), started_at TEXT NOT NULL,
+          finished_at TEXT, terminal_detail TEXT, worker_pid INTEGER, worker_pgid INTEGER,
+          worker_start_identity TEXT, worker_boot_id TEXT, UNIQUE(task_id, number)
         );
         CREATE INDEX IF NOT EXISTS tasks_created ON tasks(created_at, id);
         CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id, number);
       `);
+      this.migrateTaskRuntimeSchema();
+      this.reconcilePriorAttempts();
       return this.db;
     } catch (error) {
       try { this.db?.close(); } catch {}
@@ -104,13 +116,153 @@ export class TaskRuntime {
     }
   }
 
+  migrateTaskRuntimeSchema() {
+    const taskSql = this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'").get()?.sql ?? "";
+    const attemptSql = this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'attempts'").get()?.sql ?? "";
+    const attemptColumns = new Set(this.db.prepare("PRAGMA table_info(attempts)").all().map((column) => column.name));
+    const needsMigration = !taskSql.includes("'blocked'") || !attemptSql.includes("'orphaned'")
+      || !attemptColumns.has("terminal_detail") || !attemptColumns.has("worker_start_identity") || !attemptColumns.has("worker_boot_id");
+    if (!needsMigration) return;
+
+    const terminalDetail = attemptColumns.has("terminal_detail") ? "terminal_detail" : "NULL";
+    const workerStartIdentity = attemptColumns.has("worker_start_identity") ? "worker_start_identity" : "NULL";
+    const workerBootId = attemptColumns.has("worker_boot_id") ? "worker_boot_id" : "NULL";
+    this.db.exec("PRAGMA foreign_keys = OFF; BEGIN");
+    try {
+      this.db.exec(`
+        CREATE TABLE tasks_new (
+          id TEXT PRIMARY KEY, source_repo_root TEXT NOT NULL, base_commit TEXT NOT NULL,
+          task_branch TEXT NOT NULL UNIQUE, task_worktree TEXT NOT NULL UNIQUE, goal TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('accepted','running','interrupted','blocked')), latest_attempt_id TEXT,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE attempts_new (
+          id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks_new(id), number INTEGER NOT NULL,
+          provider TEXT NOT NULL, model_id TEXT NOT NULL, thinking_level TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('starting','running','completed','failed','stopped','interrupted','orphaned')), started_at TEXT NOT NULL,
+          finished_at TEXT, terminal_detail TEXT, worker_pid INTEGER, worker_pgid INTEGER,
+          worker_start_identity TEXT, worker_boot_id TEXT, UNIQUE(task_id, number)
+        );
+        INSERT INTO tasks_new SELECT id, source_repo_root, base_commit, task_branch, task_worktree, goal, state, latest_attempt_id, created_at, updated_at FROM tasks;
+        INSERT INTO attempts_new (id, task_id, number, provider, model_id, thinking_level, state, started_at, finished_at, terminal_detail, worker_pid, worker_pgid, worker_start_identity, worker_boot_id)
+          SELECT id, task_id, number, provider, model_id, thinking_level, state, started_at, finished_at, ${terminalDetail}, worker_pid, worker_pgid, ${workerStartIdentity}, ${workerBootId} FROM attempts;
+        DROP TABLE attempts;
+        DROP TABLE tasks;
+        ALTER TABLE tasks_new RENAME TO tasks;
+        ALTER TABLE attempts_new RENAME TO attempts;
+        CREATE INDEX IF NOT EXISTS tasks_created ON tasks(created_at, id);
+        CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id, number);
+        COMMIT;
+      `);
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    } finally {
+      this.db.exec("PRAGMA foreign_keys = ON");
+    }
+  }
+
+  workerBootBoundaryProvesGone(attempt) {
+    return Boolean(attempt.workerBootId && this.bootId && attempt.workerBootId !== this.bootId);
+  }
+
+  workerOwnershipIsProven(attempt) {
+    if (!Number.isInteger(attempt.workerPid) || !Number.isInteger(attempt.workerPgid) || !attempt.workerStartIdentity) return false;
+    return processStartIdentity(attempt.workerPid) === attempt.workerStartIdentity
+      && processGroupIdentity(attempt.workerPid) === attempt.workerPgid;
+  }
+
+  signalWorkerGroup(attempt, signal) {
+    if (!this.workerOwnershipIsProven(attempt)) return false;
+    try {
+      process.kill(-attempt.workerPgid, signal);
+      return true;
+    } catch (error) {
+      return error.code === "ESRCH" && processGroupStatus(attempt.workerPgid) === "gone";
+    }
+  }
+
+  stopRecordedProcessGroup(attempt) {
+    if (!this.workerOwnershipIsProven(attempt)) return false;
+    if (processGroupStatus(attempt.workerPgid) === "gone") return true;
+    if (processGroupStatus(attempt.workerPgid) !== "alive") return false;
+    if (!this.signalWorkerGroup(attempt, "SIGTERM")) return false;
+    const termDeadline = Date.now() + this.workerStopTimeoutMs;
+    while (Date.now() <= termDeadline) {
+      const status = processGroupStatus(attempt.workerPgid);
+      if (status === "gone") return true;
+      if (status === "unknown") return false;
+      sleepSync(25);
+    }
+    if (!this.signalWorkerGroup(attempt, "SIGKILL")) return false;
+    const killDeadline = Date.now() + this.workerStopTimeoutMs;
+    while (Date.now() <= killDeadline) {
+      const status = processGroupStatus(attempt.workerPgid);
+      if (status === "gone") return true;
+      if (status === "unknown") return false;
+      sleepSync(25);
+    }
+    return processGroupStatus(attempt.workerPgid) === "gone";
+  }
+
+  finishReconciledAttempt(attempt, state, terminalDetail) {
+    const timestamp = now();
+    this.db.exec("BEGIN");
+    try {
+      this.db.prepare(`UPDATE attempts SET state = ?, finished_at = COALESCE(finished_at, ?), terminal_detail = COALESCE(terminal_detail, ?) WHERE id = ? AND state IN ${RECONCILABLE_STATES}`).run(state, timestamp, terminalDetail, attempt.id);
+      this.db.prepare(`
+        UPDATE tasks SET state = CASE WHEN EXISTS (
+          SELECT 1 FROM attempts WHERE task_id = tasks.id AND state = 'orphaned'
+        ) THEN 'blocked' ELSE ? END, updated_at = ? WHERE id = ?
+      `).run(state === "orphaned" ? "blocked" : "interrupted", timestamp, attempt.taskId);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+
+  reconcileAttempt(attempt) {
+    // A changed boot id is the strongest proof available: never signal a
+    // numeric PID/PGID that may have been reused after reboot.
+    if (this.workerBootBoundaryProvesGone(attempt)) {
+      this.finishReconciledAttempt(attempt, "interrupted", RESTART_DETAIL);
+      return;
+    }
+
+    const groupStatus = processGroupStatus(attempt.workerPgid);
+    if (groupStatus === "gone") {
+      this.finishReconciledAttempt(attempt, "interrupted", RESTART_DETAIL);
+      return;
+    }
+    if (groupStatus !== "alive" || !this.bootId || !attempt.workerBootId || !this.workerOwnershipIsProven(attempt)) {
+      this.finishReconciledAttempt(attempt, "orphaned", ORPHAN_DETAIL);
+      return;
+    }
+    const stopped = this.stopRecordedProcessGroup(attempt);
+    this.finishReconciledAttempt(attempt, stopped ? "interrupted" : "orphaned", stopped ? RESTART_DETAIL : ORPHAN_DETAIL);
+  }
+
+  reconcilePriorAttempts() {
+    const attempts = this.db.prepare(`
+      SELECT id, task_id AS taskId, state, worker_pid AS workerPid, worker_pgid AS workerPgid,
+             worker_start_identity AS workerStartIdentity, worker_boot_id AS workerBootId
+      FROM attempts WHERE state IN ${RECONCILABLE_STATES} ORDER BY started_at, id
+    `).all();
+    for (const attempt of attempts) this.reconcileAttempt(attempt);
+  }
+
+  hasUnresolvedOrphan() {
+    return Boolean(this.db.prepare("SELECT 1 FROM attempts WHERE state = 'orphaned' LIMIT 1").get());
+  }
+
   taskRow(id) {
     return this.db.prepare(`SELECT id, source_repo_root AS sourceRepoRoot, base_commit AS baseCommit, task_branch AS taskBranch, task_worktree AS taskWorktree, goal, state, latest_attempt_id AS latestAttemptId, created_at AS createdAt, updated_at AS updatedAt FROM tasks WHERE id = ?`).get(id);
   }
 
   taskWithAttempts(row) {
     if (!row) return null;
-    const attempts = this.db.prepare(`SELECT id, task_id AS taskId, number, provider, model_id AS modelId, thinking_level AS thinkingLevel, state, started_at AS startedAt, finished_at AS finishedAt, worker_pid AS workerPid, worker_pgid AS workerPgid FROM attempts WHERE task_id = ? ORDER BY number`).all(row.id).map(attemptView);
+    const attempts = this.db.prepare(`SELECT id, task_id AS taskId, number, provider, model_id AS modelId, thinking_level AS thinkingLevel, state, started_at AS startedAt, finished_at AS finishedAt, terminal_detail AS terminalDetail, worker_pid AS workerPid, worker_pgid AS workerPgid, worker_start_identity AS workerStartIdentity, worker_boot_id AS workerBootId FROM attempts WHERE task_id = ? ORDER BY number`).all(row.id).map(attemptView);
     return { ...row, attempts };
   }
 
@@ -146,6 +298,7 @@ export class TaskRuntime {
     if (!compatibility.compatible || compatibility.version !== "0.84.4") throw new Error("/task requires an installed Pi 0.84.4 executable.");
     const db = this.ensureOwner();
     if (this.active || db.prepare(`SELECT id FROM attempts WHERE state IN ${ACTIVE_STATES} LIMIT 1`).get()) throw new Error("A Fresh Executor is already active; v0.3 does not queue Tasks.");
+    if (this.hasUnresolvedOrphan()) throw new Error("A prior Fresh Executor is unresolved; v0.3 cannot prove global executor capacity is free.");
     const taskId = randomUUID();
     const { taskBranch, taskWorktree } = this.createWorktree(preflight.sourceRepoRoot, preflight.baseCommit, taskId);
     const attemptId = randomUUID(); const timestamp = now();
@@ -153,7 +306,7 @@ export class TaskRuntime {
     try {
       db.exec("BEGIN");
       db.prepare(`INSERT INTO tasks (id,source_repo_root,base_commit,task_branch,task_worktree,goal,state,latest_attempt_id,created_at,updated_at) VALUES (?,?,?,?,?,?, 'accepted',?,?,?)`).run(taskId, preflight.sourceRepoRoot, preflight.baseCommit, taskBranch, taskWorktree, goal.trim(), attemptId, timestamp, timestamp);
-      db.prepare(`INSERT INTO attempts (id,task_id,number,provider,model_id,thinking_level,state,started_at) VALUES (?,?,1,?,?,?,'starting',?)`).run(attemptId, taskId, model.provider, model.id, thinkingLevel, timestamp);
+      db.prepare(`INSERT INTO attempts (id,task_id,number,provider,model_id,thinking_level,state,started_at,worker_boot_id) VALUES (?,?,1,?,?,?,'starting',?,?)`).run(attemptId, taskId, model.provider, model.id, thinkingLevel, timestamp, this.bootId);
       db.exec("COMMIT");
     } catch (error) {
       try { db.exec("ROLLBACK"); } catch {}
@@ -162,8 +315,18 @@ export class TaskRuntime {
     }
     try {
       const worker = this.workerFactory({ cwd: taskWorktree, command: this.piCommand, env: this.workerEnv, provider: model.provider, modelId: model.id, thinkingLevel, onEvent: () => {}, onClose: () => {} });
-      db.prepare("UPDATE tasks SET state='running',updated_at=? WHERE id=?").run(now(), taskId);
-      db.prepare("UPDATE attempts SET state='running',worker_pid=?,worker_pgid=? WHERE id=?").run(Number.isInteger(worker?.pid) ? worker.pid : null, Number.isInteger(worker?.processGroupId) ? worker.processGroupId : null, attemptId);
+      const workerPid = Number.isInteger(worker?.pid) ? worker.pid : null;
+      const workerPgid = Number.isInteger(worker?.processGroupId) ? worker.processGroupId : null;
+      const workerStart = processStartIdentity(workerPid);
+      db.exec("BEGIN");
+      try {
+        db.prepare("UPDATE tasks SET state='running',updated_at=? WHERE id=?").run(now(), taskId);
+        db.prepare("UPDATE attempts SET state='running',worker_pid=?,worker_pgid=?,worker_start_identity=?,worker_boot_id=? WHERE id=?").run(workerPid, workerPgid, workerStart, this.bootId, attemptId);
+        db.exec("COMMIT");
+      } catch (metadataError) {
+        try { db.exec("ROLLBACK"); } catch {}
+        throw metadataError;
+      }
       this.active = { taskId, attemptId, worker, packet };
       worker.setModel?.({ provider: model.provider, modelId: model.id });
       worker.setThinkingLevel?.(thinkingLevel);

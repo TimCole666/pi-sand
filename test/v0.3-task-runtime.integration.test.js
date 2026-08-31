@@ -76,6 +76,9 @@ test("Extension /task persists an isolated Task and sends one bounded fresh-work
     assert.deepEqual(JSON.parse(await readFile(fake.args, "utf8")), ["--mode", "rpc", "--no-session", "--approve", "--no-extensions"]);
     const listed = await harness.commands.get("tasks").handler("", ctx);
     assert.equal(listed.tasks[0].id, result.task.id);
+    const shown = await harness.commands.get("task-show").handler(result.task.id, ctx);
+    assert.equal(shown.ok, true);
+    assert.equal(shown.task.taskWorktree, result.task.taskWorktree);
     const second = await harness.commands.get("task").handler("second", ctx);
     assert.equal(second.ok, false);
     assert.match(second.error, /already active/);

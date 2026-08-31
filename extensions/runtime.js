@@ -33,6 +33,22 @@ async function tasksCommand(taskRuntime, _args, ctx) {
   }
 }
 
+async function taskShowCommand(taskRuntime, args, ctx) {
+  try {
+    const id = typeof args === "string" ? args.trim() : "";
+    if (!id) throw new Error("/task-show requires a Task id");
+    const task = taskRuntime.getTask(id);
+    if (!task) throw new Error("Task not found");
+    const result = { ok: true, task };
+    ctx.ui.notify(JSON.stringify(result), "info");
+    return result;
+  } catch (error) {
+    const result = { ok: false, error: error.message };
+    ctx.ui.notify(JSON.stringify(result), "error");
+    return result;
+  }
+}
+
 function getSessionId(ctx) {
   return ctx.sessionManager.getSessionId();
 }
@@ -173,6 +189,11 @@ export function registerPiSandExtension(pi, { taskRuntimeFactory = () => new Tas
   pi.registerCommand("tasks", {
     description: "List durable background Tasks",
     handler: async (args, ctx) => tasksCommand(taskRuntime, args, ctx),
+  });
+
+  pi.registerCommand("task-show", {
+    description: "Show one durable background Task and its Attempts",
+    handler: async (args, ctx) => taskShowCommand(taskRuntime, args, ctx),
   });
 
   pi.registerCommand("pi-sand", {
