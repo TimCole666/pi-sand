@@ -83,6 +83,70 @@ function gitOutput(cwd, args) {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 }
 
+test("one deterministic Task journey settles, checkpoints, and leaves the Manager worktree unchanged", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-journey-"));
+  const source = await repository(parent);
+  const fake = await fakePi(parent);
+  const baseCommit = gitOutput(source, ["rev-parse", "HEAD"]);
+  let release;
+  let packet;
+  const runtime = new TaskRuntime({
+    dbPath: join(parent, "task-runtime.sqlite"),
+    piCommand: fake.command,
+    workerFactory: ({ cwd, onEvent }) => ({
+      prompt({ message }) {
+        packet = message;
+        onEvent({ type: "agent_end" });
+        release = () => {
+          writeFileSync(join(cwd, "journey.txt"), "completed journey\n");
+          onEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Journey completed." }], stopReason: "stop" } });
+          onEvent({ type: "agent_settled" });
+        };
+      },
+      close() {},
+    }),
+    worktreeRoot: join(parent, "worktrees"),
+  });
+  const harness = createExtensionHarness({ cwd: () => source });
+  registerPiSandExtension(harness.pi, { taskRuntimeFactory: () => runtime });
+  const ctx = { ...harness.context("manager"), cwd: source, model: { provider: "provider", id: "model" }, thinkingLevel: "high", isProjectTrusted: () => true };
+  try {
+    const started = await harness.commands.get("task").handler("Complete the deterministic journey", ctx);
+    assert.equal(started.ok, true, JSON.stringify(started));
+    assert.equal(started.task.state, "running");
+    assert.equal(started.task.baseCommit, baseCommit);
+    assert.notEqual(started.task.taskWorktree, source);
+    assert.match(started.task.taskBranch, /^pi-sand\/task-/);
+    assert.equal(started.task.attempts.length, 1);
+    assert.equal(started.task.attempts[0].state, "running");
+    assert.match(packet, new RegExp(started.task.id));
+    assert.match(packet, /Attempt: 1/);
+    assert.match(packet, /Goal: Complete the deterministic journey/);
+    assert.match(packet, /Task worktree:/);
+    assert.match(packet, /Base commit:/);
+    assert.doesNotMatch(packet, /Manager transcript|prior conversation|previous worker/);
+    assert.equal(gitOutput(source, ["rev-parse", "HEAD"]), baseCommit);
+    assert.equal(gitOutput(source, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+
+    release();
+    const completed = runtime.getTask(started.task.id);
+    assert.equal(completed.state, "completed");
+    assert.equal(completed.finalResult, "Journey completed.");
+    assert.equal(completed.attempts[0].state, "completed");
+    assert.equal(completed.attempts[0].finalBranchHead, completed.finalBranchHead);
+    assert.notEqual(completed.finalBranchHead, baseCommit);
+    assert.equal(await readFile(join(completed.taskWorktree, "journey.txt"), "utf8"), "completed journey\n");
+    assert.equal(gitOutput(completed.taskWorktree, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+    assert.match(gitOutput(completed.taskWorktree, ["log", "-1", "--format=%s"]), new RegExp(`^pi-sand: checkpoint completed Task ${started.task.id}$`));
+    assert.equal(gitOutput(source, ["rev-parse", "HEAD"]), baseCommit);
+    assert.equal(gitOutput(source, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+    assert.equal((await harness.commands.get("task-show").handler(started.task.id, ctx)).task.finalResult, "Journey completed.");
+  } finally {
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
 test("Extension /task persists an isolated Task and sends one bounded fresh-worker packet", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-"));
   const source = await repository(parent);
