@@ -17,13 +17,25 @@ function procStatFields(pid) {
   const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
   const closingParen = stat.lastIndexOf(")");
   if (closingParen < 0) return null;
-  return stat.slice(closingParen + 2).trim().split(/\s+/);
+  return stat
+    .slice(closingParen + 2)
+    .trim()
+    .split(/\s+/);
 }
 
 export function readProcessStartIdentity(pid) {
   if (process.platform !== "linux") return null;
   try {
     return procStatFields(pid)?.[19] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export function readProcessState(pid) {
+  if (process.platform !== "linux") return null;
+  try {
+    return procStatFields(pid)?.[0] ?? null;
   } catch {
     return null;
   }
@@ -51,7 +63,12 @@ export function readProcessIdentity(pid) {
     const fields = procStatFields(numericPid);
     const processGroupId = Number(fields?.[2]);
     const processStartIdentity = fields?.[19] ?? null;
-    if (!Number.isInteger(processGroupId) || processGroupId <= 0 || !processStartIdentity) return null;
+    if (
+      !Number.isInteger(processGroupId) ||
+      processGroupId <= 0 ||
+      !processStartIdentity
+    )
+      return null;
     const bootId = readLinuxBootId();
     return { pid: numericPid, processGroupId, processStartIdentity, bootId };
   } catch {
@@ -72,7 +89,6 @@ function processGroupMemberStatus(processGroupId) {
   }
 
   let uncertain = false;
-  let foundMember = false;
   for (const entry of entries) {
     if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
     let fields;
@@ -84,20 +100,24 @@ function processGroupMemberStatus(processGroupId) {
       if (error.code !== "ENOENT") uncertain = true;
       continue;
     }
-    if (!fields || Number(fields[2]) !== processGroupId) continue;
-    foundMember = true;
+    if (!fields) {
+      uncertain = true;
+      continue;
+    }
+    if (Number(fields[2]) !== processGroupId) continue;
     if (fields[0] !== "Z") return "alive";
   }
   if (uncertain) return "unknown";
   // A zombie-only group, and a group whose members disappeared during the
   // scan, cannot execute work. kill(..., 0) is not sufficient to distinguish
   // that case, so both are treated as gone.
-  return foundMember ? "gone" : "gone";
+  return "gone";
 }
 
 /** Return a zombie-aware liveness state for one process group. */
 export function processGroupStatus(processGroupId) {
-  if (!Number.isInteger(processGroupId) || processGroupId <= 0) return "unknown";
+  if (!Number.isInteger(processGroupId) || processGroupId <= 0)
+    return "unknown";
   try {
     process.kill(-processGroupId, 0);
   } catch (error) {
@@ -113,7 +133,10 @@ export function processGroupIsAlive(processGroupId) {
 }
 
 export function recordedWorkerIsGone(worker) {
-  return Number.isInteger(worker?.workerPgid) && processGroupStatus(worker.workerPgid) === "gone";
+  return (
+    Number.isInteger(worker?.workerPgid) &&
+    processGroupStatus(worker.workerPgid) === "gone"
+  );
 }
 
 export function processIsAlive(pid) {
@@ -129,7 +152,13 @@ export function processIsAlive(pid) {
 export function workerProcessMetadata(worker) {
   const pid = Number(worker?.pid);
   const processGroupId = Number(worker?.processGroupId ?? worker?.pid);
-  if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(processGroupId) || processGroupId <= 0) return null;
+  if (
+    !Number.isInteger(pid) ||
+    pid <= 0 ||
+    !Number.isInteger(processGroupId) ||
+    processGroupId <= 0
+  )
+    return null;
   const identity = readProcessIdentity(pid);
   if (!identity || identity.processGroupId !== processGroupId) return null;
   return {
@@ -142,10 +171,12 @@ export function workerProcessMetadata(worker) {
 
 function ownershipIsProven(worker, currentBootId = readLinuxBootId()) {
   const identity = readProcessIdentity(worker?.workerPid);
-  return Boolean(identity && currentBootId && worker?.workerBootId)
-    && identity.processGroupId === worker.workerPgid
-    && identity.processStartIdentity === worker.workerStartIdentity
-    && worker.workerBootId === currentBootId;
+  return (
+    Boolean(identity && currentBootId && worker?.workerBootId) &&
+    identity.processGroupId === worker.workerPgid &&
+    identity.processStartIdentity === worker.workerStartIdentity &&
+    worker.workerBootId === currentBootId
+  );
 }
 
 export const recordedWorkerIsOwned = ownershipIsProven;
@@ -156,7 +187,8 @@ function signalOwnedGroup(worker, signal, currentBootId) {
     process.kill(-worker.workerPgid, signal);
     return true;
   } catch (error) {
-    if (error.code === "ESRCH") return processGroupStatus(worker.workerPgid) === "gone";
+    if (error.code === "ESRCH")
+      return processGroupStatus(worker.workerPgid) === "gone";
     return false;
   }
 }
@@ -175,11 +207,22 @@ function waitForGroupGoneSync(processGroupId, timeoutMs) {
  * remains proven. A false result is deliberately unsafe: callers must retain
  * the worktree and keep global capacity blocked.
  */
-export function stopOwnedProcessGroupSync(worker, { timeoutMs = WORKER_STOP_TIMEOUT_MS, currentBootId = readLinuxBootId() } = {}) {
-  if (!Number.isInteger(worker?.workerPid) || !Number.isInteger(worker?.workerPgid)) return false;
+export function stopOwnedProcessGroupSync(
+  worker,
+  {
+    timeoutMs = WORKER_STOP_TIMEOUT_MS,
+    currentBootId = readLinuxBootId(),
+  } = {},
+) {
+  if (
+    !Number.isInteger(worker?.workerPid) ||
+    !Number.isInteger(worker?.workerPgid)
+  )
+    return false;
   const initialStatus = processGroupStatus(worker.workerPgid);
   if (initialStatus === "gone") return true;
-  if (initialStatus !== "alive" || !ownershipIsProven(worker, currentBootId)) return false;
+  if (initialStatus !== "alive" || !ownershipIsProven(worker, currentBootId))
+    return false;
   if (!signalOwnedGroup(worker, "SIGTERM", currentBootId)) return false;
   if (waitForGroupGoneSync(worker.workerPgid, timeoutMs)) return true;
   // Never KILL a reused group after the recorded leader identity disappears.

@@ -1,7 +1,19 @@
-import { closeSync, fsyncSync, openSync, readFileSync, realpathSync, unlinkSync, writeSync } from "node:fs";
+import {
+  closeSync,
+  fsyncSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
 import { randomUUID } from "node:crypto";
 import { basename, dirname, resolve } from "node:path";
-import { processIsAlive } from "./process.js";
+import {
+  processIsAlive,
+  readProcessIdentity,
+  readProcessState,
+} from "./process.js";
 
 const LOCK_MODE = 0o600;
 
@@ -17,7 +29,22 @@ function lockOwner(lockPath) {
 function lockError(owner) {
   const pid = owner?.pid;
   const suffix = pid ? ` (process ${pid})` : "";
-  return new Error(`The Local Agent Service is already running for this database${suffix}.`);
+  return new Error(
+    `The Local Agent Service is already running for this database${suffix}.`,
+  );
+}
+
+function lockOwnerStatus(owner) {
+  if (process.platform !== "linux")
+    return processIsAlive(owner.pid) ? "alive" : "stale";
+  if (!owner.processStartIdentity || !owner.bootId) return "unknown";
+  const identity = readProcessIdentity(owner.pid);
+  if (!identity) return processIsAlive(owner.pid) ? "unknown" : "stale";
+  if (readProcessState(owner.pid) === "Z") return "stale";
+  return identity.processStartIdentity === owner.processStartIdentity &&
+    identity.bootId === owner.bootId
+    ? "alive"
+    : "stale";
 }
 
 /**
@@ -44,7 +71,13 @@ export function acquireDatabaseLock(dbPath) {
 
   const lockPath = `${canonicalDatabasePath(dbPath)}.lock`;
   const token = randomUUID();
-  const contents = JSON.stringify({ pid: process.pid, token });
+  const identity = readProcessIdentity(process.pid);
+  const contents = JSON.stringify({
+    pid: process.pid,
+    processStartIdentity: identity?.processStartIdentity ?? null,
+    bootId: identity?.bootId ?? null,
+    token,
+  });
   let descriptor;
 
   for (;;) {
@@ -57,12 +90,16 @@ export function acquireDatabaseLock(dbPath) {
       if (descriptor !== undefined) {
         closeSync(descriptor);
         descriptor = undefined;
-        try { unlinkSync(lockPath); } catch { /* Preserve the original acquisition error. */ }
+        try {
+          unlinkSync(lockPath);
+        } catch {
+          /* Preserve the original acquisition error. */
+        }
       }
       if (error.code !== "EEXIST") throw error;
 
       const owner = lockOwner(lockPath);
-      if (!owner || processIsAlive(owner.pid)) throw lockError(owner);
+      if (!owner || lockOwnerStatus(owner) !== "stale") throw lockError(owner);
       try {
         unlinkSync(lockPath);
       } catch (unlinkError) {
@@ -79,7 +116,8 @@ export function acquireDatabaseLock(dbPath) {
       released = true;
       try {
         const owner = lockOwner(lockPath);
-        if (owner?.token === token && owner.pid === process.pid) unlinkSync(lockPath);
+        if (owner?.token === token && owner.pid === process.pid)
+          unlinkSync(lockPath);
       } finally {
         closeSync(descriptor);
       }

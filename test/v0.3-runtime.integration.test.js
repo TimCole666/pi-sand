@@ -177,8 +177,16 @@ test("autostart does not replay a transmitted mutation after the daemon disconne
       spawnImpl: () => {
         daemonStarts += 1;
         daemonServer = createServer((socket) => socket.once("data", (chunk) => {
-          received.push(JSON.parse(String(chunk).trim()));
-          socket.destroy();
+          const request = JSON.parse(String(chunk).trim());
+          received.push(request);
+          if (request.method === "runtime.status") {
+            socket.end(`${JSON.stringify({
+              id: request.id,
+              version: 1,
+              success: true,
+              data: { protocolVersion: 1, daemonPid: process.pid, state: "ready" },
+            })}\n`);
+          } else socket.destroy();
         }));
         daemonServer.listen(socketPath);
         return {};
@@ -190,12 +198,51 @@ test("autostart does not replay a transmitted mutation after the daemon disconne
         return /outcome is unknown/.test(error.message);
       });
       assert.equal(daemonStarts, 1);
-      assert.equal(received.length, 1, `${method} must not be replayed after transmission`);
-      assert.equal(received[0].method, method);
+      assert.equal(received[0].method, "runtime.status");
+      assert.equal(
+        received.filter((request) => request.method === method).length,
+        1,
+        `${method} must not be replayed after transmission`,
+      );
     } finally {
       await new Promise((resolveServer) => daemonServer?.close(resolveServer));
       await rm(parent, { recursive: true, force: true });
     }
+  }
+});
+
+test("autostart bounds a silent daemon within the startup deadline", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-silent-daemon-"));
+  const env = environment(parent);
+  const socketPath = runtimeSocketPath({ env });
+  let daemonServer;
+  const sockets = new Set();
+  const client = new RuntimeClient({
+    env,
+    startTimeoutMs: 100,
+    requestTimeoutMs: 1_000,
+    spawnImpl: () => {
+      daemonServer = createServer((socket) => {
+        sockets.add(socket);
+        socket.once("close", () => sockets.delete(socket));
+      });
+      daemonServer.listen(socketPath);
+      return {};
+    },
+  });
+  const startedAt = Date.now();
+  try {
+    await assert.rejects(
+      client.request("runtime.status"),
+      /runtime could not be reached/i,
+    );
+    assert.ok(Date.now() - startedAt < 750);
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    if (daemonServer) {
+      await new Promise((resolveServer) => daemonServer.close(resolveServer));
+    }
+    await rm(parent, { recursive: true, force: true });
   }
 });
 
