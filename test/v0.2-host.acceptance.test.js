@@ -18,8 +18,8 @@ function send(command, child) {
   child.stdin.write(`${JSON.stringify(command)}\n`);
 }
 
-function waitForEvent(events, predicate, child) {
-  const existing = events.find(predicate);
+function waitForEvent(events, predicate, child, startAt = 0) {
+  const existing = events.slice(startAt).find(predicate);
   if (existing) return Promise.resolve(existing);
 
   return new Promise((resolveEvent, reject) => {
@@ -33,7 +33,7 @@ function waitForEvent(events, predicate, child) {
     };
     child.once("close", onClose);
     const check = () => {
-      const event = events.find(predicate);
+      const event = events.slice(startAt).find(predicate);
       if (!event) return;
       clearTimeout(timer);
       child.removeListener("close", onClose);
@@ -118,6 +118,55 @@ async function runHostAcceptance() {
 
     const statusResponse = await waitForEvent(events, (event) => event.type === "response" && event.id === "status", child);
     assert.equal(statusResponse.success, true);
+
+    const reloadStart = events.length;
+    send({ id: "reload", type: "prompt", message: "/pi-sand-reload" }, child);
+    const reloadResponse = await waitForEvent(
+      events,
+      (event) => event.type === "response" && event.id === "reload",
+      child,
+      reloadStart,
+    );
+    assert.equal(reloadResponse.success, true);
+    const reloadStatus = await waitForEvent(
+      events,
+      (event) => event.type === "extension_ui_request" && event.method === "setStatus" && event.statusKey === "pi-sand" && event.statusText === "pi-sand: idle",
+      child,
+      reloadStart,
+    );
+    assert.equal(reloadStatus.statusText, "pi-sand: idle");
+
+    const postReloadStart = events.length;
+    send({ id: "post-reload-status", type: "prompt", message: "/pi-sand" }, child);
+    const postReloadNotice = await waitForEvent(
+      events,
+      (event) => event.type === "extension_ui_request" && event.method === "notify",
+      child,
+      postReloadStart,
+    );
+    const postReloadStatus = JSON.parse(postReloadNotice.message);
+    assert.equal(postReloadStatus.extension, "pi-sand");
+    assert.equal(postReloadStatus.mode, "rpc");
+    assert.equal(postReloadStatus.activity, "idle");
+    const postReloadResponse = await waitForEvent(
+      events,
+      (event) => event.type === "response" && event.id === "post-reload-status",
+      child,
+      postReloadStart,
+    );
+    assert.equal(postReloadResponse.success, true);
+
+    const postReloadCommandsStart = events.length;
+    send({ id: "post-reload-commands", type: "get_commands" }, child);
+    const postReloadCommands = await waitForEvent(
+      events,
+      (event) => event.type === "response" && event.id === "post-reload-commands",
+      child,
+      postReloadCommandsStart,
+    );
+    assert.equal(postReloadCommands.success, true);
+    assert.equal(postReloadCommands.data.commands.filter((candidate) => candidate.name === "pi-sand").length, 1);
+    assert.equal(postReloadCommands.data.commands.filter((candidate) => candidate.name === "pi-sand-reload").length, 1);
     assert.equal(events.some((event) => event.type === "agent_start" || event.type === "turn_start"), false, "an extension command must not start an LLM turn");
   } finally {
     child.stdin.end();
@@ -129,7 +178,7 @@ async function runHostAcceptance() {
 test("v0.2 host package metadata follows Pi's documented local/Git package contract", async () => {
   const manifest = JSON.parse(await readFile(join(repositoryRoot, "package.json"), "utf8"));
   assert.equal(manifest.keywords.includes("pi-package"), true);
-  assert.deepEqual(manifest.pi, { extensions: ["./extensions"] });
+  assert.deepEqual(manifest.pi, { extensions: ["./extensions/pi-sand.ts"] });
   assert.deepEqual(manifest.peerDependencies, { "@earendil-works/pi-coding-agent": "*" });
 });
 
