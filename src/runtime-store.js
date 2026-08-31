@@ -28,6 +28,10 @@ export const MAX_TASK_PACKET_LENGTH = 16 * 1024;
 export const MAX_TASK_RESULT_LENGTH = 4 * 1024;
 export const MAX_TASK_DETAIL_LENGTH = 2 * 1024;
 export const MAX_TERMINAL_DETAIL_LENGTH = 1_000;
+export const MAX_EVIDENCE_OUTPUT_LENGTH = 8 * 1024;
+export const MAX_LOCAL_GATE_COUNT = 16;
+export const MAX_LOCAL_GATE_COMMAND_LENGTH = 4 * 1024;
+export const MAX_LOCAL_GATE_TIMEOUT_MS = 60_000;
 export const WORKER_STOP_TIMEOUT_MS = 2_000;
 export const COMMITMENT_CONTRACT_VERSION = 1;
 export const COMMITMENT_CONTROL_VERSION = 1;
@@ -103,6 +107,10 @@ const ATTEMPT_RUN_SELECT = `SELECT attempt_id AS attemptId, sequence, kind,
   prompt_digest AS promptDigest, state, settled_outcome AS settledOutcome,
   evidence_refs AS evidenceRefs, started_at AS startedAt, settled_at AS settledAt
   FROM attempt_runs`;
+const EVIDENCE_SELECT = `SELECT id, task_id AS taskId, attempt_id AS attemptId,
+  attempt_run_id AS attemptRunId, kind, source, subject, subject_digest AS subjectDigest,
+  payload, payload_digest AS payloadDigest, dedupe_key AS dedupeKey,
+  observed_at AS observedAt FROM evidence`;
 
 function assistantText(message) {
   if (typeof message?.content === "string") return message.content;
@@ -141,8 +149,64 @@ function promptDigest(prompt) {
   return createHash("sha256").update(prompt, "utf8").digest("hex");
 }
 
+function digest(value) {
+  return createHash("sha256").update(String(value), "utf8").digest("hex");
+}
+
 function defaultCompletionContract(goal) {
   return { objective: goal };
+}
+
+function localGatesFromContract(contract) {
+  if (contract == null) return [];
+  if (typeof contract !== "object" || Array.isArray(contract))
+    throw new Error("Task completionContract must be a JSON object.");
+  const rawGates =
+    contract.localGates ??
+    contract.requiredLocalGates ??
+    contract.requiredCommands ??
+    null;
+  if (rawGates == null) return [];
+  if (!Array.isArray(rawGates) || rawGates.length > MAX_LOCAL_GATE_COUNT)
+    throw new Error("Task completionContract localGates are bounded.");
+
+  return rawGates.map((rawGate, index) => {
+    const gateObject =
+      rawGate && typeof rawGate === "object" && !Array.isArray(rawGate)
+        ? rawGate
+        : null;
+    const rawCommand = gateObject?.command ?? rawGate;
+    const command =
+      Array.isArray(rawCommand)
+        ? rawCommand
+        : gateObject && typeof rawCommand === "object"
+          ? [rawCommand.program, ...(rawCommand.args ?? [])]
+          : typeof rawCommand === "string"
+            ? [rawCommand]
+            : null;
+    if (
+      !Array.isArray(command) ||
+      command.length === 0 ||
+      command.some((part) => typeof part !== "string" || !part || part.includes("\\0"))
+    )
+      throw new Error(
+        "Each local gate must provide a non-empty executable command array.",
+      );
+    const commandLength = Buffer.byteLength(JSON.stringify(command), "utf8");
+    if (commandLength > MAX_LOCAL_GATE_COMMAND_LENGTH)
+      throw new Error("Task completionContract local gate command is too large.");
+    const id = gateObject?.id ?? gateObject?.name ?? `local-gate-${index + 1}`;
+    if (typeof id !== "string" || !id.trim() || Buffer.byteLength(id, "utf8") > 256)
+      throw new Error("Each local gate must have a bounded criterion identity.");
+    const requestedTimeout = gateObject?.timeoutMs;
+    const timeoutMs =
+      requestedTimeout == null
+        ? MAX_LOCAL_GATE_TIMEOUT_MS
+        : Number(requestedTimeout);
+    if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_LOCAL_GATE_TIMEOUT_MS)
+      throw new Error("Each local gate timeout must be bounded.");
+    return { id: id.trim(), command, timeoutMs };
+  });
 }
 
 function migratedAttemptRunState(state) {
@@ -203,6 +267,23 @@ function attemptRunSnapshot(row) {
   };
 }
 
+function evidenceSnapshot(row) {
+  return {
+    id: row.id,
+    taskId: row.taskId,
+    attemptId: row.attemptId ?? null,
+    attemptRunId: row.attemptRunId ?? null,
+    kind: row.kind,
+    source: row.source,
+    subject: row.subject,
+    subjectDigest: row.subjectDigest,
+    payload: parsed(row.payload, row.payload),
+    payloadDigest: row.payloadDigest,
+    dedupeKey: row.dedupeKey ?? null,
+    observedAt: row.observedAt,
+  };
+}
+
 function attemptSnapshot(row, attemptRuns = []) {
   return {
     id: row.id,
@@ -227,7 +308,7 @@ function attemptSnapshot(row, attemptRuns = []) {
   };
 }
 
-function taskSnapshot(row, attempts = []) {
+function taskSnapshot(row, attempts = [], evidence = []) {
   return {
     id: row.id,
     sourceRepoRoot: row.sourceRepoRoot,
@@ -253,6 +334,7 @@ function taskSnapshot(row, attempts = []) {
     finalRevision: row.finalRevision ?? null,
     completionEvidenceRef: row.completionEvidenceRef ?? null,
     terminalReason: row.terminalReason ?? null,
+    evidence,
     attempts,
   };
 }
@@ -595,6 +677,22 @@ export class RuntimeStore {
       );
       CREATE INDEX IF NOT EXISTS attempt_runs_attempt ON attempt_runs(attempt_id, sequence);`);
       this.ensureAttemptRuns();
+      this.db.exec(`CREATE TABLE IF NOT EXISTS evidence (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
+        attempt_id TEXT REFERENCES attempts(id), attempt_run_id TEXT,
+        kind TEXT NOT NULL, source TEXT NOT NULL, subject TEXT NOT NULL,
+        subject_digest TEXT NOT NULL, payload TEXT NOT NULL,
+        payload_digest TEXT NOT NULL, dedupe_key TEXT UNIQUE, observed_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS evidence_task ON evidence(task_id, observed_at, id);
+      CREATE TRIGGER IF NOT EXISTS evidence_immutable_update
+      BEFORE UPDATE ON evidence BEGIN
+        SELECT RAISE(ABORT, 'Evidence is immutable');
+      END;
+      CREATE TRIGGER IF NOT EXISTS evidence_immutable_delete
+      BEFORE DELETE ON evidence BEGIN
+        SELECT RAISE(ABORT, 'Evidence is immutable');
+      END;`);
       this.reconcilePriorAttempts();
       return this;
     } catch (error) {
@@ -740,13 +838,28 @@ export class RuntimeStore {
         ...(runsByAttempt.get(run.attemptId) ?? []),
         attemptRunSnapshot(run),
       ]);
+    const evidenceRows = this.db
+      .prepare(`${EVIDENCE_SELECT} ORDER BY task_id, observed_at, id`)
+      .all();
+    const evidenceByTask = new Map();
+    for (const evidence of evidenceRows)
+      evidenceByTask.set(evidence.taskId, [
+        ...(evidenceByTask.get(evidence.taskId) ?? []),
+        evidenceSnapshot(evidence),
+      ]);
     const grouped = new Map();
     for (const attempt of attempts)
       grouped.set(attempt.taskId, [
         ...(grouped.get(attempt.taskId) ?? []),
         attemptSnapshot(attempt, runsByAttempt.get(attempt.id) ?? []),
       ]);
-    return rows.map((row) => taskSnapshot(row, grouped.get(row.id) ?? []));
+    return rows.map((row) =>
+      taskSnapshot(
+        row,
+        grouped.get(row.id) ?? [],
+        evidenceByTask.get(row.id) ?? [],
+      ),
+    );
   }
 
   #taskRow(id) {
@@ -775,7 +888,11 @@ export class RuntimeStore {
         this.#attemptRunRows(attempt.id).map(attemptRunSnapshot),
       ),
     );
-    return taskSnapshot(row, attempts);
+    const evidence = this.db
+      .prepare(`${EVIDENCE_SELECT} WHERE task_id = ? ORDER BY observed_at, id`)
+      .all(id)
+      .map(evidenceSnapshot);
+    return taskSnapshot(row, attempts, evidence);
   }
 
   createWorktree({ repoRoot, baseCommit, taskId }) {
@@ -839,6 +956,9 @@ export class RuntimeStore {
       throw new Error("/task requires a selected provider and model.");
     if (!thinkingLevel)
       throw new Error("/task requires a selected thinking level.");
+    const requestedCompletionContract =
+      completionContract ?? defaultCompletionContract(goal.trim());
+    localGatesFromContract(requestedCompletionContract);
 
     const preflight = preflightGitWorkspace(cwd);
     const compatibility = checkFreshExecutorCompatibility({
@@ -863,10 +983,9 @@ export class RuntimeStore {
       taskId,
     });
     const cleanGoal = goal.trim();
-    const storedCompletionContract = serialized(
-      completionContract,
-      defaultCompletionContract(cleanGoal),
-    );
+    const storedCompletionContract = serialized(requestedCompletionContract, {
+      objective: cleanGoal,
+    });
     const storedAuthority = serialized(authority, DEFAULT_AUTHORITY);
     const storedBudget = serialized(budget, DEFAULT_BUDGET);
     const storedReturnRoute = serialized(returnRoute, DEFAULT_RETURN_ROUTE);
@@ -1300,7 +1419,535 @@ export class RuntimeStore {
       });
       return;
     }
-    await this.settleInitialRun(active, outcome);
+    const settled = await this.settleInitialRun(active, outcome);
+    if (settled) await this.superviseSettled(active, outcome);
+  }
+
+  #supervisorState(active) {
+    const task = this.#taskRow(active.taskId);
+    if (
+      !task ||
+      !["accepted", "running"].includes(task.state) ||
+      task.latestAttemptId !== active.attemptId ||
+      task.controlVersion !== active.controlVersion ||
+      task.contractVersion !== active.contractVersion
+    )
+      return null;
+    const attempt = this.db
+      .prepare(`${ATTEMPT_SELECT} WHERE id = ? AND task_id = ?`)
+      .get(active.attemptId, active.taskId);
+    const run = this.db
+      .prepare(
+        `${ATTEMPT_RUN_SELECT} WHERE attempt_id = ? AND sequence = ?`,
+      )
+      .get(active.attemptId, active.runSequence);
+    if (
+      !attempt ||
+      attempt.state !== "running" ||
+      !run ||
+      run.state !== "settled" ||
+      run.controlVersion !== active.controlVersion ||
+      run.contractVersion !== active.contractVersion
+    )
+      return null;
+    return { task, attempt, run };
+  }
+
+  #appendEvidence({
+    taskId,
+    attemptId,
+    attemptRunId,
+    kind,
+    source = "runtime",
+    subject,
+    payload,
+    dedupeKey,
+  }) {
+    const payloadText = JSON.stringify(payload);
+    if (Buffer.byteLength(payloadText, "utf8") > MAX_TASK_PACKET_LENGTH)
+      throw new Error("Evidence payload exceeds its bounded size limit.");
+    const id = randomUUID();
+    const observedAt = now();
+    this.db
+      .prepare(`INSERT INTO evidence (
+        id, task_id, attempt_id, attempt_run_id, kind, source, subject,
+        subject_digest, payload, payload_digest, dedupe_key, observed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(dedupe_key) DO NOTHING`)
+      .run(
+        id,
+        taskId,
+        attemptId,
+        attemptRunId,
+        kind,
+        source,
+        subject,
+        digest(subject),
+        payloadText,
+        digest(payloadText),
+        dedupeKey,
+        observedAt,
+      );
+    const row = this.db
+      .prepare("SELECT id FROM evidence WHERE dedupe_key = ?")
+      .get(dedupeKey);
+    if (!row) throw new Error("Evidence could not be persisted.");
+    return row.id;
+  }
+
+  #linkEvidence(active, evidenceIds) {
+    if (!evidenceIds.length) return;
+    const row = this.db
+      .prepare(
+        "SELECT evidence_refs AS evidenceRefs FROM attempt_runs WHERE attempt_id = ? AND sequence = ?",
+      )
+      .get(active.attemptId, active.runSequence);
+    const existing = parsed(row?.evidenceRefs, []);
+    const refs = Array.isArray(existing) ? existing : [];
+    for (const evidenceId of evidenceIds)
+      if (!refs.includes(evidenceId)) refs.push(evidenceId);
+    this.db
+      .prepare(`UPDATE attempt_runs SET evidence_refs = ?
+        WHERE attempt_id = ? AND sequence = ? AND state = 'settled'
+        AND control_version = ? AND contract_version = ?`)
+      .run(
+        JSON.stringify(refs),
+        active.attemptId,
+        active.runSequence,
+        active.controlVersion,
+        active.contractVersion,
+      );
+  }
+
+  #candidateIdentity(task, candidateSha) {
+    assertTaskWorktreeIdentity(task);
+    const branch = git(task.taskWorktree, [
+      "symbolic-ref",
+      "--quiet",
+      "--short",
+      "HEAD",
+    ]);
+    const fields = git(task.taskWorktree, [
+      "show",
+      "--quiet",
+      "--format=%H%x00%an%x00%ae%x00%cn%x00%ce",
+      candidateSha,
+    ]).split("\\0");
+    if (fields[0] !== candidateSha || branch !== task.taskBranch)
+      throw new Error("Task candidate identity changed");
+    return {
+      candidateSha,
+      sourceRepoRoot: task.sourceRepoRoot,
+      taskWorktree: task.taskWorktree,
+      taskBranch: task.taskBranch,
+      branch,
+      author: { name: fields[1], email: fields[2] },
+      committer: { name: fields[3], email: fields[4] },
+    };
+  }
+
+  #recordCandidate(active, task, candidateSha) {
+    const identity = this.#candidateIdentity(task, candidateSha);
+    const timestamp = now();
+    const evidencePayload = {
+      ...identity,
+      observedAt: timestamp,
+    };
+    const evidenceIds = [];
+    this.db.exec("BEGIN");
+    try {
+      const result = this.db
+        .prepare(`UPDATE tasks SET final_revision = ?, updated_at = ?
+          WHERE id = ? AND latest_attempt_id = ? AND state IN ('accepted', 'running')
+          AND control_version = ? AND contract_version = ?
+          AND (final_revision IS NULL OR final_revision = ?)`)
+        .run(
+          candidateSha,
+          timestamp,
+          active.taskId,
+          active.attemptId,
+          active.controlVersion,
+          active.contractVersion,
+          candidateSha,
+        );
+      if (result.changes !== 1)
+        throw new Error("Task completion versions are no longer current.");
+      evidenceIds.push(
+        this.#appendEvidence({
+          taskId: active.taskId,
+          attemptId: active.attemptId,
+          attemptRunId: `${active.attemptId}:${active.runSequence}`,
+          kind: "git_identity",
+          subject: candidateSha,
+          payload: evidencePayload,
+          dedupeKey: `git_identity:${active.taskId}:${active.attemptId}:${active.runSequence}:${candidateSha}`,
+        }),
+      );
+      this.#linkEvidence(active, evidenceIds);
+      this.db.exec("COMMIT");
+      return { identity, evidenceIds };
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+  }
+
+  #runLocalGate(task, candidateSha, gate) {
+    const startedAt = now();
+    let stdout = "";
+    let stderr = "";
+    let exitCode = 0;
+    let signal = null;
+    let exitCategory = "passed";
+    try {
+      stdout = execFileSync(gate.command[0], gate.command.slice(1), {
+        cwd: task.taskWorktree,
+        encoding: "utf8",
+        timeout: gate.timeoutMs,
+        maxBuffer: MAX_EVIDENCE_OUTPUT_LENGTH * 2,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      stdout = error.stdout ?? "";
+      stderr = error.stderr ?? "";
+      exitCode = Number.isInteger(error.status) ? error.status : null;
+      signal = error.signal ?? null;
+      if (error.timedOut || error.code === "ETIMEDOUT") exitCategory = "timeout";
+      else if (signal) exitCategory = "signal";
+      else if (Number.isInteger(error.status)) exitCategory = "nonzero";
+      else exitCategory = "error";
+    }
+    const finishedAt = now();
+    stdout = bounded(stdout, MAX_EVIDENCE_OUTPUT_LENGTH);
+    stderr = bounded(stderr, MAX_EVIDENCE_OUTPUT_LENGTH);
+    const postCandidateSha = this.currentBranchHead(task.taskWorktree);
+    let postStatus = "";
+    try {
+      postStatus = git(task.taskWorktree, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+      ]);
+    } catch {
+      postStatus = "<unavailable>";
+    }
+    if (postCandidateSha !== candidateSha) exitCategory = "candidate_changed";
+    else if (postStatus) exitCategory = "working_tree_changed";
+    const resultDigest = digest(
+      JSON.stringify({
+        candidateSha,
+        criterion: gate.id,
+        command: gate.command,
+        cwd: task.taskWorktree,
+        exitCategory,
+        exitCode,
+        signal,
+        stdout,
+        stderr,
+      }),
+    );
+    return {
+      criterion: gate.id,
+      command: gate.command,
+      cwd: task.taskWorktree,
+      candidateSha,
+      startedAt,
+      finishedAt,
+      exitCategory,
+      exitCode,
+      signal,
+      stdout,
+      stderr,
+      postCandidateSha,
+      postStatus,
+      resultDigest,
+      passed: exitCategory === "passed",
+    };
+  }
+
+  #recordLocalGateEvidence(active, gateResult) {
+    const payload = { ...gateResult };
+    delete payload.passed;
+    const evidenceId = this.#appendEvidence({
+      taskId: active.taskId,
+      attemptId: active.attemptId,
+      attemptRunId: `${active.attemptId}:${active.runSequence}`,
+      kind: "local_gate_result",
+      subject: gateResult.candidateSha,
+      payload,
+      dedupeKey: `local_gate_result:${active.taskId}:${active.attemptId}:${active.runSequence}:${gateResult.candidateSha}:${gateResult.criterion}`,
+    });
+    return evidenceId;
+  }
+
+  #verificationFailure(
+    active,
+    {
+      state = "failed",
+      reason,
+      detail,
+      candidateSha = null,
+      finalBranchHead = candidateSha,
+      evidenceIds = [],
+      workerTerminated,
+    },
+  ) {
+    const timestamp = now();
+    const finalResult = active.finalAssistant?.result ?? null;
+    this.db.exec("BEGIN");
+    try {
+      const taskUpdate = this.db
+        .prepare(`UPDATE tasks SET state = ?, updated_at = ?, final_result = ?,
+          terminal_detail = ?, final_branch_head = ?, final_revision = COALESCE(final_revision, ?),
+          terminal_reason = ?, completion_evidence_ref = NULL
+          WHERE id = ? AND latest_attempt_id = ? AND state IN ('accepted', 'running')
+          AND control_version = ? AND contract_version = ?
+          AND (? IS NULL OR final_revision = ?)`)
+        .run(
+          state,
+          timestamp,
+          finalResult,
+          bounded(detail, MAX_TASK_DETAIL_LENGTH),
+          finalBranchHead,
+          candidateSha,
+          reason,
+          active.taskId,
+          active.attemptId,
+          active.controlVersion,
+          active.contractVersion,
+          candidateSha,
+          candidateSha,
+        );
+      if (taskUpdate.changes !== 1) {
+        this.db.exec("COMMIT");
+        return false;
+      }
+      const attemptUpdate = this.db
+        .prepare(`UPDATE attempts SET state = ?, finished_at = ?, worker_terminated = ?,
+          final_result = ?, terminal_detail = ?, final_branch_head = ?
+          WHERE id = ? AND task_id = ? AND state = 'running'`)
+        .run(
+          state === "blocked" ? "orphaned" : "failed",
+          timestamp,
+          workerTerminated ? 1 : 0,
+          finalResult,
+          bounded(detail, MAX_TASK_DETAIL_LENGTH),
+          finalBranchHead,
+          active.attemptId,
+          active.taskId,
+        );
+      if (attemptUpdate.changes !== 1) throw new Error("Attempt completion fence rejected verification outcome.");
+      this.db.exec("COMMIT");
+      if (this.active === active) this.active = null;
+      return true;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+  }
+
+  #completeVerified(active, candidateSha, evidenceIds) {
+    const timestamp = now();
+    const finalResult = active.finalAssistant?.result ?? null;
+    const completionEvidenceRef = JSON.stringify(evidenceIds);
+    this.db.exec("BEGIN");
+    try {
+      const taskUpdate = this.db
+        .prepare(`UPDATE tasks SET state = 'completed', updated_at = ?, final_result = ?,
+          terminal_detail = ?, final_branch_head = ?, final_revision = ?,
+          completion_evidence_ref = ?, terminal_reason = ?
+          WHERE id = ? AND latest_attempt_id = ? AND state IN ('accepted', 'running')
+          AND control_version = ? AND contract_version = ? AND final_revision = ?`)
+        .run(
+          timestamp,
+          finalResult,
+          "Task completed after all required local gates passed.",
+          candidateSha,
+          candidateSha,
+          completionEvidenceRef,
+          "verified_local",
+          active.taskId,
+          active.attemptId,
+          active.controlVersion,
+          active.contractVersion,
+          candidateSha,
+        );
+      if (taskUpdate.changes !== 1) {
+        this.db.exec("COMMIT");
+        return false;
+      }
+      const attemptUpdate = this.db
+        .prepare(`UPDATE attempts SET state = 'completed', finished_at = ?, worker_terminated = 1,
+          final_result = ?, terminal_detail = ?, final_branch_head = ?
+          WHERE id = ? AND task_id = ? AND state = 'running'`)
+        .run(
+          timestamp,
+          finalResult,
+          "Task completed after all required local gates passed.",
+          candidateSha,
+          active.attemptId,
+          active.taskId,
+        );
+      if (attemptUpdate.changes !== 1) throw new Error("Attempt completion fence rejected verified outcome.");
+      const runUpdate = this.db
+        .prepare(`UPDATE attempt_runs SET evidence_refs = ?
+          WHERE attempt_id = ? AND sequence = ? AND state = 'settled'
+          AND control_version = ? AND contract_version = ?`)
+        .run(
+          completionEvidenceRef,
+          active.attemptId,
+          active.runSequence,
+          active.controlVersion,
+          active.contractVersion,
+        );
+      if (runUpdate.changes !== 1) throw new Error("AttemptRun completion fence rejected verified outcome.");
+      this.db.exec("COMMIT");
+      if (this.active === active) this.active = null;
+      return true;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+  }
+
+  async superviseSettled(active) {
+    if (this.active !== active || active.stopRequested || active.finalizing) return;
+    active.finalizing = true;
+    let candidateSha = null;
+    let candidateEvidenceIds = [];
+    let localGateEvidenceIds = [];
+    try {
+      const current = this.#supervisorState(active);
+      if (!current) return;
+      const task = current.task;
+      const gates = localGatesFromContract(parsed(task.completionContract));
+      // A contract without an explicit local criterion remains under the
+      // #50 Supervisor seam; it must not turn executor prose into completion.
+      if (gates.length === 0) return;
+      assertTaskWorktreeIdentity(task);
+      const initialStatus = git(task.taskWorktree, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+      ]);
+      if (initialStatus) {
+        if (parsed(task.completionContract)?.allowResidualChanges === false)
+          throw new Error("Task residual changes are not allowed by its completion contract.");
+        this.checkpoint(task, active);
+      }
+      const fencedBeforeCandidate = this.#supervisorState(active);
+      if (!fencedBeforeCandidate) return;
+      assertTaskWorktreeIdentity(fencedBeforeCandidate.task);
+      const cleanStatus = git(task.taskWorktree, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+      ]);
+      if (cleanStatus)
+        throw new Error("Task worktree remained dirty after checkpoint.");
+      candidateSha = this.currentBranchHead(task.taskWorktree);
+      if (!/^[0-9a-f]{40}$/i.test(candidateSha ?? ""))
+        throw new Error("Exact Task candidate commit SHA is unavailable.");
+      const candidate = this.#recordCandidate(active, task, candidateSha);
+      candidateEvidenceIds = candidate.evidenceIds;
+      for (const gate of gates) {
+        if (!this.#supervisorState(active) || active.stopRequested) return;
+        const gateResult = this.#runLocalGate(task, candidateSha, gate);
+        this.db.exec("BEGIN");
+        try {
+          const evidenceId = this.#recordLocalGateEvidence(active, gateResult);
+          localGateEvidenceIds.push(evidenceId);
+          this.#linkEvidence(active, [evidenceId]);
+          this.db.exec("COMMIT");
+        } catch (error) {
+          try {
+            this.db.exec("ROLLBACK");
+          } catch {}
+          throw error;
+        }
+        if (!gateResult.passed) {
+          const retired = await this.retireWorker(
+            active.worker,
+            active.workerMetadata,
+          );
+          if (this.active !== active || active.stopRequested) return;
+          if (!retired) {
+            this.#verificationFailure(active, {
+              state: "blocked",
+              reason: "worker_retirement_ambiguous",
+              detail: "Required local gate failed and the Fresh Executor could not be safely retired.",
+              candidateSha,
+              finalBranchHead: gateResult.postCandidateSha ?? candidateSha,
+              evidenceIds: [...candidateEvidenceIds, ...localGateEvidenceIds],
+              workerTerminated: false,
+            });
+            return;
+          }
+          this.#verificationFailure(active, {
+            reason: "local_gate_failed",
+            detail: `Required local gate failed: ${gateResult.criterion} (${gateResult.exitCategory}).`,
+            candidateSha,
+            finalBranchHead: gateResult.postCandidateSha ?? candidateSha,
+            evidenceIds: [...candidateEvidenceIds, ...localGateEvidenceIds],
+            workerTerminated: true,
+          });
+          return;
+        }
+      }
+      if (!this.#supervisorState(active) || active.stopRequested) return;
+      assertTaskWorktreeIdentity(task);
+      if (this.currentBranchHead(task.taskWorktree) !== candidateSha)
+        throw new Error("Task candidate commit changed during local verification.");
+      const finalStatus = git(task.taskWorktree, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+      ]);
+      if (finalStatus)
+        throw new Error("Task worktree changed during local verification.");
+      const retired = await this.retireWorker(
+        active.worker,
+        active.workerMetadata,
+      );
+      if (this.active !== active || active.stopRequested) return;
+      if (!retired) {
+        this.#verificationFailure(active, {
+          state: "blocked",
+          reason: "worker_retirement_ambiguous",
+          detail: "Required local gates passed but the Fresh Executor could not be safely retired.",
+          candidateSha,
+          evidenceIds: [...candidateEvidenceIds, ...localGateEvidenceIds],
+          workerTerminated: false,
+        });
+        return;
+      }
+      this.#completeVerified(active, candidateSha, [
+        ...candidateEvidenceIds,
+        ...localGateEvidenceIds,
+      ]);
+    } catch (error) {
+      if (this.active !== active || active.stopRequested) return;
+      let retired = false;
+      try {
+        retired = await this.retireWorker(active.worker, active.workerMetadata);
+      } catch {}
+      if (this.active !== active || active.stopRequested) return;
+      this.#verificationFailure(active, {
+        state: retired ? "failed" : "blocked",
+        reason: retired ? "local_verification_failed" : "worker_retirement_ambiguous",
+        detail: `Task local verification failed: ${commandError(error)}`,
+        candidateSha,
+        workerTerminated: retired,
+      });
+    } finally {
+      active.finalizing = false;
+    }
   }
 
   async retireWorker(worker, metadata) {

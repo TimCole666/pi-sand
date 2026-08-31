@@ -43,13 +43,14 @@ async function eventually(read, predicate, timeoutMs = 1_000) {
 
 const model = { provider: "provider", id: "model" };
 
-function taskOptions(source) {
+function taskOptions(source, completionContract) {
   return {
     goal: "persist the commitment seam",
     cwd: source,
     trusted: true,
     model,
     thinkingLevel: "high",
+    ...(completionContract ? { completionContract } : {}),
   };
 }
 
@@ -217,6 +218,259 @@ test("healthy initial settlement persists one AttemptRun without completing the 
       0,
     );
     assert.equal(git(source, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+  } finally {
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("Supervisor records the exact candidate and failed local gate without completing", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-local-gate-fail-"));
+  const source = await repository(parent);
+  const piCommand = await versionCommand(parent);
+  const runtime = new RuntimeStore({
+    dbPath: join(parent, "runtime.sqlite"),
+    piCommand,
+    worktreeRoot: join(parent, "worktrees"),
+    workerFactory: async ({ cwd, onEvent }) => {
+      await writeFile(join(cwd, "worker.txt"), "worker\\n");
+      onEvent({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: "done is not authority",
+          stopReason: "stop",
+        },
+      });
+      onEvent({ type: "agent_settled" });
+      return { callbacksAttached: true, close() {} };
+    },
+  });
+  try {
+    const started = await runtime.createTask(
+      taskOptions(source, {
+        objective: "verify the candidate",
+        localGates: [
+          {
+            id: "required-test",
+            command: [
+              process.execPath,
+              "-e",
+              "process.stderr.write('gate failed\\\\n'); process.exit(7)",
+            ],
+          },
+        ],
+      }),
+    );
+    const failed = await eventually(
+      () => runtime.getTask(started.id),
+      (task) => task.state !== "running",
+    );
+    const candidate = git(failed.taskWorktree, ["rev-parse", "HEAD"]);
+    assert.equal(failed.state, "failed");
+    assert.equal(failed.finalRevision, candidate);
+    assert.equal(failed.finalBranchHead, candidate);
+    assert.equal(failed.finalResult, "done is not authority");
+    assert.equal(git(source, ["rev-parse", "HEAD"]), failed.baseCommit);
+    assert.equal(
+      git(source, ["status", "--porcelain=v1", "--untracked-files=all"]),
+      "",
+    );
+    assert.equal(
+      git(failed.taskWorktree, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+      ]),
+      "",
+    );
+    const evidence = runtime.db
+      .prepare(
+        "SELECT kind, subject, payload, payload_digest FROM evidence WHERE task_id = ? ORDER BY observed_at, id",
+      )
+      .all(failed.id);
+    assert.deepEqual(
+      evidence.map(({ kind, subject }) => ({ kind, subject })),
+      [
+        { kind: "git_identity", subject: candidate },
+        { kind: "local_gate_result", subject: candidate },
+      ],
+    );
+    const gate = JSON.parse(evidence[1].payload);
+    assert.equal(gate.candidateSha, candidate);
+    assert.equal(gate.criterion, "required-test");
+    assert.equal(gate.exitCategory, "nonzero");
+    assert.equal(gate.exitCode, 7);
+    assert.equal(gate.stdout, "");
+    assert.equal(gate.stderr, "gate failed\\n");
+    assert.match(evidence[1].payload_digest, /^[0-9a-f]{64}$/);
+    assert.equal(
+      failed.attempts[0].attemptRuns[0].evidenceRefs.length,
+      2,
+    );
+  } finally {
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("Supervisor preserves worker commits, checkpoints residual changes, and completes after a passing gate", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-local-gate-pass-"));
+  const source = await repository(parent);
+  const piCommand = await versionCommand(parent);
+  const runtime = new RuntimeStore({
+    dbPath: join(parent, "runtime.sqlite"),
+    piCommand,
+    worktreeRoot: join(parent, "worktrees"),
+    workerFactory: async ({ cwd, onEvent }) => {
+      await writeFile(join(cwd, "worker.txt"), "worker\\n");
+      execFileSync("git", ["add", "worker.txt"], { cwd });
+      execFileSync("git", ["commit", "-qm", "worker commit"], {
+        cwd,
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: "worker",
+          GIT_AUTHOR_EMAIL: "worker@example.com",
+          GIT_COMMITTER_NAME: "worker",
+          GIT_COMMITTER_EMAIL: "worker@example.com",
+        },
+      });
+      await writeFile(join(cwd, "residual.txt"), "residual\\n");
+      onEvent({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: "executor says done",
+          stopReason: "stop",
+        },
+      });
+      onEvent({ type: "agent_settled" });
+      return { callbacksAttached: true, close() {} };
+    },
+  });
+  try {
+    const started = await runtime.createTask(
+      taskOptions(source, {
+        objective: "verify the candidate",
+        localGates: [
+          {
+            id: "required-test",
+            command: [
+              process.execPath,
+              "-e",
+              "process.stdout.write('gate passed\\\\n')",
+            ],
+          },
+        ],
+      }),
+    );
+    const completed = await eventually(
+      () => runtime.getTask(started.id),
+      (task) => task.state === "completed",
+    );
+    const candidate = git(completed.taskWorktree, ["rev-parse", "HEAD"]);
+    assert.equal(completed.finalRevision, candidate);
+    assert.equal(completed.finalBranchHead, candidate);
+    assert.equal(completed.terminalReason, "verified_local");
+    assert.deepEqual(
+      git(completed.taskWorktree, ["log", "--format=%s", "-3"]).split("\\n"),
+      [
+        "pi-sand: checkpoint completed Task " + completed.id,
+        "worker commit",
+        "base",
+      ],
+    );
+    assert.equal(
+      git(completed.taskWorktree, ["log", "-1", "--format=%an <%ae>"]),
+      "pi-sand <pi-sand@localhost>",
+    );
+    assert.equal(
+      git(completed.taskWorktree, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+      ]),
+      "",
+    );
+    assert.equal(
+      JSON.parse(completed.completionEvidenceRef).length,
+      2,
+    );
+    assert.equal(completed.attempts[0].state, "completed");
+    assert.equal(completed.attempts[0].workerTerminated, true);
+    assert.equal(completed.attempts[0].attemptRuns[0].state, "settled");
+    assert.equal(completed.attempts[0].attemptRuns[0].evidenceRefs.length, 2);
+    assert.equal(git(source, ["rev-parse", "HEAD"]), completed.baseCommit);
+    assert.equal(
+      git(source, ["status", "--porcelain=v1", "--untracked-files=all"]),
+      "",
+    );
+  } finally {
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("Supervisor rejects a gate that changes the candidate worktree", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-local-gate-mutation-"));
+  const source = await repository(parent);
+  const piCommand = await versionCommand(parent);
+  const runtime = new RuntimeStore({
+    dbPath: join(parent, "runtime.sqlite"),
+    piCommand,
+    worktreeRoot: join(parent, "worktrees"),
+    workerFactory: async ({ onEvent }) => {
+      onEvent({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: "done",
+          stopReason: "stop",
+        },
+      });
+      onEvent({ type: "agent_settled" });
+      return { callbacksAttached: true, close() {} };
+    },
+  });
+  try {
+    const started = await runtime.createTask(
+      taskOptions(source, {
+        objective: "verify the candidate",
+        localGates: [
+          {
+            id: "mutating-check",
+            command: [
+              process.execPath,
+              "-e",
+              "require('node:fs').writeFileSync('after-gate.txt', 'changed\\\\n')",
+            ],
+          },
+        ],
+      }),
+    );
+    const failed = await eventually(
+      () => runtime.getTask(started.id),
+      (task) => task.state !== "running",
+    );
+    const candidate = git(failed.taskWorktree, ["rev-parse", "HEAD"]);
+    assert.notEqual(failed.state, "completed");
+    assert.equal(failed.finalRevision, candidate);
+    assert.equal(
+      git(failed.taskWorktree, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+      ]),
+      "?? after-gate.txt",
+    );
+    const gate = runtime.db
+      .prepare(
+        "SELECT payload FROM evidence WHERE task_id = ? AND kind = 'local_gate_result'",
+      )
+      .get(failed.id);
+    assert.equal(JSON.parse(gate.payload).exitCategory, "working_tree_changed");
+    assert.equal(JSON.parse(gate.payload).candidateSha, candidate);
+    assert.equal(git(source, ["rev-parse", "HEAD"]), failed.baseCommit);
   } finally {
     runtime.close();
     await rm(parent, { recursive: true, force: true });
