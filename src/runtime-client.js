@@ -139,7 +139,7 @@ export class RuntimeClient {
       response =
         method === "runtime.status"
           ? readiness
-          : await this.waitForResponse(method, params, version);
+          : await this.requestSocket(method, params, version);
     }
     if (response.version !== PROTOCOL_VERSION)
       throw protocolMismatch(
@@ -228,36 +228,33 @@ export class RuntimeClient {
   }
 
   async waitForDaemon(version) {
-    const response = await this.waitForResponse("runtime.status", {}, version);
-    if (response.version !== PROTOCOL_VERSION)
-      throw protocolMismatch(
-        `daemon returned version ${String(response.version)}.`,
-      );
-    if (!response.success) {
-      if (response.error?.code === "protocol_mismatch")
-        throw protocolMismatch(response.error.message);
-      throw responseError(response);
-    }
-    validateRuntimeStatus(response.data);
-    return response;
-  }
-
-  async waitForResponse(method, params, version) {
     const deadline = Date.now() + this.startTimeoutMs;
     let lastError;
     while (Date.now() < deadline) {
       try {
+        const remaining = deadline - Date.now();
         const timeoutMs = Math.max(
           1,
-          Math.min(this.requestTimeoutMs, deadline - Date.now()),
+          Math.min(this.requestTimeoutMs, remaining),
         );
-        return await this.requestSocket(method, params, version, timeoutMs);
+        const response = await this.requestSocket(
+          "runtime.status",
+          {},
+          version,
+          timeoutMs,
+        );
+        if (response.version !== PROTOCOL_VERSION)
+          throw protocolMismatch(
+            `daemon returned version ${String(response.version)}.`,
+          );
+        if (!response.success) {
+          if (response.error?.code === "protocol_mismatch")
+            throw protocolMismatch(response.error.message);
+          throw responseError(response);
+        }
+        validateRuntimeStatus(response.data);
+        return response;
       } catch (error) {
-        if (
-          error.code === "ambiguous_mutation" ||
-          (MUTATING_METHODS.has(method) && error.sent)
-        )
-          throw error;
         lastError = error;
         const remaining = deadline - Date.now();
         if (remaining <= 0) break;

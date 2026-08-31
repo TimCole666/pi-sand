@@ -306,6 +306,83 @@ test("autostart bounds a silent daemon within the startup deadline", {
   }
 });
 
+test("autostart allows a long mutation to use the request timeout instead of the startup deadline", {
+  skip: process.platform === "linux" ? false : "Linux-only",
+}, async () => {
+  const parent = await mkdtemp(
+    join(tmpdir(), "pi-sand-v03-autostart-mutation-timeout-"),
+  );
+  const env = environment(parent);
+  const socketPath = runtimeSocketPath({ env });
+  await mkdir(dirname(socketPath), { recursive: true });
+  await chmod(dirname(socketPath), 0o700);
+  let daemonServer;
+  let daemonStarts = 0;
+  const received = [];
+  const client = new RuntimeClient({
+    env,
+    startTimeoutMs: 50,
+    requestTimeoutMs: 300,
+    spawnImpl: () => {
+      daemonStarts += 1;
+      daemonServer = createServer((socket) =>
+        socket.once("data", (chunk) => {
+          const request = JSON.parse(String(chunk).trim());
+          received.push(request);
+          if (request.method === "runtime.status") {
+            socket.end(
+              `${JSON.stringify({
+                id: request.id,
+                version: 1,
+                success: true,
+                data: {
+                  protocolVersion: 1,
+                  daemonPid: process.pid,
+                  state: "ready",
+                },
+              })}\n`,
+            );
+          } else if (request.method === "task.create") {
+            setTimeout(() => {
+              socket.end(
+                `${JSON.stringify({
+                  id: request.id,
+                  version: 1,
+                  success: true,
+                  data: {
+                    task: {
+                      id: "task-long-start",
+                      state: "running",
+                    },
+                  },
+                })}\n`,
+              );
+            }, 120);
+          } else {
+            socket.destroy();
+          }
+        }),
+      );
+      daemonServer.listen(socketPath);
+      return {};
+    },
+  });
+  try {
+    const task = await client.createTask({ goal: "test slow start" });
+    assert.equal(task.id, "task-long-start");
+    assert.equal(daemonStarts, 1);
+    assert.equal(received[0].method, "runtime.status");
+    assert.equal(
+      received.filter((request) => request.method === "task.create").length,
+      1,
+      "task.create must be received exactly once without replay",
+    );
+  } finally {
+    await new Promise((resolveServer) => daemonServer?.close(resolveServer));
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
 test("the Extension exposes /tasks through an IPC client and never owns runtime storage", async () => {
   const harness = createExtensionHarness();
   const clients = [];
