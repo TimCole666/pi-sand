@@ -8,8 +8,10 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   MAX_EVIDENCE_OUTPUT_LENGTH,
+  MAX_EVIDENCE_PAYLOAD_LENGTH,
   RuntimeStore,
 } from "../src/runtime-store.js";
+import { processGroupStatus } from "../src/process.js";
 
 const wait = (milliseconds) =>
   new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
@@ -693,6 +695,89 @@ test("bounded local gate stdout and stderr persist in one evidence receipt", asy
     assert.equal(gate.payload.stderr.length, MAX_EVIDENCE_OUTPUT_LENGTH);
     assert.equal(settled.attempts[0].attemptRuns[0].evidenceRefs.length, 2);
   } finally {
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("a zero-exit gate leader cannot pass while an unref'd group descendant can mutate the Task worktree", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-local-gate-descendant-"));
+  const source = await repository(parent);
+  const descendantPidFile = join(parent, "gate-descendant-pid");
+  const gateGroupPidFile = join(parent, "gate-group-pid");
+  const lateMutation = "late-gate-mutation.txt";
+  let gateGroupPid = null;
+  const runtime = new RuntimeStore({
+    dbPath: join(parent, "runtime.sqlite"),
+    piCommand: await versionCommand(parent),
+    worktreeRoot: join(parent, "worktrees"),
+    workerFactory: async ({ onEvent }) => {
+      onEvent({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: "gate leader says done",
+          stopReason: "stop",
+        },
+      });
+      onEvent({ type: "agent_settled" });
+      return { callbacksAttached: true, close() {} };
+    },
+  });
+  try {
+    const started = await runtime.createTask(
+      taskOptions(source, {
+        localGates: [
+          {
+            id: "detached-descendant-check",
+            timeoutMs: 2_000,
+            command: [
+              process.execPath,
+              "-e",
+              `const { spawn } = require("node:child_process"); const fs = require("node:fs"); fs.writeFileSync(${JSON.stringify(gateGroupPidFile)}, String(process.pid)); const descendant = spawn(process.execPath, ["-e", ${JSON.stringify(`const fs = require("node:fs"); setTimeout(() => { try { fs.writeFileSync(${JSON.stringify(lateMutation)}, "late\\n"); } catch {} }, 250); setTimeout(() => {}, 1_000);`)}], { cwd: process.cwd(), stdio: "ignore" }); descendant.unref(); fs.writeFileSync(${JSON.stringify(descendantPidFile)}, String(descendant.pid)); setTimeout(() => process.exit(0), 100);`,
+            ],
+          },
+        ],
+      }),
+    );
+    await eventually(() => existsSync(gateGroupPidFile), Boolean, 2_000);
+    gateGroupPid = Number(readFileSync(gateGroupPidFile, "utf8"));
+    await eventually(() => existsSync(descendantPidFile), Boolean, 2_000);
+    assert.equal(processGroupStatus(gateGroupPid), "alive");
+
+    const outcome = await eventually(
+      () => runtime.getTask(started.id),
+      (task) => task.state !== "running",
+      2_000,
+    );
+    assert.equal(outcome.state, "blocked");
+    assert.equal(outcome.completionEvidenceRef, null);
+    const gate = outcome.evidence.find(
+      ({ kind }) => kind === "local_gate_result",
+    );
+    assert.ok(gate);
+    assert.equal(gate.payload.exitCode, 0);
+    assert.equal(gate.payload.exitCategory, "gate_termination_ambiguous");
+    assert.equal(gate.payload.processTerminated, false);
+    assert.ok(
+      Buffer.byteLength(JSON.stringify(gate.payload), "utf8") <=
+        MAX_EVIDENCE_PAYLOAD_LENGTH,
+    );
+
+    await eventually(
+      () => existsSync(join(outcome.taskWorktree, "late-gate-mutation.txt")),
+      Boolean,
+      2_000,
+    );
+    assert.notEqual(runtime.getTask(started.id).state, "completed");
+  } finally {
+    if (gateGroupPid) {
+      try {
+        process.kill(-gateGroupPid, "SIGKILL");
+      } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    }
     runtime.close();
     await rm(parent, { recursive: true, force: true });
   }

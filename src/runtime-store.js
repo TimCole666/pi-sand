@@ -1621,23 +1621,33 @@ export class RuntimeStore {
       let errorDetail = null;
       let timedOut = false;
       let cancelled = false;
-      let processTerminated = true;
+      let processTerminated = false;
       let terminationResult = null;
       let settled = false;
 
+      const clearGateReferences = () => {
+        if (active.gateCancellation === cancel) active.gateCancellation = null;
+        if (active.gateProcess?.child === child) active.gateProcess = null;
+      };
+
       const terminate = () => {
-        if (terminationResult !== null) return terminationResult;
+        if (terminationResult === true) return true;
         if (!metadata) {
-          terminationResult = false;
           processTerminated = false;
-          return terminationResult;
+          return false;
         }
-        terminationResult = stopOwnedProcessGroupSync(metadata, {
+        const terminated = stopOwnedProcessGroupSync(metadata, {
           timeoutMs: this.workerStopTimeoutMs,
           currentBootId: this.bootId,
         });
-        processTerminated = terminationResult;
-        return terminationResult;
+        if (terminated) {
+          terminationResult = true;
+          processTerminated = true;
+          clearGateReferences();
+        } else {
+          processTerminated = false;
+        }
+        return terminated;
       };
 
       const finish = ({ code = exitCode, signal: exitSignal = signal, error = null } = {}) => {
@@ -1647,19 +1657,23 @@ export class RuntimeStore {
         exitCode = code;
         signal = exitSignal;
         if (error) errorDetail = bounded(commandError(error), MAX_TASK_DETAIL_LENGTH);
-        if (terminationResult === null)
+        if (terminationResult !== true) {
+          const groupStatus = metadata
+            ? processGroupStatus(metadata.workerPgid)
+            : "unknown";
           processTerminated =
-            !child?.pid || child.exitCode !== null || child.signalCode !== null;
-        if (active.gateCancellation === cancel) active.gateCancellation = null;
-        if (active.gateProcess?.child === child) active.gateProcess = null;
+            groupStatus === "gone" &&
+            recordedWorkerIsGone(metadata);
+        }
+        if (processTerminated) clearGateReferences();
 
         let exitCategory;
-        if (cancelled)
-          exitCategory = processTerminated ? "cancelled" : "gate_termination_ambiguous";
-        else if (timedOut)
-          exitCategory = processTerminated
-            ? "timeout"
-            : "timeout_termination_ambiguous";
+        if (!processTerminated)
+          exitCategory = timedOut
+            ? "timeout_termination_ambiguous"
+            : "gate_termination_ambiguous";
+        else if (cancelled) exitCategory = "cancelled";
+        else if (timedOut) exitCategory = "timeout";
         else if (error) exitCategory = "error";
         else if (signal) exitCategory = "signal";
         else if (exitCode === 0) exitCategory = "passed";
@@ -1677,8 +1691,10 @@ export class RuntimeStore {
         } catch {
           postStatus = "<unavailable>";
         }
-        if (postCandidateSha !== candidateSha) exitCategory = "candidate_changed";
-        else if (postStatus) exitCategory = "working_tree_changed";
+        if (processTerminated && postCandidateSha !== candidateSha)
+          exitCategory = "candidate_changed";
+        else if (processTerminated && postStatus)
+          exitCategory = "working_tree_changed";
         const resultDigest = digest(
           JSON.stringify({
             candidateSha,
@@ -1716,10 +1732,9 @@ export class RuntimeStore {
       };
 
       const cancel = () => {
-        if (settled) return true;
         cancelled = true;
         const terminated = terminate();
-        if (!terminated)
+        if (!terminated && !settled)
           finish({ error: new Error("Local gate process could not be safely terminated.") });
         return terminated;
       };
@@ -1836,7 +1851,7 @@ export class RuntimeStore {
         );
       if (attemptUpdate.changes !== 1) throw new Error("Attempt completion fence rejected verification outcome.");
       this.db.exec("COMMIT");
-      if (this.active === active) this.active = null;
+      if (this.active === active && !active.gateProcess) this.active = null;
       return true;
     } catch (error) {
       try {
@@ -1980,12 +1995,15 @@ export class RuntimeStore {
           throw error;
         }
         if (!gateResult.passed) {
+          const gateRetired =
+            gateResult.processTerminated === true ||
+            this.#cancelLocalGate(active);
           const retired = await this.retireWorker(
             active.worker,
             active.workerMetadata,
           );
           if (this.active !== active || active.stopRequested) return;
-          if (!retired || gateResult.processTerminated !== true) {
+          if (!retired || !gateRetired || gateResult.processTerminated !== true) {
             this.#verificationFailure(active, {
               state: "blocked",
               reason:
@@ -2261,7 +2279,11 @@ export class RuntimeStore {
       } catch {}
       throw error;
     }
-    if (this.active?.attemptId === attemptId) this.active = null;
+    if (
+      this.active?.attemptId === attemptId &&
+      !this.active.gateProcess
+    )
+      this.active = null;
   }
 
   async stopTask(id) {
