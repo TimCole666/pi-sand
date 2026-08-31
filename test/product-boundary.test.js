@@ -166,6 +166,84 @@ test("database ownership rejects the exact live owner but reclaims PID-reused an
   }
 });
 
+test("stale database lock concurrent reclaim barrier guarantees exactly one owner", {
+  skip: process.platform === "linux" ? false : "Linux-only",
+}, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-sand-concurrent-lock-"));
+  const dbPath = join(directory, "state.sqlite");
+  const lockPath = databaseLockPath(dbPath);
+  await writeFile(
+    lockPath,
+    JSON.stringify({
+      pid: 999999,
+      processStartIdentity: "dead-start",
+      bootId: "dead-boot",
+      token: "stale-token",
+    }),
+  );
+
+  const workerScript = `
+    import { acquireDatabaseLock } from ${JSON.stringify(new URL("../src/database-lock.js", import.meta.url).href)};
+    process.on("message", () => {
+      try {
+        const lock = acquireDatabaseLock(process.env.DB_PATH);
+        process.send({ winner: true, pid: process.pid });
+        setTimeout(() => {
+          lock.release();
+          process.exit(0);
+        }, 500);
+      } catch (error) {
+        process.send({ winner: false, pid: process.pid, error: error.message });
+        process.exit(1);
+      }
+    });
+  `;
+  const scriptPath = join(directory, "worker.mjs");
+  await writeFile(scriptPath, workerScript);
+
+  const N = 12;
+  const children = [];
+  const responses = [];
+  try {
+    for (let i = 0; i < N; i++) {
+      const child = spawn(process.execPath, [scriptPath], {
+        env: { ...process.env, DB_PATH: dbPath },
+        stdio: ["inherit", "inherit", "inherit", "ipc"],
+      });
+      child.on("message", (msg) => responses.push(msg));
+      children.push(child);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    for (const child of children) child.send("go");
+
+    await Promise.all(
+      children.map(
+        (child) => new Promise((resolve) => child.on("exit", resolve)),
+      ),
+    );
+
+    const winners = responses.filter((r) => r.winner);
+    const losers = responses.filter((r) => !r.winner);
+    assert.equal(winners.length, 1, "exactly one candidate must win ownership");
+    assert.equal(losers.length, N - 1, "all other candidates must lose");
+    for (const loser of losers) {
+      assert.match(
+        loser.error,
+        /already running for this database/,
+        "losers must fail with clear ownership error",
+      );
+    }
+  } finally {
+    for (const child of children) {
+      try {
+        child.kill();
+      } catch {}
+    }
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("a failed AgentService bootstrap releases ownership so product Retry works in the same server", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-sand-bootstrap-retry-"));
   const dbPath = join(directory, "state.sqlite");

@@ -135,12 +135,30 @@ test("singleton races converge, stale sockets are reclaimed only after DB owners
     await mkdir(dirname(socket), { recursive: true });
     await chmod(dirname(socket), 0o700);
     await writeFile(socket, "stale socket marker");
+    await writeFile(
+      `${env.PI_SAND_RUNTIME_DB}.lock`,
+      JSON.stringify({
+        pid: 999999,
+        processStartIdentity: "dead-start",
+        bootId: "dead-boot",
+        token: "stale-lock",
+      }),
+    );
 
-    const [first, second] = await Promise.all([runClient(env), runClient(env)]);
+    const [first, second, third, fourth] = await Promise.all([
+      runClient(env),
+      runClient(env),
+      runClient(env),
+      runClient(env),
+    ]);
     daemonPid = first.status.daemonPid;
     assert.equal(second.status.daemonPid, daemonPid);
+    assert.equal(third.status.daemonPid, daemonPid);
+    assert.equal(fourth.status.daemonPid, daemonPid);
     assert.deepEqual(first.tasks, []);
     assert.deepEqual(second.tasks, []);
+    assert.deepEqual(third.tasks, []);
+    assert.deepEqual(fourth.tasks, []);
 
     const client = new RuntimeClient({ env });
     await assert.rejects(client.request("task.create"), (error) => {

@@ -1,14 +1,15 @@
 import {
-  closeSync,
-  fsyncSync,
-  openSync,
+  chmodSync,
+  mkdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   unlinkSync,
-  writeSync,
+  writeFileSync,
 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { basename, dirname, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import {
   processIsAlive,
   readProcessIdentity,
@@ -50,11 +51,10 @@ function lockOwnerStatus(owner) {
 /**
  * Acquire an OS-process ownership marker for a product database.
  *
- * SQLite protects individual reads/writes, but does not express the product
- * invariant that exactly one Local Agent Service owns a database for its whole
- * lifetime. An exclusive-create marker gives competing service startups a
- * deterministic product error. A marker left by a dead process is reclaimed;
- * malformed markers fail closed rather than risking two owners.
+ * An exclusive SQLite transaction on a dedicated `.owner.sqlite` guard database
+ * establishes kernel-enforced mutual exclusion across competing daemon processes
+ * for the entire runtime lifetime. A diagnostic `.lock` marker file retains
+ * process identity metadata for recovery and error reporting.
  */
 function canonicalDatabasePath(dbPath) {
   const absolute = resolve(dbPath);
@@ -69,7 +69,9 @@ function canonicalDatabasePath(dbPath) {
 export function acquireDatabaseLock(dbPath) {
   if (dbPath === ":memory:") return null;
 
-  const lockPath = `${canonicalDatabasePath(dbPath)}.lock`;
+  const canonical = canonicalDatabasePath(dbPath);
+  const lockPath = `${canonical}.lock`;
+  const ownerDbPath = `${canonical}.owner.sqlite`;
   const token = randomUUID();
   const identity = readProcessIdentity(process.pid);
   const contents = JSON.stringify({
@@ -78,34 +80,64 @@ export function acquireDatabaseLock(dbPath) {
     bootId: identity?.bootId ?? null,
     token,
   });
-  let descriptor;
 
-  for (;;) {
+  const parentDir = dirname(ownerDbPath);
+  try {
+    mkdirSync(parentDir, { recursive: true, mode: 0o700 });
+  } catch {}
+
+  let ownerDb;
+  try {
+    ownerDb = new DatabaseSync(ownerDbPath);
     try {
-      descriptor = openSync(lockPath, "wx", LOCK_MODE);
-      writeSync(descriptor, contents);
-      fsyncSync(descriptor);
-      break;
-    } catch (error) {
-      if (descriptor !== undefined) {
-        closeSync(descriptor);
-        descriptor = undefined;
-        try {
-          unlinkSync(lockPath);
-        } catch {
-          /* Preserve the original acquisition error. */
-        }
-      }
-      if (error.code !== "EEXIST") throw error;
-
-      const owner = lockOwner(lockPath);
-      if (!owner || lockOwnerStatus(owner) !== "stale") throw lockError(owner);
+      chmodSync(ownerDbPath, LOCK_MODE);
+    } catch {}
+    ownerDb.exec("BEGIN EXCLUSIVE;");
+  } catch (error) {
+    if (ownerDb) {
       try {
-        unlinkSync(lockPath);
-      } catch (unlinkError) {
-        if (unlinkError.code !== "ENOENT") throw lockError(owner);
-      }
+        ownerDb.close();
+      } catch {}
     }
+    if (/database is locked|busy/i.test(error.message)) {
+      const owner = lockOwner(lockPath);
+      throw lockError(owner);
+    }
+    throw error;
+  }
+
+  // The exclusive transaction guarantees only one candidate reaches this point.
+  // Verify that any existing diagnostic metadata is not from a live process.
+  const existingOwner = lockOwner(lockPath);
+  if (existingOwner) {
+    const status = lockOwnerStatus(existingOwner);
+    if (status !== "stale") {
+      try {
+        ownerDb.exec("ROLLBACK;");
+      } catch {}
+      try {
+        ownerDb.close();
+      } catch {}
+      throw lockError(existingOwner);
+    }
+  }
+
+  // Atomically write the diagnostic metadata.
+  const tmpLockPath = `${lockPath}.${token}.tmp`;
+  try {
+    writeFileSync(tmpLockPath, contents, { mode: LOCK_MODE });
+    renameSync(tmpLockPath, lockPath);
+  } catch (error) {
+    try {
+      unlinkSync(tmpLockPath);
+    } catch {}
+    try {
+      ownerDb.exec("ROLLBACK;");
+    } catch {}
+    try {
+      ownerDb.close();
+    } catch {}
+    throw error;
   }
 
   let released = false;
@@ -116,10 +148,18 @@ export function acquireDatabaseLock(dbPath) {
       released = true;
       try {
         const owner = lockOwner(lockPath);
-        if (owner?.token === token && owner.pid === process.pid)
-          unlinkSync(lockPath);
+        if (owner?.token === token && owner.pid === process.pid) {
+          try {
+            unlinkSync(lockPath);
+          } catch {}
+        }
       } finally {
-        closeSync(descriptor);
+        try {
+          ownerDb.exec("ROLLBACK;");
+        } catch {}
+        try {
+          ownerDb.close();
+        } catch {}
       }
     },
   };
