@@ -1,3 +1,5 @@
+import { TaskRuntime } from "../src/task-runtime.js";
+
 const STATUS_KEY = "pi-sand";
 const WIDGET_KEY = "pi-sand";
 const ACTIVITY = {
@@ -5,6 +7,31 @@ const ACTIVITY = {
   RUNNING: "running",
   WAITING_FOR_USER: "waiting_for_user",
 };
+
+async function taskCommand(taskRuntime, args, ctx) {
+  try {
+    const task = taskRuntime.startTask({ goal: args, cwd: ctx.cwd, trusted: ctx.isProjectTrusted?.() === true, model: ctx.model, thinkingLevel: ctx.thinkingLevel });
+    const result = { ok: true, task };
+    ctx.ui.notify(JSON.stringify(result), "info");
+    return result;
+  } catch (error) {
+    const result = { ok: false, error: error.message };
+    ctx.ui.notify(JSON.stringify(result), "error");
+    return result;
+  }
+}
+
+async function tasksCommand(taskRuntime, _args, ctx) {
+  try {
+    const result = { ok: true, tasks: taskRuntime.listTasks() };
+    ctx.ui.notify(JSON.stringify(result), "info");
+    return result;
+  } catch (error) {
+    const result = { ok: false, error: error.message };
+    ctx.ui.notify(JSON.stringify(result), "error");
+    return result;
+  }
+}
 
 function getSessionId(ctx) {
   return ctx.sessionManager.getSessionId();
@@ -83,8 +110,11 @@ function formatStatus(status) {
   return JSON.stringify(status);
 }
 
-export function registerPiSandExtension(pi) {
+export function registerPiSandExtension(pi, { taskRuntimeFactory = () => new TaskRuntime() } = {}) {
   let runtime;
+  // This object is deliberately resource-free. SQLite and the owner lock are
+  // acquired lazily by /task or /tasks, never during Extension loading.
+  const taskRuntime = taskRuntimeFactory();
 
   const currentRuntime = (ctx) => (runtime?.matches(ctx) ? runtime : undefined);
 
@@ -133,6 +163,16 @@ export function registerPiSandExtension(pi) {
 
   pi.on("ui_prompt_end", async (_event, ctx) => {
     currentRuntime(ctx)?.endUserPrompt(ctx);
+  });
+
+  pi.registerCommand("task", {
+    description: "Start one durable background Task in an isolated Fresh Executor",
+    handler: async (args, ctx) => taskCommand(taskRuntime, args, ctx),
+  });
+
+  pi.registerCommand("tasks", {
+    description: "List durable background Tasks",
+    handler: async (args, ctx) => tasksCommand(taskRuntime, args, ctx),
   });
 
   pi.registerCommand("pi-sand", {
