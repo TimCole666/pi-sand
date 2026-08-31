@@ -41,12 +41,12 @@ export function processGroupIdentity(pid) {
   }
 }
 
-function processGroupHasLiveMember(processGroupId) {
+function processGroupMemberStatus(processGroupId) {
   let entries;
   try {
     entries = readdirSync("/proc", { withFileTypes: true });
   } catch {
-    return true;
+    return "unknown";
   }
   let uncertain = false;
   for (const entry of entries) {
@@ -61,23 +61,32 @@ function processGroupHasLiveMember(processGroupId) {
       continue;
     }
     if (!fields || Number(fields[2]) !== processGroupId) continue;
-    if (fields[0] !== "Z") return true;
+    if (fields[0] !== "Z") return "alive";
   }
-  return uncertain;
+  return uncertain ? "unknown" : "gone";
 }
 
-export function processGroupIsAlive(processGroupId) {
-  if (!Number.isInteger(processGroupId) || processGroupId <= 0) return false;
+/**
+ * Return a zombie-aware process-group state. Unlike kill(..., 0), a group
+ * containing only zombie members is gone because no member can execute work.
+ */
+export function processGroupStatus(processGroupId) {
+  if (!Number.isInteger(processGroupId) || processGroupId <= 0) return "unknown";
   try {
     process.kill(-processGroupId, 0);
   } catch (error) {
     // EPERM means the group exists but is not signalable by this process.
-    if (error.code === "EPERM") return true;
-    return false;
+    if (error.code === "EPERM") return "alive";
+    if (error.code === "ESRCH") return "gone";
+    return "unknown";
   }
-  // kill(..., 0) also succeeds for zombie-only groups. Treat those as gone;
-  // they cannot execute work and otherwise make TERM/KILL waits time out.
-  return processGroupHasLiveMember(processGroupId);
+  return processGroupMemberStatus(processGroupId);
+}
+
+export function processGroupIsAlive(processGroupId) {
+  // Unknown remains alive for safety: callers must not report a worker stopped
+  // while /proc visibility is uncertain.
+  return processGroupStatus(processGroupId) !== "gone";
 }
 
 export function workerProcessMetadata(worker) {

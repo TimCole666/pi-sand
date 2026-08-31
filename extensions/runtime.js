@@ -8,9 +8,23 @@ const ACTIVITY = {
   WAITING_FOR_USER: "waiting_for_user",
 };
 
+function managerModelAuthPreflight(ctx) {
+  if (typeof ctx.modelRegistry?.hasConfiguredAuth !== "function") return undefined;
+  return (model) => {
+    // Pi exposes no synchronous credential-resolution probe to extensions.
+    // hasConfiguredAuth(model) is its documented current Manager model/auth
+    // state signal, so preserve rejection before Task/worktree acceptance.
+    const current = ctx.model;
+    return Boolean(current)
+      && current.provider === model?.provider
+      && current.id === model?.id
+      && ctx.modelRegistry.hasConfiguredAuth(current) === true;
+  };
+}
+
 async function taskCommand(taskRuntime, args, ctx) {
   try {
-    const task = taskRuntime.startTask({ goal: args, cwd: ctx.cwd, trusted: ctx.isProjectTrusted?.() === true, model: ctx.model, thinkingLevel: ctx.thinkingLevel });
+    const task = taskRuntime.startTask({ goal: args, cwd: ctx.cwd, trusted: ctx.isProjectTrusted?.() === true, model: ctx.model, thinkingLevel: ctx.thinkingLevel, modelAuthPreflight: managerModelAuthPreflight(ctx) });
     const result = { ok: true, task };
     ctx.ui.notify(JSON.stringify(result), "info");
     return result;
@@ -47,7 +61,7 @@ async function taskStopCommand(taskRuntime, args, ctx) {
 
 async function taskRetryCommand(taskRuntime, args, ctx) {
   try {
-    const result = { ok: true, task: taskRuntime.retryTask({ id: String(args ?? "").trim(), trusted: ctx.isProjectTrusted?.() === true, model: ctx.model, thinkingLevel: ctx.thinkingLevel }) };
+    const result = { ok: true, task: taskRuntime.retryTask({ id: String(args ?? "").trim(), trusted: ctx.isProjectTrusted?.() === true, model: ctx.model, thinkingLevel: ctx.thinkingLevel, modelAuthPreflight: managerModelAuthPreflight(ctx) }) };
     ctx.ui.notify(JSON.stringify(result), "info");
     return result;
   } catch (error) {
@@ -152,10 +166,11 @@ function formatStatus(status) {
 
 export function registerPiSandExtension(pi, { taskRuntimeFactory = () => new TaskRuntime() } = {}) {
   let runtime;
-  // This object is deliberately resource-free. SQLite and the owner lock are
-  // acquired lazily by /task or /tasks, never during Extension loading.
-  const taskRuntime = taskRuntimeFactory();
-
+  let taskRuntime;
+  // The Task Runtime object and its SQLite owner lock are both session-scoped:
+  // create them lazily on the first Task command, then discard the closed
+  // instance so a replacement session can acquire ownership again.
+  const currentTaskRuntime = () => (taskRuntime ??= taskRuntimeFactory());
   const currentRuntime = (ctx) => (runtime?.matches(ctx) ? runtime : undefined);
 
   // pi-sand has no project-local configuration yet. Defer trust decisions to
@@ -176,8 +191,10 @@ export function registerPiSandExtension(pi, { taskRuntimeFactory = () => new Tas
     // Pi 0.84.4 guarantees this event runs before the old Extension runtime is
     // torn down. Stop the owned Fresh Executor first; the replacement
     // Extension gets a new TaskRuntime and can only inspect durable state.
+    const closingTaskRuntime = taskRuntime;
+    taskRuntime = undefined;
     try {
-      await taskRuntime.shutdown(TASK_SHUTDOWN_REASONS.includes(event?.reason) ? event.reason : "quit");
+      await closingTaskRuntime?.shutdown(TASK_SHUTDOWN_REASONS.includes(event?.reason) ? event.reason : "quit");
     } finally {
       current.close(ctx);
       runtime = undefined;
@@ -213,27 +230,27 @@ export function registerPiSandExtension(pi, { taskRuntimeFactory = () => new Tas
 
   pi.registerCommand("task", {
     description: "Start one durable background Task in an isolated Fresh Executor",
-    handler: async (args, ctx) => taskCommand(taskRuntime, args, ctx),
+    handler: async (args, ctx) => taskCommand(currentTaskRuntime(), args, ctx),
   });
 
   pi.registerCommand("tasks", {
     description: "List durable background Tasks",
-    handler: async (args, ctx) => tasksCommand(taskRuntime, args, ctx),
+    handler: async (args, ctx) => tasksCommand(currentTaskRuntime(), args, ctx),
   });
 
   pi.registerCommand("task-show", {
     description: "Show one durable background Task and its Attempts",
-    handler: async (args, ctx) => taskShowCommand(taskRuntime, args, ctx),
+    handler: async (args, ctx) => taskShowCommand(currentTaskRuntime(), args, ctx),
   });
 
   pi.registerCommand("task-stop", {
     description: "Stop an active durable background Task",
-    handler: async (args, ctx) => taskStopCommand(taskRuntime, args, ctx),
+    handler: async (args, ctx) => taskStopCommand(currentTaskRuntime(), args, ctx),
   });
 
   pi.registerCommand("task-retry", {
     description: "Retry a failed, stopped, or interrupted Task with a fresh executor",
-    handler: async (args, ctx) => taskRetryCommand(taskRuntime, args, ctx),
+    handler: async (args, ctx) => taskRetryCommand(currentTaskRuntime(), args, ctx),
   });
 
   pi.registerCommand("pi-sand", {
