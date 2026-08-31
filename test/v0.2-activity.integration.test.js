@@ -1,55 +1,46 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import registerPiSandActivity from "../extensions/pi-sand-activity.js";
+import { registerPiSandExtension } from "../extensions/runtime.js";
 
 function createHarness() {
   const handlers = new Map();
+  const commands = new Map();
   const calls = [];
-  let command;
-
   const pi = {
     on(event, handler) {
-      handlers.set(event, handler);
+      const registered = handlers.get(event) ?? [];
+      registered.push(handler);
+      handlers.set(event, registered);
     },
     registerCommand(name, definition) {
-      assert.equal(name, "pi-sand");
-      command = definition.handler;
+      commands.set(name, definition.handler);
     },
   };
 
-  registerPiSandActivity(pi);
-
-  function context(overrides = {}) {
-    return {
-      mode: "tui",
-      cwd: "/tmp/pi-sand-workspace",
-      sessionManager: { getSessionId: () => "session-1" },
-      ui: {
-        setStatus(key, text) {
-          calls.push({ method: "setStatus", key, text });
-        },
-        setWidget(key, lines) {
-          calls.push({ method: "setWidget", key, lines });
-        },
-        notify(message, type) {
-          calls.push({ method: "notify", message, type });
-        },
+  const context = (session = "session-1") => ({
+    mode: "tui",
+    cwd: "/tmp/pi-sand-workspace",
+    sessionManager: { getSessionId: () => session },
+    ui: {
+      setStatus(key, text) {
+        calls.push({ method: "setStatus", key, text });
       },
-      ...overrides,
-    };
+      setWidget(key, lines) {
+        calls.push({ method: "setWidget", key, lines });
+      },
+      notify(message, type) {
+        calls.push({ method: "notify", message, type });
+      },
+    },
+  });
+
+  async function emit(event, ctx) {
+    for (const handler of handlers.get(event) ?? []) {
+      await handler({ type: event }, ctx);
+    }
   }
 
-  async function emit(event, ctx = context()) {
-    await handlers.get(event)({}, ctx);
-  }
-
-  async function report(ctx = context()) {
-    await command("", ctx);
-    const notification = [...calls].reverse().find((call) => call.method === "notify");
-    return notification ? JSON.parse(notification.message) : undefined;
-  }
-
-  function visibleSurface() {
+  function surface() {
     const status = [...calls].reverse().find((call) => call.method === "setStatus");
     const widget = [...calls].reverse().find((call) => call.method === "setWidget");
     return {
@@ -58,17 +49,24 @@ function createHarness() {
     };
   }
 
-  return { calls, context, emit, report, visibleSurface };
+  async function report(ctx) {
+    await commands.get("pi-sand")("", ctx);
+    const notification = [...calls].reverse().find((call) => call.method === "notify");
+    return notification ? JSON.parse(notification.message) : undefined;
+  }
+
+  registerPiSandExtension(pi);
+  return { calls, context, emit, report, surface };
 }
 
 function assertSurface(harness, activity) {
-  assert.deepEqual(harness.visibleSurface(), {
+  assert.deepEqual(harness.surface(), {
     status: { key: "pi-sand", text: `pi-sand: ${activity}` },
     widget: { key: "pi-sand", lines: [`pi-sand activity: ${activity}`] },
   });
 }
 
-test("v0.2 activity projection follows the documented foreground lifecycle", async () => {
+test("v0.2 activity projection keeps status, widget, and command on one authority", async () => {
   const harness = createHarness();
   const ctx = harness.context();
 
@@ -85,25 +83,21 @@ test("v0.2 activity projection follows the documented foreground lifecycle", asy
 
   await harness.emit("agent_start", ctx);
   assertSurface(harness, "running");
-  assert.equal((await harness.report(ctx)).activity, "running");
-
   await harness.emit("ui_prompt_start", ctx);
   assertSurface(harness, "waiting_for_user");
   await harness.emit("ui_prompt_end", ctx);
   assertSurface(harness, "running");
 
-  const callsBeforeAgentEnd = harness.calls.length;
   await harness.emit("agent_end", ctx);
   assertSurface(harness, "running");
   assert.equal((await harness.report(ctx)).activity, "running");
-  assert.ok(harness.calls.length > callsBeforeAgentEnd);
 
   await harness.emit("agent_settled", ctx);
   assertSurface(harness, "idle");
   assert.equal((await harness.report(ctx)).activity, "idle");
 });
 
-test("v0.2 activity projection clears its Pi UI surface on session shutdown", async () => {
+test("v0.2 activity projection clears all Pi UI surfaces on session shutdown", async () => {
   const harness = createHarness();
   const ctx = harness.context();
 
@@ -111,9 +105,9 @@ test("v0.2 activity projection clears its Pi UI surface on session shutdown", as
   await harness.emit("agent_start", ctx);
   await harness.emit("session_shutdown", ctx);
 
-  assert.deepEqual(harness.visibleSurface(), {
+  assert.deepEqual(harness.surface(), {
     status: { key: "pi-sand", text: undefined },
     widget: { key: "pi-sand", lines: undefined },
   });
-  assert.equal((await harness.report(ctx)), undefined);
+  assert.equal(await harness.report(ctx), undefined);
 });

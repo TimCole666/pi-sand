@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import registerPiSandActivity from "./pi-sand-activity.js";
+import { registerPiSandExtension } from "./runtime.js";
 
 export default function (pi: ExtensionAPI) {
-  registerPiSandActivity(pi);
+  registerPiSandExtension(pi);
 }
