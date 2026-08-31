@@ -38,6 +38,7 @@ export const COMMITMENT_CONTRACT_VERSION = 1;
 export const COMMITMENT_CONTROL_VERSION = 1;
 const INITIAL_ATTEMPT_RUN_SEQUENCE = 1;
 const ACTIVE_ATTEMPT_STATES = new Set(["starting", "running"]);
+const ACTIVE_GATE_STATES = new Set(["running", "ambiguous"]);
 const RETRYABLE_TASK_STATES = new Set(["failed", "stopped", "interrupted"]);
 const WORKER_RETIRE_TIMEOUT_MS = 2_000;
 const now = () => new Date().toISOString();
@@ -111,6 +112,8 @@ const ATTEMPT_SELECT = `SELECT id, task_id AS taskId, number, applied_provider A
   applied_thinking_level AS thinkingLevel, state, started_at AS startedAt, finished_at AS finishedAt,
   worker_pid AS workerPid, worker_pgid AS workerPgid, worker_terminated AS workerTerminated,
   worker_start_identity AS workerStartIdentity, worker_boot_id AS workerBootId,
+  gate_pid AS gatePid, gate_pgid AS gatePgid, gate_start_identity AS gateStartIdentity,
+  gate_boot_id AS gateBootId, gate_state AS gateState, gate_terminated AS gateTerminated,
   final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead,
   shutdown_reason AS shutdownReason
   FROM attempts`;
@@ -316,6 +319,13 @@ function attemptSnapshot(row, attemptRuns = []) {
     workerTerminated: row.workerTerminated === 1,
     workerStartIdentity: row.workerStartIdentity ?? null,
     workerBootId: row.workerBootId ?? null,
+    gatePid: row.gatePid ?? null,
+    gatePgid: row.gatePgid ?? null,
+    gateStartIdentity: row.gateStartIdentity ?? null,
+    gateBootId: row.gateBootId ?? null,
+    gateState:
+      row.gateState ?? (row.gateTerminated === 1 ? "none" : "ambiguous"),
+    gateTerminated: row.gateTerminated === 1,
     attemptRuns,
   };
 }
@@ -468,6 +478,17 @@ export class RuntimeStore {
       this.db.exec(
         "ALTER TABLE attempts ADD COLUMN worker_terminated INTEGER NOT NULL DEFAULT 1",
       );
+    for (const [name, type] of [
+      ["gate_pid", "INTEGER"],
+      ["gate_pgid", "INTEGER"],
+      ["gate_start_identity", "TEXT"],
+      ["gate_boot_id", "TEXT"],
+      ["gate_state", "TEXT NOT NULL DEFAULT 'none'"],
+      ["gate_terminated", "INTEGER NOT NULL DEFAULT 1"],
+    ]) {
+      if (!attemptColumns.has(name))
+        this.db.exec(`ALTER TABLE attempts ADD COLUMN ${name} ${type}`);
+    }
     for (const [table, column] of [
       ["tasks", "shutdown_reason"],
       ["attempts", "shutdown_reason"],
@@ -502,16 +523,22 @@ export class RuntimeStore {
             provider TEXT, model_id TEXT, thinking_level TEXT, state TEXT NOT NULL,
             started_at TEXT NOT NULL, finished_at TEXT, worker_pid INTEGER, worker_pgid INTEGER,
             worker_start_identity TEXT, worker_boot_id TEXT,
-            worker_terminated INTEGER NOT NULL DEFAULT 1, final_result TEXT, terminal_detail TEXT,
-            final_branch_head TEXT, shutdown_reason TEXT, applied_provider TEXT,
-            applied_model_id TEXT, applied_thinking_level TEXT, UNIQUE(task_id, number)
+            worker_terminated INTEGER NOT NULL DEFAULT 1,
+            gate_pid INTEGER, gate_pgid INTEGER, gate_start_identity TEXT, gate_boot_id TEXT,
+            gate_state TEXT NOT NULL DEFAULT 'none' CHECK(gate_state IN ('none', 'running', 'terminated', 'ambiguous')),
+            gate_terminated INTEGER NOT NULL DEFAULT 1,
+            final_result TEXT, terminal_detail TEXT, final_branch_head TEXT, shutdown_reason TEXT,
+            applied_provider TEXT, applied_model_id TEXT, applied_thinking_level TEXT,
+            UNIQUE(task_id, number)
           );
           INSERT INTO attempts (id, task_id, number, provider, model_id, thinking_level, state, started_at,
             finished_at, worker_pid, worker_pgid, worker_start_identity, worker_boot_id, worker_terminated,
+            gate_pid, gate_pgid, gate_start_identity, gate_boot_id, gate_state, gate_terminated,
             final_result, terminal_detail, final_branch_head, shutdown_reason, applied_provider,
             applied_model_id, applied_thinking_level)
           SELECT id, task_id, number, provider, model_id, thinking_level, state, started_at,
             finished_at, worker_pid, worker_pgid, worker_start_identity, worker_boot_id, worker_terminated,
+            gate_pid, gate_pgid, gate_start_identity, gate_boot_id, gate_state, gate_terminated,
             final_result, terminal_detail, final_branch_head, shutdown_reason, applied_provider,
             applied_model_id, applied_thinking_level
           FROM attempts_legacy;
@@ -671,9 +698,14 @@ export class RuntimeStore {
           id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), number INTEGER NOT NULL,
           provider TEXT, model_id TEXT, thinking_level TEXT, state TEXT NOT NULL,
           started_at TEXT NOT NULL, finished_at TEXT, worker_pid INTEGER, worker_pgid INTEGER,
-          worker_terminated INTEGER NOT NULL DEFAULT 1, final_result TEXT, terminal_detail TEXT,
-          final_branch_head TEXT, shutdown_reason TEXT, applied_provider TEXT,
-          applied_model_id TEXT, applied_thinking_level TEXT, UNIQUE(task_id, number)
+          worker_start_identity TEXT, worker_boot_id TEXT,
+          worker_terminated INTEGER NOT NULL DEFAULT 1,
+          gate_pid INTEGER, gate_pgid INTEGER, gate_start_identity TEXT, gate_boot_id TEXT,
+          gate_state TEXT NOT NULL DEFAULT 'none' CHECK(gate_state IN ('none', 'running', 'terminated', 'ambiguous')),
+          gate_terminated INTEGER NOT NULL DEFAULT 1,
+          final_result TEXT, terminal_detail TEXT, final_branch_head TEXT, shutdown_reason TEXT,
+          applied_provider TEXT, applied_model_id TEXT, applied_thinking_level TEXT,
+          UNIQUE(task_id, number)
         );
         CREATE INDEX IF NOT EXISTS tasks_created ON tasks(created_at, id);
         CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id, number);`);
@@ -705,6 +737,7 @@ export class RuntimeStore {
       BEFORE DELETE ON evidence BEGIN
         SELECT RAISE(ABORT, 'Evidence is immutable');
       END;`);
+      this.reconcilePriorGates();
       this.reconcilePriorAttempts();
       return this;
     } catch (error) {
@@ -719,10 +752,131 @@ export class RuntimeStore {
     return this.db
       .prepare(`SELECT id, task_id AS taskId, state, worker_pid AS workerPid,
       worker_pgid AS workerPgid, worker_start_identity AS workerStartIdentity,
-      worker_boot_id AS workerBootId, worker_terminated AS workerTerminated
+      worker_boot_id AS workerBootId, worker_terminated AS workerTerminated,
+      gate_pid AS gatePid, gate_pgid AS gatePgid, gate_start_identity AS gateStartIdentity,
+      gate_boot_id AS gateBootId, gate_state AS gateState, gate_terminated AS gateTerminated
       FROM attempts WHERE state IN ('starting', 'running', 'orphaned')
-      OR (state = 'interrupted' AND worker_terminated = 0) ORDER BY started_at, id`)
+      OR (state = 'interrupted' AND worker_terminated = 0)
+      OR gate_terminated = 0 OR gate_state IN ('running', 'ambiguous')
+      ORDER BY started_at, id`)
       .all();
+  }
+
+  #gateUnresolved(attempt) {
+    return Boolean(
+      attempt &&
+        (attempt.gateTerminated === 0 || ACTIVE_GATE_STATES.has(attempt.gateState)),
+    );
+  }
+
+  #gateMetadata(attempt) {
+    return {
+      workerPid: Number(attempt?.gatePid),
+      workerPgid: Number(attempt?.gatePgid),
+      workerStartIdentity: attempt?.gateStartIdentity ?? null,
+      workerBootId: attempt?.gateBootId ?? null,
+    };
+  }
+
+  #setGateState(attemptId, state) {
+    if (!this.db) return false;
+    const gateTerminated = state === "terminated" ? 1 : 0;
+    const row = this.db
+      .prepare(
+        "SELECT gate_state AS gateState, gate_terminated AS gateTerminated FROM attempts WHERE id = ?",
+      )
+      .get(attemptId);
+    if (!row) return false;
+    if (
+      row.gateState === state &&
+      Number(row.gateTerminated) === gateTerminated
+    )
+      return true;
+    return (
+      this.db
+        .prepare(
+          "UPDATE attempts SET gate_state = ?, gate_terminated = ? WHERE id = ?",
+        )
+        .run(state, gateTerminated, attemptId).changes === 1
+    );
+  }
+
+  #recordGateProcess(active, metadata, identityProven) {
+    const gateState = identityProven ? "running" : "ambiguous";
+    const gateTerminated = 0;
+    const result = this.db
+      .prepare(`UPDATE attempts SET gate_pid = ?, gate_pgid = ?,
+        gate_start_identity = ?, gate_boot_id = ?, gate_state = ?, gate_terminated = ?
+        WHERE id = ? AND task_id = ? AND state = 'running'
+        AND gate_terminated = 1`)
+      .run(
+        Number.isInteger(metadata?.workerPid) ? metadata.workerPid : null,
+        Number.isInteger(metadata?.workerPgid) ? metadata.workerPgid : null,
+        metadata?.workerStartIdentity ?? null,
+        metadata?.workerBootId ?? null,
+        gateState,
+        gateTerminated,
+        active.attemptId,
+        active.taskId,
+      );
+    if (result.changes !== 1)
+      throw new Error("Local gate process identity could not be durably recorded.");
+    return true;
+  }
+
+  #markGateBlocked(attempt, { reason = null } = {}) {
+    const detail = reason
+      ? `pi-sandd ${reason} could not prove safe local gate termination; the Task is blocked and its worktree was retained.`
+      : "The prior local gate could not be safely identified or terminated. The Task is blocked and its worktree was retained.";
+    this.markBlocked(attempt.taskId, attempt.id, detail);
+  }
+
+  #reconcileGate(attempt) {
+    if (!this.#gateUnresolved(attempt)) return "none";
+    const metadata = this.#gateMetadata(attempt);
+    let safelyGone = false;
+    // A boot boundary proves the recorded gate cannot execute, but never
+    // permits signalling a reused PID or process-group id.
+    if (
+      attempt.gateBootId &&
+      this.bootId &&
+      attempt.gateBootId !== this.bootId
+    ) {
+      safelyGone = true;
+    } else {
+      const status = processGroupStatus(metadata.workerPgid);
+      if (status === "gone") safelyGone = true;
+      else if (
+        status === "alive" &&
+        stopOwnedProcessGroupSync(metadata, {
+          timeoutMs: this.workerStopTimeoutMs,
+          currentBootId: this.bootId,
+        })
+      ) {
+        safelyGone = true;
+      }
+    }
+    if (safelyGone) {
+      try {
+        if (this.#setGateState(attempt.id, "terminated")) return "terminated";
+      } catch {}
+    }
+    try {
+      this.#setGateState(attempt.id, "ambiguous");
+    } catch {}
+    return "ambiguous";
+  }
+
+  reconcilePriorGates({ reason = null } = {}) {
+    const attempts = this.db
+      .prepare(
+        `${ATTEMPT_SELECT} WHERE gate_terminated = 0 OR gate_state IN ('running', 'ambiguous') ORDER BY started_at, id`,
+      )
+      .all();
+    for (const attempt of attempts) {
+      if (this.#reconcileGate(attempt) === "ambiguous")
+        this.#markGateBlocked(attempt, { reason });
+    }
   }
 
   updateTaskForAttempt(attempt, state, detail, shutdownReason = null) {
@@ -829,8 +983,14 @@ export class RuntimeStore {
     return "orphaned";
   }
 
-  reconcilePriorAttempts() {
-    for (const attempt of this.attemptRows()) this.reconcileAttempt(attempt);
+  reconcilePriorAttempts({ reason = null } = {}) {
+    for (const attempt of this.attemptRows()) {
+      if (this.#gateUnresolved(attempt)) {
+        this.#markGateBlocked(attempt, { reason });
+        continue;
+      }
+      this.reconcileAttempt(attempt, { reason });
+    }
   }
 
   listTasks() {
@@ -939,7 +1099,7 @@ export class RuntimeStore {
       Boolean(
         this.db
           .prepare(
-            "SELECT 1 FROM attempts WHERE state IN ('starting', 'running', 'orphaned') LIMIT 1",
+            "SELECT 1 FROM attempts WHERE state IN ('starting', 'running', 'orphaned') OR gate_terminated = 0 OR gate_state IN ('running', 'ambiguous') LIMIT 1",
           )
           .get(),
       )
@@ -1630,24 +1790,37 @@ export class RuntimeStore {
         if (active.gateProcess?.child === child) active.gateProcess = null;
       };
 
+      const persistGateState = (state) => {
+        try {
+          return this.#setGateState(active.attemptId, state);
+        } catch {
+          return false;
+        }
+      };
+
       const terminate = () => {
         if (terminationResult === true) return true;
         if (!metadata) {
           processTerminated = false;
           return false;
         }
-        const terminated = stopOwnedProcessGroupSync(metadata, {
-          timeoutMs: this.workerStopTimeoutMs,
-          currentBootId: this.bootId,
-        });
-        if (terminated) {
+        let terminated = false;
+        try {
+          terminated = stopOwnedProcessGroupSync(metadata, {
+            timeoutMs: this.workerStopTimeoutMs,
+            currentBootId: this.bootId,
+          });
+        } catch {
+          terminated = false;
+        }
+        if (terminated && persistGateState("terminated")) {
           terminationResult = true;
           processTerminated = true;
           clearGateReferences();
-        } else {
-          processTerminated = false;
+          return true;
         }
-        return terminated;
+        processTerminated = false;
+        return false;
       };
 
       const finish = ({ code = exitCode, signal: exitSignal = signal, error = null } = {}) => {
@@ -1656,14 +1829,24 @@ export class RuntimeStore {
         clearTimeout(timer);
         exitCode = code;
         signal = exitSignal;
-        if (error) errorDetail = bounded(commandError(error), MAX_TASK_DETAIL_LENGTH);
+        if (error)
+          errorDetail = bounded(
+            typeof error === "string" ? error : commandError(error),
+            MAX_TASK_DETAIL_LENGTH,
+          );
         if (terminationResult !== true) {
-          const groupStatus = metadata
-            ? processGroupStatus(metadata.workerPgid)
-            : "unknown";
-          processTerminated =
-            groupStatus === "gone" &&
-            recordedWorkerIsGone(metadata);
+          if (!active.gateProcess && !metadata) {
+            processTerminated = true;
+          } else {
+            const groupStatus = metadata
+              ? processGroupStatus(metadata.workerPgid)
+              : "unknown";
+            const gone =
+              groupStatus === "gone" &&
+              recordedWorkerIsGone(metadata);
+            processTerminated = gone && persistGateState("terminated");
+            if (!processTerminated) persistGateState("ambiguous");
+          }
         }
         if (processTerminated) clearGateReferences();
 
@@ -1745,13 +1928,41 @@ export class RuntimeStore {
           detached: true,
           stdio: ["ignore", "pipe", "pipe"],
         });
+        const childPid = Number(child.pid);
         metadata = workerMetadata({
-          pid: child.pid,
-          processGroupId: child.pid,
+          pid: childPid,
+          processGroupId: childPid,
           workerBootId: this.bootId,
-        });
+        }) ?? {
+          workerPid: Number.isInteger(childPid) && childPid > 0 ? childPid : null,
+          workerPgid: Number.isInteger(childPid) && childPid > 0 ? childPid : null,
+          workerStartIdentity: processStartIdentity(childPid),
+          workerBootId: null,
+        };
         active.gateProcess = { child, metadata };
         active.gateCancellation = cancel;
+        const identityProven = Boolean(
+          Number.isInteger(metadata?.workerPid) &&
+            Number.isInteger(metadata?.workerPgid) &&
+            metadata.workerStartIdentity &&
+            metadata.workerBootId &&
+            recordedWorkerIsOwned(metadata, this.bootId),
+        );
+        let persisted = false;
+        try {
+          persisted = this.#recordGateProcess(active, metadata, identityProven);
+        } catch (error) {
+          errorDetail = bounded(commandError(error), MAX_TASK_DETAIL_LENGTH);
+        }
+        if (!persisted || !identityProven) {
+          terminate();
+          finish({
+            error:
+              errorDetail ||
+              new Error("Local gate process identity could not be proven or persisted."),
+          });
+          return;
+        }
         child.stdout?.setEncoding?.("utf8");
         child.stderr?.setEncoding?.("utf8");
         child.stdout?.on("data", (chunk) => {
@@ -1894,7 +2105,7 @@ export class RuntimeStore {
       const attemptUpdate = this.db
         .prepare(`UPDATE attempts SET state = 'completed', finished_at = ?, worker_terminated = 1,
           final_result = ?, terminal_detail = ?, final_branch_head = ?
-          WHERE id = ? AND task_id = ? AND state = 'running'`)
+          WHERE id = ? AND task_id = ? AND state = 'running' AND gate_terminated = 1`)
         .run(
           timestamp,
           finalResult,
@@ -1981,7 +2192,8 @@ export class RuntimeStore {
           recordedCandidateSha,
           gate,
         );
-        if (!this.#supervisorState(active) || active.stopRequested) return;
+        if (this.active !== active || !this.#supervisorState(active) || active.stopRequested)
+          return;
         this.db.exec("BEGIN");
         try {
           const evidenceId = this.#recordLocalGateEvidence(active, gateResult);
@@ -2034,7 +2246,8 @@ export class RuntimeStore {
           return;
         }
       }
-      if (!this.#supervisorState(active) || active.stopRequested) return;
+      if (this.active !== active || !this.#supervisorState(active) || active.stopRequested)
+        return;
       assertTaskWorktreeIdentity(task);
       if (this.currentBranchHead(task.taskWorktree) !== recordedCandidateSha)
         throw new Error("Task candidate commit changed during local verification.");
@@ -2306,7 +2519,9 @@ export class RuntimeStore {
     const active =
       this.active?.attemptId === attempt.id ? this.active : null;
     if (active) active.stopRequested = true;
-    const gateStopped = active ? this.#cancelLocalGate(active) : true;
+    const gateStopped = active
+      ? this.#cancelLocalGate(active)
+      : this.#reconcileGate(attempt) !== "ambiguous";
     const stopped = await this.terminateOwnedWorker(worker);
     if (!stopped || !gateStopped) {
       const detail = !gateStopped
@@ -2322,7 +2537,7 @@ export class RuntimeStore {
     try {
       this.db
         .prepare(
-          "UPDATE attempts SET state = 'stopped', finished_at = ?, worker_terminated = 1, terminal_detail = ? WHERE id = ? AND state IN ('starting', 'running')",
+          "UPDATE attempts SET state = 'stopped', finished_at = ?, worker_terminated = 1, terminal_detail = ? WHERE id = ? AND state IN ('starting', 'running') AND gate_terminated = 1",
         )
         .run(
           timestamp,
@@ -2497,23 +2712,18 @@ export class RuntimeStore {
     const active = this.active;
     if (active) {
       active.stopRequested = true;
-      const gateStopped = this.#cancelLocalGate(active);
+      let gateStopped = this.#cancelLocalGate(active);
       const attempt = this.db
-        .prepare(`SELECT id, task_id AS taskId, state, worker_pid AS workerPid,
-        worker_pgid AS workerPgid, worker_start_identity AS workerStartIdentity,
-        worker_boot_id AS workerBootId, worker_terminated AS workerTerminated
-        FROM attempts WHERE id = ?`)
+        .prepare(`${ATTEMPT_SELECT} WHERE id = ?`)
         .get(active.attemptId);
+      if (attempt && !gateStopped)
+        gateStopped = this.#reconcileGate(attempt) !== "ambiguous";
       let outcome =
         attempt && ["starting", "running"].includes(attempt.state)
           ? this.reconcileAttempt(attempt, { reason })
           : "orphaned";
-      if (!gateStopped && outcome === "interrupted") {
-        this.markBlocked(
-          active.taskId,
-          active.attemptId,
-          "The daemon shutdown could not safely terminate the active local gate; the Task is blocked and its worktree was retained.",
-        );
+      if (attempt && !gateStopped) {
+        this.#markGateBlocked(attempt, { reason });
         outcome = "orphaned";
       }
       // FreshExecutor.close() is itself a signal operation. Never invoke it
@@ -2524,15 +2734,25 @@ export class RuntimeStore {
     }
     // This also handles a graceful boundary after the in-memory handle was
     // lost: reconcile durable metadata rather than declaring capacity free.
-    for (const attempt of this.attemptRows())
-      this.reconcileAttempt(attempt, { reason });
+    this.reconcilePriorGates({ reason });
+    this.reconcilePriorAttempts({ reason });
   }
 
   release() {
     if (this.closed) return;
+    const active = this.active;
+    try {
+      if (active) {
+        active.stopRequested = true;
+        this.#cancelLocalGate(active);
+      }
+      // A direct release is also a durable ownership boundary. Reconcile any
+      // gate whose in-memory callback was already lost before closing the DB.
+      if (this.db) this.reconcilePriorGates({ reason: "release" });
+    } catch {}
     this.closed = true;
     try {
-      this.active?.worker?.close?.();
+      active?.worker?.close?.();
     } catch {}
     this.active = null;
     try {

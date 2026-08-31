@@ -127,6 +127,18 @@ test("existing v0.3 Task rows migrate to the Task-backed Commitment without a de
       runtime.db.prepare("SELECT COUNT(*) AS count FROM attempt_runs").get().count,
       1,
     );
+    const attemptSchema = runtime.db.prepare("PRAGMA table_info(attempts)").all();
+    for (const name of [
+      "gate_pid",
+      "gate_pgid",
+      "gate_start_identity",
+      "gate_boot_id",
+      "gate_state",
+      "gate_terminated",
+    ])
+      assert.ok(attemptSchema.some((column) => column.name === name));
+    assert.equal(task.attempts[0].gateState, "none");
+    assert.equal(task.attempts[0].gateTerminated, true);
   } finally {
     runtime.close();
     await rm(parent, { recursive: true, force: true });
@@ -628,6 +640,11 @@ test("Stop wins while a local gate is running and does not replay the gate", asy
     const stopStartedAt = Date.now();
     const stopped = await runtime.stopTask(started.id);
     assert.equal(stopped.state, "stopped");
+    const gateState = runtime.db
+      .prepare("SELECT gate_state AS gateState, gate_terminated AS gateTerminated FROM attempts WHERE id = ?")
+      .get(stopped.latestAttemptId);
+    assert.equal(gateState.gateState, "terminated");
+    assert.equal(gateState.gateTerminated, 1);
     assert.ok(Date.now() - stopStartedAt < 1_500);
     await wait(100);
     assert.equal(runtime.getTask(started.id).state, "stopped");
@@ -779,6 +796,138 @@ test("a zero-exit gate leader cannot pass while an unref'd group descendant can 
       }
     }
     runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("restart fences a durable local gate after its leader exits with an unref'd descendant", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-local-gate-restart-"));
+  const source = await repository(parent);
+  const dbPath = join(parent, "runtime.sqlite");
+  const worktreeRoot = join(parent, "worktrees");
+  const piCommand = await versionCommand(parent);
+  const taskIdFile = join(parent, "task-id");
+  const workerExitFile = join(parent, "worker-exit");
+  const gateGroupPidFile = join(parent, "gate-group-pid");
+  const gateLeaderExitFile = join(parent, "gate-leader-exit");
+  const descendantPidFile = join(parent, "gate-descendant-pid");
+  const lateMutation = "late-restart-gate-mutation.txt";
+  let daemon;
+  let replacement;
+  let gateGroupPid = null;
+  const waitForExit = (child) =>
+    child.exitCode !== null || child.signalCode !== null
+      ? Promise.resolve()
+      : new Promise((resolveExit) => child.once("close", resolveExit));
+  try {
+    const runtimeUrl = new URL("../src/runtime-store.js", import.meta.url).href;
+    const workerExitCode = `const fs = require("node:fs"); process.on("SIGTERM", () => { fs.writeFileSync(${JSON.stringify(workerExitFile)}, "exited"); process.exit(0); }); setTimeout(() => { fs.writeFileSync(${JSON.stringify(workerExitFile)}, "exited"); process.exit(0); }, 250);`;
+    const daemonCode = `
+      import { spawn } from "node:child_process";
+      import { writeFileSync } from "node:fs";
+      import { RuntimeStore } from ${JSON.stringify(runtimeUrl)};
+      const runtime = new RuntimeStore({
+        dbPath: ${JSON.stringify(dbPath)},
+        piCommand: ${JSON.stringify(piCommand)},
+        worktreeRoot: ${JSON.stringify(worktreeRoot)},
+        workerFactory: ({ onEvent, onWorkerSpawn }) => {
+          const worker = spawn(process.execPath, ["-e", ${JSON.stringify(workerExitCode)}], { detached: true, stdio: "ignore" });
+          onWorkerSpawn({ pid: worker.pid, processGroupId: worker.pid });
+          onEvent({ type: "message_end", message: { role: "assistant", content: "done", stopReason: "stop" } });
+          onEvent({ type: "agent_settled" });
+          return { pid: worker.pid, processGroupId: worker.pid, close() {} };
+        },
+      });
+      const task = await runtime.createTask({
+        goal: "survive gate daemon loss",
+        cwd: ${JSON.stringify(source)},
+        trusted: true,
+        model: { provider: "provider", id: "model" },
+        thinkingLevel: "high",
+        completionContract: {
+          localGates: [{
+            id: "restart-descendant-check",
+            timeoutMs: 2_000,
+            command: [process.execPath, "-e", ${JSON.stringify(`const { spawn } = require("node:child_process"); const fs = require("node:fs"); fs.writeFileSync(${JSON.stringify(gateGroupPidFile)}, String(process.pid)); const descendant = spawn(process.execPath, ["-e", ${JSON.stringify(`const fs = require("node:fs"); fs.writeFileSync(${JSON.stringify(descendantPidFile)}, String(process.pid)); setTimeout(() => { try { fs.writeFileSync(${JSON.stringify(lateMutation)}, "late\\n"); } catch {} }, 1_000); setInterval(() => {}, 10_000);`)}], { cwd: process.cwd(), stdio: "ignore" }); descendant.unref(); process.on("exit", () => fs.writeFileSync(${JSON.stringify(gateLeaderExitFile)}, "exited")); setTimeout(() => process.exit(0), 150);`)}]
+          }],
+        },
+      });
+      writeFileSync(${JSON.stringify(taskIdFile)}, task.id);
+      setInterval(() => {}, 10_000);
+    `;
+    daemon = spawn(process.execPath, ["--input-type=module", "-e", daemonCode], {
+      cwd: parent,
+      stdio: "ignore",
+    });
+
+    await eventually(() => existsSync(taskIdFile), Boolean, 3_000);
+    await eventually(() => existsSync(gateGroupPidFile), Boolean, 3_000);
+    await eventually(() => existsSync(descendantPidFile), Boolean, 3_000);
+    await eventually(() => existsSync(gateLeaderExitFile), Boolean, 3_000);
+    await eventually(() => existsSync(workerExitFile), Boolean, 3_000);
+    gateGroupPid = Number(readFileSync(gateGroupPidFile, "utf8"));
+    const taskId = readFileSync(taskIdFile, "utf8");
+    assert.equal(processGroupStatus(gateGroupPid), "alive");
+
+    daemon.kill("SIGKILL");
+    await waitForExit(daemon);
+
+    const database = new DatabaseSync(dbPath);
+    const durableGate = database
+      .prepare(`SELECT gate_pid AS gatePid, gate_pgid AS gatePgid,
+        gate_start_identity AS gateStartIdentity, gate_boot_id AS gateBootId,
+        gate_state AS gateState, gate_terminated AS gateTerminated
+        FROM attempts WHERE task_id = ?`)
+      .get(taskId);
+    database.close();
+    assert.ok(durableGate?.gatePid);
+    assert.equal(durableGate.gatePgid, gateGroupPid);
+    assert.ok(durableGate.gateStartIdentity);
+    assert.ok(durableGate.gateBootId);
+    assert.equal(durableGate.gateTerminated, 0);
+
+    replacement = new RuntimeStore({
+      dbPath,
+      piCommand,
+      worktreeRoot,
+    });
+    const restored = replacement.getTask(taskId);
+    assert.equal(restored.state, "blocked");
+    assert.equal(restored.attempts[0].gateState, "ambiguous");
+    assert.equal(restored.attempts[0].gateTerminated, false);
+    assert.equal(processGroupStatus(gateGroupPid), "alive");
+    await assert.rejects(
+      replacement.createTask({
+        goal: "must remain fenced",
+        cwd: source,
+        trusted: true,
+        model,
+        thinkingLevel: "high",
+      }),
+      /already active or unresolved/,
+    );
+
+    await eventually(
+      () => existsSync(join(restored.taskWorktree, lateMutation)),
+      Boolean,
+      3_000,
+    );
+    const afterLateMutation = replacement.getTask(taskId);
+    assert.equal(afterLateMutation.state, "blocked");
+    assert.equal(afterLateMutation.completionEvidenceRef, null);
+  } finally {
+    replacement?.release();
+    if (daemon?.exitCode === null && daemon?.signalCode === null)
+      daemon.kill("SIGKILL");
+    await waitForExit(daemon).catch(() => {});
+    for (const pid of [gateGroupPid]) {
+      if (!pid) continue;
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    }
     await rm(parent, { recursive: true, force: true });
   }
 });
