@@ -4,7 +4,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -15,6 +15,7 @@ import { FRESH_EXECUTOR_ARGS } from "../src/fresh-executor.js";
 const enabled = process.env.PI_SAND_REAL_RUNTIME === "1";
 const timeoutMs = Number(process.env.PI_SAND_REAL_RUNTIME_TIMEOUT_MS ?? 180_000);
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const daemonPath = join(repositoryRoot, "src", "daemon.js");
 const piCommand = process.env.PI_BIN ?? "pi";
 const expectedExtensionCommands = ["pi-sand", "task", "task-retry", "task-show", "task-stop", "tasks"];
 
@@ -83,6 +84,62 @@ function notificationPayload(event) {
   }
 }
 
+async function makePiWrapper(parent) {
+  const command = join(parent, "pi-wrapper");
+  const logPath = join(parent, "pi-argv.log");
+  await writeFile(command, `#!/bin/sh
+printf '%s\\0' "$@" >> "$PI_SAND_REAL_RUNTIME_ARG_LOG"
+printf '\\0' >> "$PI_SAND_REAL_RUNTIME_ARG_LOG"
+exec "$PI_SAND_REAL_PI_BIN" "$@"
+`);
+  await chmod(command, 0o755);
+  return { command, logPath };
+}
+
+function startDaemon(environment) {
+  const child = spawn(process.execPath, [daemonPath, "--foreground"], {
+    cwd: repositoryRoot,
+    detached: true,
+    env: environment,
+    stdio: "ignore",
+  });
+  child.unref();
+  return child;
+}
+
+async function readInvocationLog(logPath) {
+  let bytes;
+  try {
+    bytes = await readFile(logPath);
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
+  const invocations = [];
+  let invocation = [];
+  for (const argument of bytes.toString("utf8").split(String.fromCharCode(0))) {
+    if (argument) invocation.push(argument);
+    else if (invocation.length > 0) {
+      invocations.push(invocation);
+      invocation = [];
+    }
+  }
+  return invocations;
+}
+
+async function waitForInvocation(logPath, expectedArguments) {
+  const deadline = Date.now() + Math.min(timeoutMs, 10_000);
+  let invocations = [];
+  while (Date.now() < deadline) {
+    invocations = await readInvocationLog(logPath);
+    const matchingInvocation = invocations.find((argumentsForInvocation) => argumentsForInvocation.length === expectedArguments.length
+      && argumentsForInvocation.every((argument, index) => argument === expectedArguments[index]));
+    if (matchingInvocation) return matchingInvocation;
+    await delay(25);
+  }
+  throw new Error(`timed out waiting for exact Pi invocation ${JSON.stringify(expectedArguments)}; recorded ${JSON.stringify(invocations)}`);
+}
+
 async function commandNotification(child, events, stderr, id, message) {
   const startAt = events.length;
   send(child, { id, type: "prompt", message });
@@ -96,25 +153,6 @@ async function commandNotification(child, events, stderr, id, message) {
   );
   assert.equal(response.success, true, JSON.stringify(response));
   return notificationPayload(notification);
-}
-
-async function readProcessArguments(pid) {
-  const bytes = await readFile(`/proc/${pid}/cmdline`);
-  return bytes.toString("utf8").split("\0").filter(Boolean);
-}
-
-async function waitForProcessArguments(pid) {
-  const deadline = Date.now() + Math.min(timeoutMs, 10_000);
-  while (Date.now() < deadline) {
-    try {
-      const args = await readProcessArguments(pid);
-      if (args.length > 0) return args;
-    } catch {
-      // The worker may not have entered /proc yet.
-    }
-    await delay(25);
-  }
-  throw new Error(`Fresh Executor process ${pid} was not observable in /proc`);
 }
 
 async function waitForTask(client, id, predicate) {
@@ -215,6 +253,7 @@ async function runAcceptance(t) {
   let managerB;
   let daemonPid;
   let workerPgid;
+  let daemonProcess;
   try {
     managerA = startManager(source, environment);
     send(managerA.child, { id: "manager-state", type: "get_state" });
@@ -260,6 +299,20 @@ async function runAcceptance(t) {
       .sort();
     assert.deepEqual(extensionCommands, [...expectedExtensionCommands].sort());
 
+    // Start pi-sandd with the wrapper in its environment only. Manager A and
+    // B below are still spawned directly with the real installed Pi command.
+    const wrapper = await makePiWrapper(parent);
+    const daemonEnvironment = {
+      ...environment,
+      PI_BIN: wrapper.command,
+      PI_SAND_REAL_PI_BIN: piCommand,
+      PI_SAND_REAL_RUNTIME_ARG_LOG: wrapper.logPath,
+    };
+    daemonProcess = startDaemon(daemonEnvironment);
+    daemonPid = daemonProcess.pid;
+    const daemonStarted = await runtimeClient.status();
+    assert.equal(daemonStarted.daemonPid, daemonPid);
+
     const goal = [
       "Create exactly one repository file named real-runtime-artifact.txt.",
       "Its complete bytes must be exactly PI_SAND_REAL_RUNTIME_OK followed by one trailing newline.",
@@ -280,17 +333,13 @@ async function runAcceptance(t) {
     assert.equal(typeof attempt.workerPgid, "number");
     workerPgid = attempt.workerPgid;
     assert.notEqual(attempt.workerPid, managerA.child.pid, "Fresh Executor must be a separate Pi process");
+    assert.equal(attempt.workerPgid, attempt.workerPid, "Fresh Executor must retain one detached process group across the wrapper exec");
     assert.doesNotThrow(() => process.kill(attempt.workerPid, 0));
-    const workerArguments = await waitForProcessArguments(attempt.workerPid);
-    const profileStart = workerArguments.indexOf("--mode");
-    assert.deepEqual(
-      workerArguments.slice(profileStart, profileStart + FRESH_EXECUTOR_ARGS.length),
-      FRESH_EXECUTOR_ARGS,
-      `Fresh Executor command line must use the controlled profile: ${workerArguments.join(" ")}`,
-    );
+    const freshExecutorInvocation = await waitForInvocation(wrapper.logPath, FRESH_EXECUTOR_ARGS);
+    assert.deepEqual(freshExecutorInvocation, FRESH_EXECUTOR_ARGS, "daemon Fresh Executor must invoke the real Pi with the exact controlled profile");
 
     const daemonBeforeExit = await runtimeClient.status();
-    daemonPid = daemonBeforeExit.daemonPid;
+    assert.equal(daemonBeforeExit.daemonPid, daemonPid);
     assert.notEqual(daemonBeforeExit.daemonPid, managerA.child.pid);
     assert.doesNotThrow(() => process.kill(daemonBeforeExit.daemonPid, 0));
 
