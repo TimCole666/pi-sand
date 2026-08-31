@@ -29,6 +29,7 @@ export function checkPiCompatibility({ command = process.env.PI_BIN ?? "pi", cwd
 // The isolated spike keeps its restrictive flags because it intentionally probes a
 // controlled contract; those flags are not product behavior.
 const commonArgs = ["--mode", "rpc", "--no-session", "--approve"];
+export const FRESH_EXECUTOR_ARGS = ["--mode", "rpc", "--no-session", "--approve", "--no-extensions"];
 
 /** Spawn the installed Pi RPC process using the concrete contract proven by the spike. */
 export function spawnPi({ cwd, onEvent, onClose, command = process.env.PI_BIN ?? "pi" }) {
@@ -61,6 +62,37 @@ export function spawnPi({ cwd, onEvent, onClose, command = process.env.PI_BIN ??
       closed = true;
       try { process.kill(-child.pid, "SIGTERM"); }
       catch (error) { if (error.code !== "ESRCH") child.kill("SIGTERM"); }
+    },
+  };
+}
+
+/** Spawn one fresh, extension-free Pi RPC worker for a durable Task. */
+export function spawnFreshExecutor({ cwd, onEvent, onClose, command = process.env.PI_BIN ?? "pi", env = process.env }) {
+  const child = spawn(command, FRESH_EXECUTOR_ARGS, { cwd, detached: true, env, stdio: ["pipe", "pipe", "pipe"] });
+  let buffer = "";
+  let closed = false;
+  const send = (value) => { if (!closed && child.stdin.writable) child.stdin.write(`${JSON.stringify(value)}\n`); };
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    buffer += chunk;
+    let newline;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+      if (!line.trim()) continue;
+      try { onEvent?.(JSON.parse(line)); } catch { /* Ignore malformed diagnostics. */ }
+    }
+  });
+  child.once("error", (error) => { if (!closed) onClose?.({ code: null, signal: null, error }); });
+  child.once("close", (code, signal) => { closed = true; onClose?.({ code, signal }); });
+  return {
+    args: [...FRESH_EXECUTOR_ARGS], pid: child.pid, processGroupId: child.pid,
+    setModel({ provider, modelId }) { send({ id: `model-${Date.now()}`, type: "set_model", provider, modelId }); },
+    setThinkingLevel(level) { send({ id: `thinking-${Date.now()}`, type: "set_thinking_level", level }); },
+    prompt({ id, message }) { send({ id, type: "prompt", message }); },
+    close() {
+      if (closed) return;
+      closed = true;
+      try { process.kill(-child.pid, "SIGTERM"); } catch (error) { if (error.code !== "ESRCH") child.kill("SIGTERM"); }
     },
   };
 }

@@ -1,0 +1,114 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { TaskRuntime, TASK_RUNTIME_OWNERSHIP_ERROR } from "../src/task-runtime.js";
+import { registerPiSandExtension } from "../extensions/runtime.js";
+import { createExtensionHarness } from "./helpers/v0.2-extension-harness.js";
+
+async function repository(parent) {
+  const path = join(parent, "source");
+  execFileSync("git", ["init", "-q", path]);
+  execFileSync("git", ["-C", path, "config", "user.email", "test@example.com"]);
+  execFileSync("git", ["-C", path, "config", "user.name", "Test"]);
+  await writeFile(join(path, "fixture.txt"), "base\n");
+  execFileSync("git", ["-C", path, "add", "."]);
+  execFileSync("git", ["-C", path, "commit", "-qm", "base"]);
+  return path;
+}
+
+async function fakePi(parent) {
+  const command = join(parent, "fake-pi");
+  const packet = join(parent, "packet.jsonl");
+  const args = join(parent, "args.json");
+  await writeFile(command, `#!/usr/bin/env node
+const fs = require("node:fs");
+if (process.argv.includes("--version")) { process.stdout.write("0.84.4\\n"); process.exit(0); }
+fs.writeFileSync(process.env.ARGS_PATH, JSON.stringify(process.argv.slice(2)));
+process.stdin.on("data", (chunk) => fs.appendFileSync(process.env.PACKET_PATH, chunk));
+setInterval(() => {}, 1000);
+`);
+  await chmod(command, 0o755);
+  return { command, packet, args };
+}
+
+async function waitForPrompt(path) {
+  for (let i = 0; i < 100; i += 1) {
+    try {
+      const lines = (await readFile(path, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse);
+      if (lines.some((line) => line.type === "prompt")) return lines;
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("timed out waiting for worker prompt");
+}
+
+test("Extension /task persists an isolated Task and sends one bounded fresh-worker packet", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-"));
+  const source = await repository(parent);
+  const fake = await fakePi(parent);
+  const runtime = new TaskRuntime({ dbPath: join(parent, "task-runtime.sqlite"), piCommand: fake.command, workerEnv: { ...process.env, ARGS_PATH: fake.args, PACKET_PATH: fake.packet }, worktreeRoot: join(parent, "worktrees") });
+  const harness = createExtensionHarness({ cwd: () => source });
+  registerPiSandExtension(harness.pi, { taskRuntimeFactory: () => runtime });
+  const ctx = { ...harness.context("manager"), cwd: source, model: { provider: "provider-a", id: "model-a" }, thinkingLevel: "high", isProjectTrusted: () => true };
+  try {
+    const result = await harness.commands.get("task").handler("Fix the fixture", ctx);
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(result.task.state, "running");
+    assert.equal(result.task.attempts[0].provider, "provider-a");
+    assert.equal(result.task.attempts[0].modelId, "model-a");
+    assert.equal(result.task.attempts[0].thinkingLevel, "high");
+    assert.equal(result.task.baseCommit, execFileSync("git", ["-C", source, "rev-parse", "HEAD"], { encoding: "utf8" }).trim());
+    assert.notEqual(result.task.taskWorktree, source);
+    assert.match(result.task.taskBranch, /^pi-sand\/task-/);
+    const lines = await waitForPrompt(fake.packet);
+    const prompts = lines.filter((line) => line.type === "prompt");
+    assert.equal(prompts.length, 1);
+    assert.match(prompts[0].message, new RegExp(result.task.id));
+    assert.match(prompts[0].message, /Attempt: 1/);
+    assert.match(prompts[0].message, /Task worktree:/);
+    assert.match(prompts[0].message, /Base commit:/);
+    assert.match(prompts[0].message, /Goal: Fix the fixture/);
+    assert.doesNotMatch(prompts[0].message, /Manager transcript|prior conversation|previous worker/);
+    for (const command of lines.filter((line) => line.type !== "prompt")) assert.ok(["set_model", "set_thinking_level"].includes(command.type));
+    assert.deepEqual(JSON.parse(await readFile(fake.args, "utf8")), ["--mode", "rpc", "--no-session", "--approve", "--no-extensions"]);
+    const listed = await harness.commands.get("tasks").handler("", ctx);
+    assert.equal(listed.tasks[0].id, result.task.id);
+    const second = await harness.commands.get("task").handler("second", ctx);
+    assert.equal(second.ok, false);
+    assert.match(second.error, /already active/);
+    assert.equal(runtime.listTasks().length, 1);
+  } finally {
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("Task Git preflight rejects dirty and non-Git sources before opening its store", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-preflight-"));
+  const source = await repository(parent);
+  const fake = await fakePi(parent);
+  const runtime = new TaskRuntime({ dbPath: join(parent, "runtime.sqlite"), piCommand: fake.command, workerEnv: { ...process.env, ARGS_PATH: fake.args, PACKET_PATH: fake.packet } });
+  try {
+    await writeFile(join(source, "untracked.txt"), "dirty\n");
+    assert.throws(() => runtime.startTask({ goal: "reject", cwd: source, trusted: true, model: { provider: "p", id: "m" }, thinkingLevel: "low" }), /clean.*untracked/i);
+    assert.equal(runtime.db, null);
+    assert.throws(() => runtime.startTask({ goal: "reject", cwd: parent, trusted: true, model: { provider: "p", id: "m" }, thinkingLevel: "low" }), /Git preflight/);
+  } finally { runtime.close(); await rm(parent, { recursive: true, force: true }); }
+});
+
+test("Task Runtime ownership is lazy, separate, and non-fatal to basic Extension loading", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-owner-"));
+  const fake = await fakePi(parent);
+  const path = join(parent, "task-runtime.sqlite");
+  const first = new TaskRuntime({ dbPath: path, piCommand: fake.command, workerEnv: { ...process.env, ARGS_PATH: fake.args, PACKET_PATH: fake.packet } });
+  const second = new TaskRuntime({ dbPath: path, piCommand: fake.command, workerEnv: { ...process.env, ARGS_PATH: fake.args, PACKET_PATH: fake.packet } });
+  try {
+    assert.equal(first.db, null);
+    first.listTasks();
+    assert.throws(() => second.listTasks(), new RegExp(TASK_RUNTIME_OWNERSHIP_ERROR));
+    assert.match(first.dbPath, /task-runtime\.sqlite$/);
+  } finally { first.close(); second.close(); await rm(parent, { recursive: true, force: true }); }
+});
