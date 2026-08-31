@@ -1,13 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, realpathSync } from "node:fs";
-import { processGroupIsAlive, stopOwnedProcessGroup, stopOwnedProcessGroupSync, workerProcessMetadata, WORKER_STOP_TIMEOUT_MS } from "./process-group.js";
+import { processGroupIsAlive, processGroupStatus, stopOwnedProcessGroup, stopOwnedProcessGroupSync, workerProcessMetadata, WORKER_STOP_TIMEOUT_MS } from "./process-group.js";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { acquireDatabaseLock } from "./database-lock.js";
 import { checkPiCompatibility, spawnFreshExecutor } from "./pi.js";
-import { processGroupIdentity, processGroupStatus, processStartIdentity, readLinuxBootId } from "./process.js";
+import { processGroupIdentity, processStartIdentity, readLinuxBootId } from "./process.js";
 
 export const TASK_RUNTIME_OWNERSHIP_ERROR = "The pi-sand Task Runtime is already owned by another Pi process.";
 export const FRESH_EXECUTOR_UNSUPPORTED_ERROR = "Fresh Executor Tasks are supported only on Linux.";
@@ -20,6 +20,7 @@ export const TASK_SHUTDOWN_REASONS = Object.freeze(["quit", "reload", "new", "re
 
 const ACTIVE_STATES = "('starting', 'running')";
 const RECONCILABLE_STATES = "('starting', 'running', 'orphaned')";
+const RECONCILABLE_ATTEMPTS = `(state IN ${RECONCILABLE_STATES} OR (state = 'interrupted' AND worker_terminated = 0))`;
 const SHUTDOWN_REASON_SQL = "('quit', 'reload', 'new', 'resume', 'fork')";
 const RESTART_DETAIL = "The Task Runtime restarted before the Fresh Executor finished. The Attempt was not resumed or replayed.";
 const ORPHAN_DETAIL = "The prior Fresh Executor could not be safely identified or terminated. The Task is blocked and its worktree was retained.";
@@ -224,7 +225,7 @@ export class TaskRuntime {
     const timestamp = now();
     this.db.exec("BEGIN");
     try {
-      this.db.prepare(`UPDATE attempts SET state = ?, finished_at = COALESCE(finished_at, ?), terminal_detail = COALESCE(terminal_detail, ?) WHERE id = ? AND state IN ${RECONCILABLE_STATES}`).run(state, timestamp, terminalDetail, attempt.id);
+      this.db.prepare(`UPDATE attempts SET state = ?, finished_at = COALESCE(finished_at, ?), terminal_detail = COALESCE(terminal_detail, ?), worker_terminated = CASE WHEN ? = 'interrupted' THEN 1 ELSE worker_terminated END WHERE id = ? AND ${RECONCILABLE_ATTEMPTS}`).run(state, timestamp, terminalDetail, state, attempt.id);
       this.db.prepare(`
         UPDATE tasks SET state = CASE WHEN EXISTS (
           SELECT 1 FROM attempts WHERE task_id = tasks.id AND state = 'orphaned'
@@ -261,8 +262,9 @@ export class TaskRuntime {
   reconcilePriorAttempts() {
     const attempts = this.db.prepare(`
       SELECT id, task_id AS taskId, state, worker_pid AS workerPid, worker_pgid AS workerPgid,
-             worker_start_identity AS workerStartIdentity, worker_boot_id AS workerBootId
-      FROM attempts WHERE state IN ${RECONCILABLE_STATES} ORDER BY started_at, id
+             worker_start_identity AS workerStartIdentity, worker_boot_id AS workerBootId,
+             worker_terminated AS workerTerminated
+      FROM attempts WHERE ${RECONCILABLE_ATTEMPTS} ORDER BY started_at, id
     `).all();
     for (const attempt of attempts) this.reconcileAttempt(attempt);
   }
@@ -337,13 +339,16 @@ export class TaskRuntime {
     }
   }
 
-  startTask({ goal, cwd, trusted, model, thinkingLevel }) {
+  startTask({ goal, cwd, trusted, model, thinkingLevel, modelAuthPreflight }) {
     this.ensureSupported();
     if (typeof goal !== "string" || !goal.trim()) throw new Error("/task requires a goal");
     if (goal.trim().length > MAX_TASK_GOAL_LENGTH) throw new Error(`/task goal must be ${MAX_TASK_GOAL_LENGTH} characters or fewer.`);
     if (!trusted) throw new Error("/task requires a trusted Pi project.");
     if (!model?.provider || !model?.id) throw new Error("/task requires a selected provider and model.");
     if (!thinkingLevel) throw new Error("/task requires a selected thinking level.");
+    if (typeof modelAuthPreflight === "function" && modelAuthPreflight(model) !== true) {
+      throw new Error("/task requires usable authentication for the selected provider and model.");
+    }
     const preflight = preflightGitWorkspace(cwd);
     const compatibility = checkPiCompatibility({ command: this.piCommand, cwd: preflight.sourceRepoRoot });
     if (!compatibility.compatible || compatibility.version !== "0.84.4") throw new Error("/task requires an installed Pi 0.84.4 executable.");
@@ -513,12 +518,15 @@ export class TaskRuntime {
     return this.getTask(task.id);
   }
 
-  retryTask({ id, trusted, model, thinkingLevel }) {
+  retryTask({ id, trusted, model, thinkingLevel, modelAuthPreflight }) {
     this.ensureSupported();
     if (typeof id !== "string" || !id.trim()) throw new Error("/task-retry requires a Task id");
     if (!trusted) throw new Error("/task-retry requires a trusted Pi project.");
     if (!model?.provider || !model?.id) throw new Error("/task-retry requires a selected provider and model.");
     if (!thinkingLevel) throw new Error("/task-retry requires a selected thinking level.");
+    if (typeof modelAuthPreflight === "function" && modelAuthPreflight(model) !== true) {
+      throw new Error("/task-retry requires usable authentication for the selected provider and model.");
+    }
     const db = this.ensureOwner();
     const task = this.taskRow(id.trim());
     if (!task) throw new Error(`Task ${id} was not found.`);

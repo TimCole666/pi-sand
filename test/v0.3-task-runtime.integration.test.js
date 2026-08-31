@@ -191,6 +191,42 @@ test("Extension /task persists an isolated Task and sends one bounded fresh-work
   }
 });
 
+test("Extension rejects unavailable Manager model authentication before Task or worktree acceptance", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-auth-preflight-"));
+  const source = await repository(parent);
+  const fake = await fakePi(parent);
+  let factoryCalls = 0;
+  let workerCalls = 0;
+  const runtime = new TaskRuntime({
+    dbPath: join(parent, "runtime.sqlite"),
+    piCommand: fake.command,
+    workerFactory: () => { workerCalls += 1; return deterministicWorkerFactory()({}); },
+    worktreeRoot: join(parent, "worktrees"),
+  });
+  const harness = createExtensionHarness({ cwd: () => source });
+  registerPiSandExtension(harness.pi, {
+    taskRuntimeFactory: () => { factoryCalls += 1; return runtime; },
+  });
+  const ctx = {
+    ...harness.context("manager"),
+    cwd: source,
+    model: { provider: "provider", id: "model" },
+    modelRegistry: { hasConfiguredAuth: () => false },
+    thinkingLevel: "high",
+    isProjectTrusted: () => true,
+  };
+  try {
+    const result = await harness.commands.get("task").handler("must not accept", ctx);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /authentication/i);
+    assert.equal(factoryCalls, 1, "the injected runtime may be constructed, but must not acquire ownership");
+    assert.equal(workerCalls, 0);
+    assert.equal(runtime.db, null, "auth rejection must precede runtime ownership");
+    assert.equal(existsSync(join(parent, "worktrees")), false, "auth rejection must precede worktree acceptance");
+    assert.equal(gitOutput(source, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+  } finally { runtime.close(); await rm(parent, { recursive: true, force: true }); }
+});
+
 test("explicit stop and fresh retry preserve the task worktree and snapshot new model settings", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-stop-retry-"));
   const source = await repository(parent);
@@ -389,7 +425,7 @@ test("graceful reload and session replacement interrupt the owned worker before 
   }
 });
 
-test("an unprovable worker group stays interrupted and keeps its unsafe process metadata", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+test("startup reconciliation orphans an unsafe interrupted worker and keeps retry blocked", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-unsafe-shutdown-"));
   const source = await repository(parent);
   const fake = await fakePi(parent);
@@ -409,11 +445,13 @@ test("an unprovable worker group stays interrupted and keeps its unsafe process 
     const replacement = new TaskRuntime({ dbPath: join(parent, "task-runtime.sqlite") });
     try {
       const task = replacement.getTask(started.taskId ?? started.id);
-      assert.equal(task.state, "interrupted");
+      assert.equal(task.state, "blocked");
       assert.equal(task.shutdownReason, "reload");
+      assert.equal(task.attempts[0].state, "orphaned");
       assert.equal(task.attempts[0].workerTerminated, false);
       assert.equal(task.attempts[0].workerPid, worker.pid);
       assert.equal(task.attempts[0].workerPgid, foreign.pid);
+      assert.throws(() => replacement.retryTask({ id: task.id, trusted: true, model: { provider: "p", id: "m" }, thinkingLevel: "low" }), /blocked/);
     } finally { replacement.close(); }
   } finally {
     runtime.close();
@@ -424,6 +462,40 @@ test("an unprovable worker group stays interrupted and keeps its unsafe process 
     }
     await rm(parent, { recursive: true, force: true });
   }
+});
+
+test("the same Extension reacquires a fresh Task Runtime after session replacement without replaying the old worker", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-runtime-replacement-"));
+  const source = await repository(parent);
+  const fake = await fakePi(parent);
+  const dbPath = join(parent, "runtime.sqlite");
+  const runtimes = [];
+  const makeRuntime = () => {
+    const runtime = new TaskRuntime({ dbPath, piCommand: fake.command, workerEnv: { ...process.env, ARGS_PATH: fake.args, PACKET_PATH: fake.packet }, worktreeRoot: join(parent, "worktrees") });
+    runtimes.push(runtime);
+    return runtime;
+  };
+  const harness = createExtensionHarness({ cwd: () => source });
+  registerPiSandExtension(harness.pi, { taskRuntimeFactory: makeRuntime });
+  const oldContext = { ...harness.context("old"), cwd: source, model: { provider: "provider", id: "model" }, thinkingLevel: "high", isProjectTrusted: () => true };
+  const newContext = { ...harness.context("new"), cwd: source, model: { provider: "provider", id: "model" }, thinkingLevel: "high", isProjectTrusted: () => true };
+  try {
+    await harness.invoke("session_start", { type: "session_start", reason: "startup" }, oldContext);
+    const started = await harness.commands.get("task").handler("survive replacement", oldContext);
+    assert.equal(started.ok, true, JSON.stringify(started));
+    await waitForPrompt(fake.packet);
+    await harness.invoke("session_shutdown", { type: "session_shutdown", reason: "new" }, oldContext);
+    assert.equal(runtimes.length, 1);
+    assert.equal(runtimes[0].closed, true);
+    await harness.invoke("session_start", { type: "session_start", reason: "new" }, newContext);
+    const listed = await harness.commands.get("tasks").handler("", newContext);
+    assert.equal(listed.ok, true, JSON.stringify(listed));
+    assert.equal(listed.tasks[0].id, started.task.id);
+    assert.equal(listed.tasks[0].state, "interrupted");
+    assert.equal(runtimes.length, 2, "replacement must construct a fresh runtime lazily");
+    assert.equal(runtimes[1].closed, false);
+    assert.equal((await readFile(fake.packet, "utf8")).trim().split("\n").filter(Boolean).length, 3, "replacement must not adopt or replay the old worker");
+  } finally { for (const runtime of runtimes) runtime.close(); await rm(parent, { recursive: true, force: true }); }
 });
 
 test("Task Runtime ownership is lazy, separate, and non-fatal to basic Extension loading", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
