@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { createServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -123,6 +124,38 @@ test("singleton races converge, stale sockets are reclaimed only after DB owners
     await assert.rejects(client.request("runtime.status", {}, { version: 2 }), (error) => /protocol is incompatible/.test(error.message));
   } finally {
     if (daemonPid) await terminateRuntimes(env, daemonPid).catch(() => {});
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("a sent mutating request reports an unknown outcome without automatic replay", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-ambiguous-disconnect-"));
+  const env = environment(parent);
+  const socketPath = runtimeSocketPath({ env });
+  await mkdir(dirname(socketPath), { recursive: true });
+  await chmod(dirname(socketPath), 0o700);
+  const server = createServer((socket) => socket.once("data", () => socket.destroy()));
+  await new Promise((resolveServer, rejectServer) => {
+    server.once("error", rejectServer);
+    server.listen(socketPath, resolveServer);
+  });
+  let daemonStarts = 0;
+  const client = new RuntimeClient({
+    env,
+    requestTimeoutMs: 250,
+    spawnImpl: () => {
+      daemonStarts += 1;
+      throw new Error("automatic replay must not start a daemon");
+    },
+  });
+  try {
+    await assert.rejects(client.request("task.stop", { id: "task-1" }), (error) => {
+      assert.equal(error.code, "ambiguous_mutation");
+      return /outcome is unknown/.test(error.message);
+    });
+    assert.equal(daemonStarts, 0);
+  } finally {
+    await new Promise((resolveServer) => server.close(resolveServer));
     await rm(parent, { recursive: true, force: true });
   }
 });

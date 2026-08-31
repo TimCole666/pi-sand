@@ -47,7 +47,33 @@ test("daemon rejects dirty sources before Task acceptance and bounds packets", {
   try { const error = await client(parent, env, "task.create", { goal: "reject", cwd: source, trusted: true, model: { provider: "p", id: "m" }, thinkingLevel: "high" }).catch((failure) => failure); assert.match(error.message, /clean.*untracked/i); daemonPid = (await client(parent, env, "runtime.status")).daemonPid; assert.equal((await client(parent, env, "task.list")).tasks.length, 0); assert.equal(existsSync(join(parent, "worktrees")), false); assert.throws(() => buildTaskPacket({ taskId: "task", attemptNumber: 1, goal: "x".repeat(MAX_TASK_GOAL_LENGTH * 2), taskBranch: "branch", taskWorktree: "/tmp/worktree", baseCommit: "a".repeat(40) }), /bounded size/); } finally { if (daemonPid) { try { process.kill(daemonPid, "SIGTERM"); } catch (error) { if (error.code !== "ESRCH") throw error; } } await wait(50); await rm(parent, { recursive: true, force: true }); }
 });
 
-test("official Extension checks trust/auth before create and lifecycle disposal is a no-op", async () => {
-  const calls = []; const clientAdapter = { createTask: async (params) => { calls.push(params); return { id: "task-1", state: "running" }; }, listTasks: async () => [], getTask: async () => ({ id: "task-1", state: "running" }) }; const harness = createExtensionHarness(); registerPiSandExtension(harness.pi, { runtimeClientFactory: () => clientAdapter }); const base = { ...harness.context("manager"), model: { provider: "p", id: "m", apiKey: "secret" }, thinkingLevel: "high" };
-  assert.equal((await harness.commands.get("task").handler("nope", { ...base, isProjectTrusted: () => false })).ok, false); assert.equal(calls.length, 0); assert.equal((await harness.commands.get("task").handler("nope", { ...base, isProjectTrusted: () => true, modelRegistry: { hasConfiguredAuth: () => false } })).ok, false); assert.equal(calls.length, 0); assert.equal((await harness.commands.get("task").handler("do it", { ...base, isProjectTrusted: () => true, modelRegistry: { hasConfiguredAuth: () => true } })).ok, true); assert.deepEqual(calls[0].model, { provider: "p", id: "m" }); await harness.invoke("session_shutdown", { type: "session_shutdown", reason: "quit" }, base); assert.equal(calls.length, 1);
+test("official Extension checks trust/auth and every Pi client lifecycle is a Task no-op", async () => {
+  const createCalls = [];
+  const controlCalls = [];
+  const clientAdapter = {
+    createTask: async (params) => { createCalls.push(params); return { id: "task-1", state: "running" }; },
+    listTasks: async () => [],
+    getTask: async () => ({ id: "task-1", state: "running" }),
+    stopTask: async (id) => { controlCalls.push(["stop", id]); return { id, state: "stopped" }; },
+    retryTask: async (params) => { controlCalls.push(["retry", params]); return { id: params.id, state: "running" }; },
+  };
+  const harness = createExtensionHarness();
+  registerPiSandExtension(harness.pi, { runtimeClientFactory: () => clientAdapter });
+  const base = { ...harness.context("manager"), model: { provider: "p", id: "m", apiKey: "secret" }, thinkingLevel: "high" };
+
+  assert.equal((await harness.commands.get("task").handler("nope", { ...base, isProjectTrusted: () => false })).ok, false);
+  assert.equal(createCalls.length, 0);
+  assert.equal((await harness.commands.get("task").handler("nope", { ...base, isProjectTrusted: () => true, modelRegistry: { hasConfiguredAuth: () => false } })).ok, false);
+  assert.equal(createCalls.length, 0);
+  assert.equal((await harness.commands.get("task").handler("do it", { ...base, isProjectTrusted: () => true, modelRegistry: { hasConfiguredAuth: () => true } })).ok, true);
+  assert.deepEqual(createCalls[0].model, { provider: "p", id: "m" });
+
+  for (const reason of ["quit", "reload", "new", "resume", "fork"]) {
+    const context = { ...base, ...harness.context(reason) };
+    await harness.invoke("session_start", { type: "session_start", reason }, context);
+    await harness.invoke("agent_start", { type: "agent_start" }, context);
+    await harness.invoke("session_shutdown", { type: "session_shutdown", reason }, context);
+  }
+  assert.equal(createCalls.length, 1);
+  assert.deepEqual(controlCalls, [], "Pi client lifecycle must not stop or retry a daemon-owned Task");
 });
