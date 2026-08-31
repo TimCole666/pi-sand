@@ -50,8 +50,9 @@ function validateRequest(request) {
   }
 }
 
-function handleRequest(request, store) {
+async function handleRequest(request, store) {
   validateRequest(request);
+  const params = request.params && typeof request.params === "object" ? request.params : {};
   switch (request.method) {
     case "runtime.status":
       return {
@@ -62,8 +63,14 @@ function handleRequest(request, store) {
       };
     case "task.list":
       return { tasks: store.listTasks() };
+    case "task.get": {
+      const task = store.getTask(params.id);
+      if (!task) throw Object.assign(new Error("Task was not found."), { code: "task_not_found" });
+      return { task };
+    }
     case "task.create":
-    case "task.get":
+      if (Object.keys(params).length === 0) throw Object.assign(new Error("method is not implemented in protocol v1 tracer bullet: task.create"), { code: "method_unimplemented" });
+      return { task: await store.createTask(params) };
     case "task.stop":
     case "task.retry":
       throw Object.assign(new Error(`method is not implemented in protocol v1 tracer bullet: ${request.method}`), { code: "method_unimplemented" });
@@ -102,7 +109,7 @@ function bindServer(server, socketPath) {
 function serveConnection(socket, store) {
   let buffer = "";
   let handled = false;
-  const finish = (line) => {
+  const finish = async (line) => {
     if (handled) return;
     handled = true;
     let request;
@@ -111,7 +118,7 @@ function serveConnection(socket, store) {
       return;
     }
     try {
-      const data = handleRequest(request, store);
+      const data = await handleRequest(request, store);
       socket.end(`${response(request.id, true, data)}\n`);
     } catch (error) {
       const code = error.code && /^[a-z_]+$/.test(error.code) ? error.code : "request_failed";
@@ -129,7 +136,7 @@ function serveConnection(socket, store) {
     }
     const newline = buffer.indexOf("\n");
     if (newline < 0) return;
-    finish(buffer.slice(0, newline).replace(/\r$/, ""));
+    void finish(buffer.slice(0, newline).replace(/\r$/, ""));
   });
   socket.on("error", () => {});
 }
@@ -137,7 +144,7 @@ function serveConnection(socket, store) {
 export async function startRuntimeDaemon({
   dbPath = runtimeDatabasePath(),
   socketPath = process.env.PI_SAND_SOCKET ?? runtimeSocketPath(),
-  store = new RuntimeStore({ dbPath }),
+  store = new RuntimeStore({ dbPath, piCommand: process.env.PI_BIN ?? "pi", worktreeRoot: process.env.PI_SAND_TASK_WORKTREE_ROOT }),
 } = {}) {
   assertLinux();
   // Secure the socket parent before binding. Singleton cleanup happens only

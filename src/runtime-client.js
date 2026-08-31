@@ -13,6 +13,8 @@ import {
 
 export const CLIENT_PROTOCOL_MISMATCH_ERROR = "The pi-sand runtime protocol is incompatible with this client.";
 export const RUNTIME_UNAVAILABLE_ERROR = "The pi-sand runtime could not be reached.";
+export const MUTATION_OUTCOME_UNKNOWN_ERROR = "The Task mutation outcome is unknown; inspect /tasks before trying again.";
+const MUTATING_METHODS = new Set(["task.create", "task.stop", "task.retry"]);
 const DEFAULT_START_TIMEOUT_MS = 10_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
 const daemonPath = fileURLToPath(new URL("./daemon.js", import.meta.url));
@@ -74,6 +76,18 @@ export class RuntimeClient {
     return result.tasks;
   }
 
+  async createTask(params) {
+    const result = await this.request("task.create", params);
+    if (!result?.task) throw new Error("The runtime returned an invalid Task.");
+    return result.task;
+  }
+
+  async getTask(id) {
+    const result = await this.request("task.get", { id });
+    if (!result?.task) throw new Error("The runtime returned an invalid Task.");
+    return result.task;
+  }
+
   async request(method, params = {}, { version = PROTOCOL_VERSION } = {}) {
     if (process.platform !== "linux") throw new Error("The pi-sand runtime is supported only on Linux.");
     if (!isAbsolute(this.socketPath)) throw new Error("The pi-sand runtime socket path must be absolute.");
@@ -82,6 +96,7 @@ export class RuntimeClient {
     try {
       response = await this.requestSocket(method, params, version);
     } catch (firstError) {
+      if (firstError.code === "ambiguous_mutation" || (MUTATING_METHODS.has(method) && firstError.sent)) throw firstError;
       await this.startDaemon(firstError);
       response = await this.waitForResponse(method, params, version);
     }
@@ -96,6 +111,7 @@ export class RuntimeClient {
   async requestSocket(method, params, version) {
     return new Promise((resolveResponse, rejectResponse) => {
       let settled = false;
+      let sent = false;
       let buffer = "";
       const requestId = randomUUID();
       const socket = this.connectImpl({ path: this.socketPath });
@@ -105,7 +121,10 @@ export class RuntimeClient {
         settled = true;
         clearTimeout(timer);
         socket.destroy();
-        if (error) rejectResponse(error);
+        if (error && sent && MUTATING_METHODS.has(method)) {
+          const unknown = new Error(MUTATION_OUTCOME_UNKNOWN_ERROR, { cause: error });
+          unknown.code = "ambiguous_mutation"; unknown.sent = true; rejectResponse(unknown);
+        } else if (error) { error.sent = sent; rejectResponse(error); }
         else resolveResponse(response);
       };
       socket.setEncoding?.("utf8");
@@ -127,7 +146,8 @@ export class RuntimeClient {
       socket.once("error", (error) => finish(error));
       socket.once("close", () => { if (!settled) finish(new Error("runtime closed the connection before responding")); });
       socket.once("connect", () => {
-        socket.write(`${JSON.stringify({ id: requestId, version, method, params })}\n`);
+        try { sent = true; socket.write(`${JSON.stringify({ id: requestId, version, method, params })}\n`); }
+        catch (error) { finish(error); }
       });
     });
   }
