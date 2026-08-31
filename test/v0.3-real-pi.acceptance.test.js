@@ -4,7 +4,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -105,6 +105,22 @@ function startDaemon(environment) {
   });
   child.unref();
   return child;
+}
+
+async function waitForDaemon(runtimeClient, daemonProcess) {
+  const deadline = Date.now() + Math.min(timeoutMs, 10_000);
+  while (Date.now() < deadline) {
+    if (daemonProcess.exitCode !== null) {
+      throw new Error(`the wrapper-backed daemon exited before becoming ready (code=${daemonProcess.exitCode}, signal=${daemonProcess.signalCode})`);
+    }
+    try {
+      await access(runtimeClient.socketPath);
+      return await runtimeClient.status();
+    } catch {
+      await delay(25);
+    }
+  }
+  throw new Error("timed out waiting for the wrapper-backed daemon socket");
 }
 
 async function readInvocationLog(logPath) {
@@ -253,7 +269,6 @@ async function runAcceptance(t) {
   let managerB;
   let daemonPid;
   let workerPgid;
-  let daemonProcess;
   try {
     managerA = startManager(source, environment);
     send(managerA.child, { id: "manager-state", type: "get_state" });
@@ -308,9 +323,9 @@ async function runAcceptance(t) {
       PI_SAND_REAL_PI_BIN: piCommand,
       PI_SAND_REAL_RUNTIME_ARG_LOG: wrapper.logPath,
     };
-    daemonProcess = startDaemon(daemonEnvironment);
+    const daemonProcess = startDaemon(daemonEnvironment);
     daemonPid = daemonProcess.pid;
-    const daemonStarted = await runtimeClient.status();
+    const daemonStarted = await waitForDaemon(runtimeClient, daemonProcess);
     assert.equal(daemonStarted.daemonPid, daemonPid);
 
     const goal = [
@@ -415,13 +430,13 @@ async function runAcceptance(t) {
 
 const piVersionProbe = enabled ? spawnSync(piCommand, ["--version"], { encoding: "utf8" }) : null;
 
-const skipReason = !enabled
-  ? "set PI_SAND_REAL_RUNTIME=1 with Pi 0.84.4 and usable configured model credentials to run the opt-in persistent-runtime acceptance"
-  : piVersionProbe?.status !== 0
-    ? `Pi 0.84.4 is required (${piVersionProbe?.error?.message ?? "version probe failed"})`
-    : piVersionProbe.stdout.trim() !== "0.84.4"
-      ? `Pi 0.84.4 is required; found ${piVersionProbe.stdout.trim() || "no version"}`
-      : undefined;
+const skipReason = enabled
+  ? piVersionProbe?.status === 0
+    ? piVersionProbe.stdout.trim() === "0.84.4"
+      ? undefined
+      : `Pi 0.84.4 is required; found ${piVersionProbe.stdout.trim() || "no version"}`
+    : `Pi 0.84.4 is required (${piVersionProbe?.error?.message ?? "version probe failed"})`
+  : "set PI_SAND_REAL_RUNTIME=1 with Pi 0.84.4 and usable configured model credentials to run the opt-in persistent-runtime acceptance";
 
 test("v0.3 real Pi Manager A exit -> daemon completion -> Manager B reconnect", {
   skip: skipReason,
