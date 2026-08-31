@@ -136,9 +136,10 @@ export class RuntimeClient {
         throw firstError;
       await this.startDaemon(firstError);
       const readiness = await this.waitForDaemon(version);
-      response = method === "runtime.status"
-        ? readiness
-        : await this.waitForResponse(method, params, version);
+      response =
+        method === "runtime.status"
+          ? readiness
+          : await this.waitForResponse(method, params, version);
     }
     if (response.version !== PROTOCOL_VERSION)
       throw protocolMismatch(
@@ -152,7 +153,12 @@ export class RuntimeClient {
     return response.data;
   }
 
-  async requestSocket(method, params, version, timeoutMs = this.requestTimeoutMs) {
+  async requestSocket(
+    method,
+    params,
+    version,
+    timeoutMs = this.requestTimeoutMs,
+  ) {
     return new Promise((resolveResponse, rejectResponse) => {
       let settled = false;
       let sent = false;

@@ -21,20 +21,32 @@ function runClient(environment) {
     process.stdout.write(JSON.stringify({ status, tasks }) + "\\n");
   `;
   return new Promise((resolveClient, rejectClient) => {
-    const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
-      cwd: repositoryRoot,
-      env: { ...process.env, ...environment },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    const child = spawn(
+      process.execPath,
+      ["--input-type=module", "-e", script],
+      {
+        cwd: repositoryRoot,
+        env: { ...process.env, ...environment },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
     child.once("error", rejectClient);
     child.once("close", (code, signal) => {
-      if (code === 0) resolveClient(JSON.parse(stdout.trim())); else rejectClient(new Error(`client failed (${code}, ${signal}): ${stderr}`));
+      if (code === 0) resolveClient(JSON.parse(stdout.trim()));
+      else
+        rejectClient(
+          new Error(`client failed (${code}, ${signal}): ${stderr}`),
+        );
     });
   });
 }
@@ -47,12 +59,24 @@ function environment(parent) {
 }
 
 async function terminateDaemon(pid) {
-  try { process.kill(pid, "SIGTERM"); } catch (error) { if (error.code !== "ESRCH") throw error; }
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (error) {
+    if (error.code !== "ESRCH") throw error;
+  }
   for (let index = 0; index < 100; index += 1) {
-    try { process.kill(pid, 0); } catch (error) { if (error.code === "ESRCH") return; }
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if (error.code === "ESRCH") return;
+    }
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
   }
-  try { process.kill(pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch (error) {
+    if (error.code !== "ESRCH") throw error;
+  }
 }
 
 async function terminateRuntimes(env, knownPid) {
@@ -61,7 +85,10 @@ async function terminateRuntimes(env, knownPid) {
     await terminateDaemon(pid);
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
     try {
-      const response = await new RuntimeClient({ env, requestTimeoutMs: 100 }).requestSocket("runtime.status", {}, 1);
+      const response = await new RuntimeClient({
+        env,
+        requestTimeoutMs: 100,
+      }).requestSocket("runtime.status", {}, 1);
       pid = response.data?.daemonPid;
     } catch {
       pid = null;
@@ -69,7 +96,9 @@ async function terminateRuntimes(env, knownPid) {
   }
 }
 
-test("a detached daemon survives a client process and a fresh client reconnects to its durable runtime", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+test("a detached daemon survives a client process and a fresh client reconnects to its durable runtime", {
+  skip: process.platform === "linux" ? false : "Linux-only",
+}, async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-ipc-lifetime-"));
   const env = environment(parent);
   let daemonPid;
@@ -95,7 +124,9 @@ test("a detached daemon survives a client process and a fresh client reconnects 
   }
 });
 
-test("singleton races converge, stale sockets are reclaimed only after DB ownership, and protocol errors stay explicit", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+test("singleton races converge, stale sockets are reclaimed only after DB ownership, and protocol errors stay explicit", {
+  skip: process.platform === "linux" ? false : "Linux-only",
+}, async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-ipc-race-"));
   const env = environment(parent);
   let daemonPid;
@@ -120,20 +151,29 @@ test("singleton races converge, stale sockets are reclaimed only after DB owners
       assert.equal(error.code, "unknown_method");
       return /unknown protocol method/.test(error.message);
     });
-    await assert.rejects(client.request("runtime.status", {}, { version: 2 }), (error) => /protocol is incompatible/.test(error.message));
+    await assert.rejects(
+      client.request("runtime.status", {}, { version: 2 }),
+      (error) => /protocol is incompatible/.test(error.message),
+    );
   } finally {
     if (daemonPid) await terminateRuntimes(env, daemonPid).catch(() => {});
     await rm(parent, { recursive: true, force: true });
   }
 });
 
-test("a sent mutating request reports an unknown outcome without automatic replay", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
-  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-ambiguous-disconnect-"));
+test("a sent mutating request reports an unknown outcome without automatic replay", {
+  skip: process.platform === "linux" ? false : "Linux-only",
+}, async () => {
+  const parent = await mkdtemp(
+    join(tmpdir(), "pi-sand-v03-ambiguous-disconnect-"),
+  );
   const env = environment(parent);
   const socketPath = runtimeSocketPath({ env });
   await mkdir(dirname(socketPath), { recursive: true });
   await chmod(dirname(socketPath), 0o700);
-  const server = createServer((socket) => socket.once("data", () => socket.destroy()));
+  const server = createServer((socket) =>
+    socket.once("data", () => socket.destroy()),
+  );
   await new Promise((resolveServer, rejectServer) => {
     server.once("error", rejectServer);
     server.listen(socketPath, resolveServer);
@@ -148,10 +188,13 @@ test("a sent mutating request reports an unknown outcome without automatic repla
     },
   });
   try {
-    await assert.rejects(client.request("task.stop", { id: "task-1" }), (error) => {
-      assert.equal(error.code, "ambiguous_mutation");
-      return /outcome is unknown/.test(error.message);
-    });
+    await assert.rejects(
+      client.request("task.stop", { id: "task-1" }),
+      (error) => {
+        assert.equal(error.code, "ambiguous_mutation");
+        return /outcome is unknown/.test(error.message);
+      },
+    );
     assert.equal(daemonStarts, 0);
   } finally {
     await new Promise((resolveServer) => server.close(resolveServer));
@@ -159,9 +202,17 @@ test("a sent mutating request reports an unknown outcome without automatic repla
   }
 });
 
-test("autostart does not replay a transmitted mutation after the daemon disconnects", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
-  for (const [method, params] of [["task.create", { goal: "create once" }], ["task.stop", { id: "task-1" }], ["task.retry", { id: "task-1" }]]) {
-    const parent = await mkdtemp(join(tmpdir(), `pi-sand-v03-autostart-${method.replace(".", "-")}-`));
+test("autostart does not replay a transmitted mutation after the daemon disconnects", {
+  skip: process.platform === "linux" ? false : "Linux-only",
+}, async () => {
+  for (const [method, params] of [
+    ["task.create", { goal: "create once" }],
+    ["task.stop", { id: "task-1" }],
+    ["task.retry", { id: "task-1" }],
+  ]) {
+    const parent = await mkdtemp(
+      join(tmpdir(), `pi-sand-v03-autostart-${method.replace(".", "-")}-`),
+    );
     const env = environment(parent);
     const socketPath = runtimeSocketPath({ env });
     await mkdir(dirname(socketPath), { recursive: true });
@@ -175,18 +226,26 @@ test("autostart does not replay a transmitted mutation after the daemon disconne
       startTimeoutMs: 500,
       spawnImpl: () => {
         daemonStarts += 1;
-        daemonServer = createServer((socket) => socket.once("data", (chunk) => {
-          const request = JSON.parse(String(chunk).trim());
-          received.push(request);
-          if (request.method === "runtime.status") {
-            socket.end(`${JSON.stringify({
-              id: request.id,
-              version: 1,
-              success: true,
-              data: { protocolVersion: 1, daemonPid: process.pid, state: "ready" },
-            })}\n`);
-          } else socket.destroy();
-        }));
+        daemonServer = createServer((socket) =>
+          socket.once("data", (chunk) => {
+            const request = JSON.parse(String(chunk).trim());
+            received.push(request);
+            if (request.method === "runtime.status") {
+              socket.end(
+                `${JSON.stringify({
+                  id: request.id,
+                  version: 1,
+                  success: true,
+                  data: {
+                    protocolVersion: 1,
+                    daemonPid: process.pid,
+                    state: "ready",
+                  },
+                })}\n`,
+              );
+            } else socket.destroy();
+          }),
+        );
         daemonServer.listen(socketPath);
         return {};
       },
@@ -210,7 +269,9 @@ test("autostart does not replay a transmitted mutation after the daemon disconne
   }
 });
 
-test("autostart bounds a silent daemon within the startup deadline", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+test("autostart bounds a silent daemon within the startup deadline", {
+  skip: process.platform === "linux" ? false : "Linux-only",
+}, async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-silent-daemon-"));
   const env = environment(parent);
   const socketPath = runtimeSocketPath({ env });
@@ -250,14 +311,23 @@ test("the Extension exposes /tasks through an IPC client and never owns runtime 
   const clients = [];
   registerPiSandExtension(harness.pi, {
     runtimeClientFactory: () => {
-      const client = { closed: false, listTasks: async () => [{ id: "task-1", state: "completed" }], close() { this.closed = true; } };
+      const client = {
+        closed: false,
+        listTasks: async () => [{ id: "task-1", state: "completed" }],
+        close() {
+          this.closed = true;
+        },
+      };
       clients.push(client);
       return client;
     },
   });
   const context = harness.context("session");
   const result = await harness.commands.get("tasks").handler("", context);
-  assert.deepEqual(result, { ok: true, tasks: [{ id: "task-1", state: "completed" }] });
+  assert.deepEqual(result, {
+    ok: true,
+    tasks: [{ id: "task-1", state: "completed" }],
+  });
   assert.equal(clients.length, 1);
   assert.equal(harness.notifications.at(-1).type, "info");
   assert.equal([...harness.commands.keys()].includes("task"), false);
@@ -266,8 +336,19 @@ test("the Extension exposes /tasks through an IPC client and never owns runtime 
   assert.equal([...harness.commands.keys()].includes("task-retry"), false);
 
   for (const reason of ["quit", "reload", "new", "resume", "fork"]) {
-    await harness.invoke("session_start", { type: "session_start", reason }, harness.context(reason));
-    await harness.invoke("session_shutdown", { type: "session_shutdown", reason }, harness.context(reason));
+    await harness.invoke(
+      "session_start",
+      { type: "session_start", reason },
+      harness.context(reason),
+    );
+    await harness.invoke(
+      "session_shutdown",
+      { type: "session_shutdown", reason },
+      harness.context(reason),
+    );
   }
-  assert.equal(clients.every((client) => client.closed === false), true);
+  assert.equal(
+    clients.every((client) => client.closed === false),
+    true,
+  );
 });

@@ -407,10 +407,14 @@ test("settlement rules preserve commits, checkpoint residual changes, avoid empt
   const piCommand = await versionCommand(parent);
   let emit;
   const runtime = new RuntimeStore({
-    ...startOptions(source, ({ onEvent }) => {
-      emit = onEvent;
-      return { close() {} };
-    }, piCommand),
+    ...startOptions(
+      source,
+      ({ onEvent }) => {
+        emit = onEvent;
+        return { close() {} };
+      },
+      piCommand,
+    ),
     dbPath: join(parent, "runtime.sqlite"),
   });
   try {

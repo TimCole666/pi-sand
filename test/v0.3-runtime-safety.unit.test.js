@@ -141,9 +141,8 @@ test(
         const taskAfterReopen = reopened.getTask("task-1");
         assert.equal(taskAfterReopen.attempts[0].provider, null);
         assert.equal(
-          reopened.db
-            .prepare("SELECT COUNT(*) AS count FROM attempts")
-            .get().count,
+          reopened.db.prepare("SELECT COUNT(*) AS count FROM attempts").get()
+            .count,
           1,
         );
       } finally {
@@ -328,69 +327,77 @@ test("Stop wins over a concurrent settled completion", linuxOnly, async () => {
   }
 });
 
-test("daemon shutdown wins over a concurrent settled completion", linuxOnly, async () => {
-  const parent = await mkdtemp(
-    join(tmpdir(), "pi-sand-runtime-shutdown-settle-race-"),
-  );
-  const source = await repository(parent);
-  let child;
-  let emit;
-  let releaseRetirement;
-  let enterRetirement;
-  const retirement = new Promise((resolveRetirement) => {
-    releaseRetirement = resolveRetirement;
-  });
-  const retirementEntered = new Promise((resolveRetirement) => {
-    enterRetirement = resolveRetirement;
-  });
-  const runtime = new TaskRuntime({
-    dbPath: join(parent, "runtime.sqlite"),
-    piCommand: await versionCommand(parent),
-    workerFactory: ({ onEvent, onWorkerSpawn }) => {
-      child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
-        detached: true,
-        stdio: "ignore",
-      });
-      const worker = { pid: child.pid, processGroupId: child.pid, close() {} };
-      onWorkerSpawn(worker);
-      emit = onEvent;
-      return worker;
-    },
-    worktreeRoot: join(parent, "worktrees"),
-    workerStopTimeoutMs: 100,
-  });
-  runtime.retireWorker = async () => {
-    enterRetirement();
-    await retirement;
-    return true;
-  };
-  try {
-    const started = await runtime.createTask(taskOptions(source));
-    emit({
-      type: "message_end",
-      message: {
-        role: "assistant",
-        content: "settled result",
-        stopReason: "stop",
-      },
+test(
+  "daemon shutdown wins over a concurrent settled completion",
+  linuxOnly,
+  async () => {
+    const parent = await mkdtemp(
+      join(tmpdir(), "pi-sand-runtime-shutdown-settle-race-"),
+    );
+    const source = await repository(parent);
+    let child;
+    let emit;
+    let releaseRetirement;
+    let enterRetirement;
+    const retirement = new Promise((resolveRetirement) => {
+      releaseRetirement = resolveRetirement;
     });
-    emit({ type: "agent_settled" });
-    await retirementEntered;
-    assert.equal(await runtime.shutdown("daemon-shutdown"), "interrupted");
-    releaseRetirement();
-    await new Promise((resolveWait) => setImmediate(resolveWait));
-    const interrupted = runtime.getTask(started.id);
-    assert.equal(interrupted.state, "interrupted");
-    assert.equal(interrupted.shutdownReason, "daemon-shutdown");
-    assert.equal(interrupted.attempts[0].state, "interrupted");
-  } finally {
-    releaseRetirement?.();
-    killGroup(child);
-    await waitForExit(child).catch(() => {});
-    runtime.close();
-    await rm(parent, { recursive: true, force: true });
-  }
-});
+    const retirementEntered = new Promise((resolveRetirement) => {
+      enterRetirement = resolveRetirement;
+    });
+    const runtime = new TaskRuntime({
+      dbPath: join(parent, "runtime.sqlite"),
+      piCommand: await versionCommand(parent),
+      workerFactory: ({ onEvent, onWorkerSpawn }) => {
+        child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+          detached: true,
+          stdio: "ignore",
+        });
+        const worker = {
+          pid: child.pid,
+          processGroupId: child.pid,
+          close() {},
+        };
+        onWorkerSpawn(worker);
+        emit = onEvent;
+        return worker;
+      },
+      worktreeRoot: join(parent, "worktrees"),
+      workerStopTimeoutMs: 100,
+    });
+    runtime.retireWorker = async () => {
+      enterRetirement();
+      await retirement;
+      return true;
+    };
+    try {
+      const started = await runtime.createTask(taskOptions(source));
+      emit({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: "settled result",
+          stopReason: "stop",
+        },
+      });
+      emit({ type: "agent_settled" });
+      await retirementEntered;
+      assert.equal(await runtime.shutdown("daemon-shutdown"), "interrupted");
+      releaseRetirement();
+      await new Promise((resolveWait) => setImmediate(resolveWait));
+      const interrupted = runtime.getTask(started.id);
+      assert.equal(interrupted.state, "interrupted");
+      assert.equal(interrupted.shutdownReason, "daemon-shutdown");
+      assert.equal(interrupted.attempts[0].state, "interrupted");
+    } finally {
+      releaseRetirement?.();
+      killGroup(child);
+      await waitForExit(child).catch(() => {});
+      runtime.close();
+      await rm(parent, { recursive: true, force: true });
+    }
+  },
+);
 
 test(
   "incomplete worker identity fails before the Attempt becomes running",
