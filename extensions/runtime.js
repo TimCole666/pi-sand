@@ -12,14 +12,12 @@ function getSessionId(ctx) {
 
 class SessionRuntime {
   #sessionId;
-  #context;
   #activity = ACTIVITY.IDLE;
   #agentWorkActive = false;
   #closed = false;
 
   constructor(ctx) {
     this.#sessionId = getSessionId(ctx);
-    this.#context = ctx;
   }
 
   get sessionId() {
@@ -63,12 +61,11 @@ class SessionRuntime {
     this.#agentWorkActive = active;
   }
 
-  close(ctx = this.#context) {
+  close(ctx) {
     if (this.#closed) return;
     this.#closed = true;
-    this.#context = undefined;
-    ctx?.ui.setStatus(STATUS_KEY, undefined);
-    ctx?.ui.setWidget(WIDGET_KEY, undefined);
+    ctx.ui.setStatus(STATUS_KEY, undefined);
+    ctx.ui.setWidget(WIDGET_KEY, undefined);
   }
 }
 
@@ -96,10 +93,9 @@ export function registerPiSandExtension(pi) {
   pi.on("project_trust", async () => ({ trusted: "undecided" }));
 
   pi.on("session_start", async (_event, ctx) => {
-    // Pi normally emits session_shutdown before this event. Closing the prior
-    // runtime defensively also keeps replacement safe if the host coalesces
-    // lifecycle delivery.
-    runtime?.close();
+    // Pi emits session_shutdown for the prior runtime before this event. The
+    // shutdown context is the only valid context for clearing old UI state;
+    // never close a prior runtime with this replacement-session context.
     runtime = new SessionRuntime(ctx);
     runtime.render(ctx);
   });
@@ -147,14 +143,6 @@ export function registerPiSandExtension(pi) {
       const status = createStatus(current, ctx);
       current.render(ctx);
       ctx.ui.notify(formatStatus(status), "info");
-    },
-  });
-
-  pi.registerCommand("pi-sand-reload", {
-    description: "Reload pi-sand through Pi's extension runtime",
-    handler: async (_args, ctx) => {
-      await ctx.reload();
-      return;
     },
   });
 }

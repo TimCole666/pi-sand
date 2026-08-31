@@ -1,57 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { registerPiSandExtension } from "../extensions/runtime.js";
+import { createExtensionHarness } from "./helpers/v0.2-extension-harness.js";
 
 function createHarness() {
-  const handlers = new Map();
-  const commands = new Map();
-  const status = [];
-  const widgets = [];
-  const notifications = [];
-
-  const pi = {
-    on(event, handler) {
-      const registered = handlers.get(event) ?? [];
-      registered.push(handler);
-      handlers.set(event, registered);
-    },
-    registerCommand(name, command) {
-      commands.set(name, command);
-    },
-  };
-
-  const invoke = async (event, eventData, ctx) => {
-    for (const handler of handlers.get(event) ?? []) {
-      await handler(eventData, ctx);
-    }
-  };
-
-  const context = (session, idle = true) => ({
-    mode: "tui",
-    cwd: `/workspace/${session}`,
-    sessionManager: { getSessionId: () => session },
-    isIdle: () => idle,
-    ui: {
-      setStatus(key, text) {
-        status.push({ session, key, text });
-      },
-      setWidget(key, lines) {
-        widgets.push({ session, key, lines });
-      },
-      notify(message, type) {
-        notifications.push({ session, message, type });
-      },
-    },
-  });
-
-  return { commands, handlers, invoke, context, notifications, pi, status, widgets };
+  const harness = createExtensionHarness();
+  registerPiSandExtension(harness.pi);
+  return harness;
 }
 
 test("factory only binds Pi-native handlers and does not start runtime resources", () => {
   const harness = createHarness();
-  registerPiSandExtension(harness.pi);
 
-  assert.deepEqual([...harness.commands.keys()], ["pi-sand", "pi-sand-reload"]);
+  assert.deepEqual([...harness.commands.keys()], ["pi-sand"]);
   assert.deepEqual([...harness.handlers.keys()], [
     "project_trust",
     "session_start",
@@ -69,7 +30,6 @@ test("factory only binds Pi-native handlers and does not start runtime resources
 
 test("project trust remains owned by Pi", async () => {
   const harness = createHarness();
-  registerPiSandExtension(harness.pi);
   const decision = await harness.handlers.get("project_trust")[0]({
     type: "project_trust",
     cwd: "/workspace/untrusted",
@@ -79,7 +39,6 @@ test("project trust remains owned by Pi", async () => {
 
 test("session lifecycle projects activity, preserves agent_end authority, and cleans up idempotently", async () => {
   const harness = createHarness();
-  registerPiSandExtension(harness.pi);
   const oldContext = harness.context("old");
   const newContext = harness.context("new");
 
@@ -122,12 +81,12 @@ test("session lifecycle projects activity, preserves agent_end authority, and cl
 
 test("session replacement clears the old surfaces before binding one fresh runtime", async () => {
   const harness = createHarness();
-  registerPiSandExtension(harness.pi);
   const oldContext = harness.context("old");
   const newContext = harness.context("new");
 
   await harness.invoke("session_start", { type: "session_start", reason: "startup" }, oldContext);
   await harness.invoke("agent_start", { type: "agent_start" }, oldContext);
+  await harness.invoke("session_shutdown", { type: "session_shutdown", reason: "new" }, oldContext);
   await harness.invoke("session_start", { type: "session_start", reason: "new" }, newContext);
 
   assert.deepEqual(harness.status.slice(-2), [
@@ -148,18 +107,16 @@ test("session replacement clears the old surfaces before binding one fresh runti
 
 test("reload replacement starts one fresh projection without duplicate registrations", async () => {
   const first = createHarness();
-  registerPiSandExtension(first.pi);
   const context = first.context("same-session");
   await first.invoke("session_start", { type: "session_start", reason: "startup" }, context);
   await first.invoke("session_shutdown", { type: "session_shutdown", reason: "reload" }, context);
 
   const second = createHarness();
-  registerPiSandExtension(second.pi);
   const replacementContext = second.context("same-session");
   await second.invoke("session_start", { type: "session_start", reason: "reload" }, replacementContext);
   await second.commands.get("pi-sand").handler("", replacementContext);
 
-  assert.equal(second.commands.size, 2);
+  assert.deepEqual([...second.commands.keys()], ["pi-sand"]);
   assert.equal(second.status.filter(({ text }) => text === "pi-sand: idle").length, 2);
   assert.equal(first.status.filter(({ text }) => text === undefined).length, 1);
   assert.equal(JSON.parse(second.notifications[0].message).session, "same-session");

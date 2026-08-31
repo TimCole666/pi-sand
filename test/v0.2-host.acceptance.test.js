@@ -1,10 +1,10 @@
 // v0.2 durable seam: Real Pi Extension Host Acceptance on Pi 0.84.4.
 // Deterministic Extension Lifecycle Integration is the companion durable seam;
-// this test proves package loading, command dispatch, and reload in real Pi.
+// this test proves package loading, command dispatch, and Pi-native prompting.
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
@@ -13,10 +13,6 @@ import { tmpdir } from "node:os";
 import { StringDecoder } from "node:string_decoder";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const extensionSourcePaths = [
-  join(repositoryRoot, "extensions", "pi-sand.ts"),
-  join(repositoryRoot, "extensions", "runtime.js"),
-];
 const piCommand = process.env.PI_BIN ?? "pi";
 const piVersionProbe = spawnSync(piCommand, ["--version"], { encoding: "utf8" });
 const piAvailable = piVersionProbe.status === 0;
@@ -84,7 +80,15 @@ async function runHostAcceptance() {
     "--no-tools",
     "--offline",
     "-e", repositoryRoot,
-  ], { cwd: hostCwd, stdio: ["pipe", "pipe", "pipe"] });
+  ], {
+    cwd: hostCwd,
+    env: {
+      ...process.env,
+      PI_SAND_DB: join(hostCwd, "unexpected-pi-sand.sqlite"),
+      XDG_DATA_HOME: join(hostCwd, "unexpected-xdg-data"),
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
   const close = once(child, "close");
   const events = [];
   let changed;
@@ -128,55 +132,98 @@ async function runHostAcceptance() {
     const statusResponse = await waitForEvent(events, (event) => event.type === "response" && event.id === "status", child);
     assert.equal(statusResponse.success, true);
 
-    const reloadStart = events.length;
-    send({ id: "reload", type: "prompt", message: "/pi-sand-reload" }, child);
-    const reloadResponse = await waitForEvent(
+    const replacementStart = events.length;
+    send({ id: "replacement", type: "new_session" }, child);
+    const replacementResponse = await waitForEvent(
       events,
-      (event) => event.type === "response" && event.id === "reload",
+      (event) => event.type === "response" && event.id === "replacement",
       child,
-      reloadStart,
+      replacementStart,
     );
-    assert.equal(reloadResponse.success, true);
-    const reloadStatus = await waitForEvent(
+    assert.equal(replacementResponse.success, true);
+    assert.deepEqual(replacementResponse.data, { cancelled: false });
+    const replacementCleanup = await waitForEvent(
+      events,
+      (event) => event.type === "extension_ui_request" && event.method === "setStatus" && event.statusKey === "pi-sand" && event.statusText === undefined,
+      child,
+      replacementStart,
+    );
+    const replacementStatus = await waitForEvent(
       events,
       (event) => event.type === "extension_ui_request" && event.method === "setStatus" && event.statusKey === "pi-sand" && event.statusText === "pi-sand: idle",
       child,
-      reloadStart,
+      replacementStart,
     );
-    assert.equal(reloadStatus.statusText, "pi-sand: idle");
+    assert.equal(replacementCleanup.statusText, undefined);
+    assert.equal(replacementStatus.statusText, "pi-sand: idle");
 
-    const postReloadStart = events.length;
-    send({ id: "post-reload-status", type: "prompt", message: "/pi-sand" }, child);
-    const postReloadNotice = await waitForEvent(
+    const postReplacementStart = events.length;
+    send({ id: "post-replacement-status", type: "prompt", message: "/pi-sand" }, child);
+    const postReplacementNotice = await waitForEvent(
       events,
       (event) => event.type === "extension_ui_request" && event.method === "notify",
       child,
-      postReloadStart,
+      postReplacementStart,
     );
-    const postReloadStatus = JSON.parse(postReloadNotice.message);
-    assert.equal(postReloadStatus.extension, "pi-sand");
-    assert.equal(postReloadStatus.mode, "rpc");
-    assert.equal(postReloadStatus.activity, "idle");
-    const postReloadResponse = await waitForEvent(
+    const postReplacementStatus = JSON.parse(postReplacementNotice.message);
+    assert.equal(postReplacementStatus.extension, "pi-sand");
+    assert.equal(postReplacementStatus.mode, "rpc");
+    assert.equal(postReplacementStatus.activity, "idle");
+    assert.notEqual(postReplacementStatus.session, status.session);
+    const postReplacementResponse = await waitForEvent(
       events,
-      (event) => event.type === "response" && event.id === "post-reload-status",
+      (event) => event.type === "response" && event.id === "post-replacement-status",
       child,
-      postReloadStart,
+      postReplacementStart,
     );
-    assert.equal(postReloadResponse.success, true);
+    assert.equal(postReplacementResponse.success, true);
 
-    const postReloadCommandsStart = events.length;
-    send({ id: "post-reload-commands", type: "get_commands" }, child);
-    const postReloadCommands = await waitForEvent(
+    const postReplacementCommandsStart = events.length;
+    send({ id: "post-replacement-commands", type: "get_commands" }, child);
+    const postReplacementCommands = await waitForEvent(
       events,
-      (event) => event.type === "response" && event.id === "post-reload-commands",
+      (event) => event.type === "response" && event.id === "post-replacement-commands",
       child,
-      postReloadCommandsStart,
+      postReplacementCommandsStart,
     );
-    assert.equal(postReloadCommands.success, true);
-    assert.equal(postReloadCommands.data.commands.filter((candidate) => candidate.name === "pi-sand").length, 1);
-    assert.equal(postReloadCommands.data.commands.filter((candidate) => candidate.name === "pi-sand-reload").length, 1);
-    assert.equal(events.some((event) => event.type === "agent_start" || event.type === "turn_start"), false, "an extension command must not start an LLM turn");
+    assert.equal(postReplacementCommands.success, true);
+    assert.equal(postReplacementCommands.data.commands.filter((candidate) => candidate.name === "pi-sand").length, 1);
+    assert.equal(postReplacementCommands.data.commands.some((candidate) => candidate.name === "pi-sand-reload"), false);
+
+    const ordinaryStart = events.length;
+    send({ id: "ordinary", type: "prompt", message: "ordinary Pi-native prompt" }, child);
+    const ordinaryResponse = await waitForEvent(
+      events,
+      (event) => event.type === "response" && event.id === "ordinary",
+      child,
+      ordinaryStart,
+    );
+    assert.equal(ordinaryResponse.success, true);
+    await waitForEvent(events, (event) => event.type === "agent_start", child, ordinaryStart);
+    send({ id: "abort-ordinary", type: "abort" }, child);
+    const abortResponse = await waitForEvent(
+      events,
+      (event) => event.type === "response" && event.id === "abort-ordinary",
+      child,
+      ordinaryStart,
+    );
+    assert.equal(abortResponse.success, true);
+    await waitForEvent(events, (event) => event.type === "agent_settled", child, ordinaryStart);
+
+    const ordinaryEvents = events.slice(ordinaryStart);
+    assert.equal(ordinaryEvents.filter((event) => event.type === "agent_start").length, 1);
+    assert.equal(ordinaryEvents.filter((event) => event.type === "turn_start").length, 1);
+    assert.equal(ordinaryEvents.some((event) => event.type === "message_start" && event.message?.role === "user" && event.message.content?.[0]?.text === "ordinary Pi-native prompt"), true);
+    const assistantStarts = ordinaryEvents.filter((event) => event.type === "message_start" && event.message?.role === "assistant");
+    assert.equal(assistantStarts.length, 1);
+    assert.equal(assistantStarts[0].message.stopReason, "aborted");
+    assert.deepEqual(assistantStarts[0].message.content, []);
+    assert.equal(ordinaryEvents.some((event) => event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta"), false);
+    assert.equal(ordinaryEvents.some((event) => event.type === "tool_execution_start"), false);
+    assert.equal(ordinaryEvents.some((event) => event.type === "extension_ui_request" && event.method === "notify"), false);
+    assert.equal(ordinaryEvents.some((event) => event.type === "extension_ui_request" && event.method === "setStatus" && event.statusText === "pi-sand: running"), true);
+    assert.equal(await readFile(join(hostCwd, "unexpected-pi-sand.sqlite")).catch(() => undefined), undefined, "ordinary prompts must not start the legacy service");
+    assert.deepEqual(await readdir(hostCwd), [], "ordinary prompts must not create a second host-owned transcript or service state");
   } finally {
     child.stdin.end();
     await close;
@@ -197,13 +244,4 @@ test("v0.2 host acceptance loads the package in real Pi 0.84.4 and dispatches /p
 }, async () => {
   assert.equal(piVersionProbe.stdout.trim(), "0.84.4", "the v0.2 host contract is pinned to Pi 0.84.4");
   await runHostAcceptance();
-});
-
-test("v0.2 host extension leaves ordinary prompts with foreground Pi", async () => {
-  const source = (await Promise.all(extensionSourcePaths.map((path) => readFile(path, "utf8")))).join("\n");
-  assert.doesNotMatch(source, /AgentService|Local Agent Service|child_process|spawn\s*\(|execFile\s*\(/);
-  assert.doesNotMatch(source, /chromium|localhost|http\.createServer|\.listen\s*\(/i);
-  assert.doesNotMatch(source, /pi\.on\(\s*["']input["']/);
-  assert.doesNotMatch(source, /send(?:User)?Message\s*\(/);
-  assert.doesNotMatch(source, /appendEntry|transcript|sqlite|database/i);
 });

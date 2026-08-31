@@ -59,7 +59,7 @@ Pi owns the foreground:
 
 The Extension observes and presents a small host-status projection. It does not create a parallel foreground Agent/Turn/transcript database, replay the transcript into model context, add a planner or scheduler, or route ordinary prompts through the v0.1 service.
 
-Future pi-sand **runtime state** is a separate concern from Pi conversation state. This v0.2 host migration does not implement durable `Task`, `Attempt`, or `Mission` state, Fresh Executors, completion wake, scheduling, or worker orchestration. Those are later primitives with their own contracts, not names for the current Pi conversation.
+Future pi-sand **runtime state** is a separate concern from Pi conversation state. This v0.2 host migration does not implement Fresh Executors, durable `Task`/`Attempt` state, a scheduler, `Mission`, or self-hosting. Completion wake, scheduling, and worker orchestration are also not implemented. Those are later primitives with their own contracts, not names for the current Pi conversation.
 
 ## Test seams
 
@@ -73,7 +73,7 @@ The v0.2 host contract has two durable seams, as defined by GitHub issue [#22](h
 
 2. **Deterministic Extension Lifecycle Integration** — `test/v0.2-activity.integration.test.js` and `test/v0.2-extension.integration.test.js` exercise the public Extension event/registration/UI boundary with deterministic host events, including session start, agent start, user-prompt waiting, `agent_settled`, reload/session replacement, and shutdown. It is intentionally distinct from the real-host acceptance seam; the current implementation is only a host-status projection and does not add a parallel runtime.
 
-The v0.2 completion authority is Pi's settled lifecycle, not a low-level `agent_end` event. Lifecycle work must preserve Pi's ownership and must not introduce a reload manager, parallel runtime, Task, Attempt, or Mission implementation into this host migration.
+The v0.2 completion authority is Pi's settled lifecycle, not a low-level `agent_end` event. Lifecycle work must preserve Pi's ownership and must not introduce a reload manager, parallel runtime, Fresh Executor, durable Task/Attempt state, scheduler, Mission, or self-hosting implementation into this host migration.
 
 Run the repository's deterministic checks with:
 
