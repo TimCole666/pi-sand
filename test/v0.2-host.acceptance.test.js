@@ -129,7 +129,7 @@ async function runHostAcceptance() {
 test("v0.2 host package metadata follows Pi's documented local/Git package contract", async () => {
   const manifest = JSON.parse(await readFile(join(repositoryRoot, "package.json"), "utf8"));
   assert.equal(manifest.keywords.includes("pi-package"), true);
-  assert.deepEqual(manifest.pi, { extensions: ["./extensions"] });
+  assert.deepEqual(manifest.pi, { extensions: ["./extensions/pi-sand.ts"] });
   assert.deepEqual(manifest.peerDependencies, { "@earendil-works/pi-coding-agent": "*" });
 });
 
