@@ -1,6 +1,6 @@
 # Pi integration spike (ticket #1)
 
-This repository uses the installed Pi CLI as the first production runtime. The spike deliberately probes Pi's documented JSONL interfaces instead of scraping its terminal UI or inventing a provider abstraction.
+**Historical v0.1 evidence.** This repository uses the installed Pi CLI as the first production runtime. The spike deliberately probes Pi's documented JSONL interfaces instead of scraping its terminal UI or inventing a provider abstraction. It documents the retained v0.1 Local Agent Service subprocess adapter, not the current v0.2 Pi Extension host; v0.2 is pinned to Pi 0.84.4 and documented in [`README.md`](../README.md) and GitHub issue [#22](https://github.com/TimCole666/pi-sand/issues/22).
 
 ## Reproduce
 

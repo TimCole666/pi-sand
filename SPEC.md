@@ -1,6 +1,6 @@
 # Historical: Pi-Native Grok Bot Compatibility Specification
 
-> **Superseded.** This document is retained for historical context only. The sole normative v0.1 authority is [`SPEC-v0.1.md`](SPEC-v0.1.md); the companion [`REFERENCE.md`](REFERENCE.md) is explicitly non-normative.
+> **Superseded.** This document is retained for historical v0.1 context only. The sole normative v0.1 authority is [`SPEC-v0.1.md`](SPEC-v0.1.md); the companion [`REFERENCE.md`](REFERENCE.md) is explicitly non-normative. The current v0.2 host contract is GitHub issue [#22](https://github.com/TimCole666/pi-sand/issues/22): Pi 0.84.4 with pi-sand loaded as a Pi Extension. The older unmerged [`spec/v0.2-productization`](https://github.com/TimCole666/pi-sand/tree/spec/v0.2-productization) direction is superseded and must not be read into this historical document.
 
 
 ## Problem Statement

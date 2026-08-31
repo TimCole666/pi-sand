@@ -1,61 +1,115 @@
 # pi-sand
 
-A Linux-first desktop Agent product around the installed Pi CLI. The v0.1.0 product boundary keeps durable product state, the Local Agent Service, and the Desktop presentation separate:
+`pi-sand` is a Pi package with a TypeScript Extension. The current product path is **v0.2: load pi-sand into the installed Pi 0.84.4 host and start Pi**. Pi's normal CLI/TUI remains the interactive product host; RPC is an automation and test seam.
 
 ```text
-Desktop Client → Local Agent Service → pi --mode rpc → Agent workspace
+Pi CLI / TUI
+    ↓
+pi-sand Extension
+    ├── /pi-sand status command
+    ├── small host-status surface
+    └── future pi-sand runtime state
 ```
 
-## Launch the product
+## v0.2 product path
 
-Requires Node.js 22.13+ (the service uses the unflagged built-in `node:sqlite` module), Chromium, and `pi` on `PATH`.
+The exact verified v0.2 host baseline is **Pi 0.84.4**. This repository does not claim generic compatibility with other Pi versions. Verify the host before relying on a different version.
+
+Install from a local checkout for development:
 
 ```sh
-npm run launch
+pi install /absolute/path/to/pi-sand
+pi
 ```
 
-The supported Linux entry point starts or connects to the loopback-only Local Agent Service, then locates and invokes the supported Chromium Desktop directly. No terminal, manually selected port, or manually opened localhost URL is required for normal use. `PI_SAND_NO_BROWSER=1 npm run launch` starts the product service without opening a browser, which is useful for automated checks. Chromium must be installed and available at `/usr/bin/chromium`, `/usr/bin/chromium-browser`, or on `PATH`.
+A Git-source installation uses the same package shape:
 
-`npm start` remains a developer-oriented service-only entry point; it is not the normal product experience. The service binds only to `127.0.0.1`, protects mutation requests from unrelated browser origins, and allows only one Local Agent Service process to own a database at a time.
+```sh
+pi install git:github.com/TimCole666/pi-sand
+pi
+```
 
-By default the SQLite database is stored at `${XDG_DATA_HOME:-~/.local/share}/pi-sand/pi-sand.sqlite`. Set `PI_SAND_DB` to choose another database, `PORT` to choose the fixed local endpoint, or `PI_BIN` to choose the Pi executable. The v0.1 production adapter supports only the explicitly verified Pi versions `0.84.2` and `0.84.4` and preflights `PI_BIN --version` before the first Turn; an unavailable or incompatible Pi is reported as a product-level error. The service creates its database and parent directory on first start.
+For a fast, non-persistent local extension load while developing:
 
-Create an Agent with a workspace directory, then submit ordinary natural-language requests. Workspace input accepts absolute paths and `~`/`~/...`; other relative paths are rejected. Accepted paths are verified directories, realpathed, and persisted as one canonical workspace identity, so symlink aliases share the same execution exclusion.
+```sh
+pi -e /absolute/path/to/pi-sand
+```
 
-## Product boundary
+The package manifest exposes the TypeScript Extension through `pi.extensions`; Pi resolves that entry point for local and Git package sources. A project-local installation may be loaded with Pi's documented local-package option after the project is trusted. No repository build step is required for the TypeScript Extension loader.
 
-The Local Agent Service owns durable Agents, Turns, user/assistant transcript messages, staged/committed attachment metadata, canonical workspaces, and Pi process ownership. The Desktop owns presentation state such as the selected Agent and unsent per-Agent drafts. Closing the Desktop does not stop the service or active Pi work; reopening takes an authoritative snapshot and reconnects to semantic updates without replaying or duplicating transcript messages.
+Once Pi is running, invoke:
 
-Pi owns reasoning, tools, skills, retries inside its autonomous loop, and its native conversational context. pi-sand does not add a planner, scheduler, queue, worker pool, provider abstraction, replay loop, or custom memory/context system. Independent Agents may run concurrently only when their canonical workspaces differ. Stop, unexpected Pi exit, and service-restart reconciliation produce explicit durable Turn outcomes; unfinished work after service restart is interrupted without replay or worker adoption.
+```text
+/pi-sand
+```
 
-Process groups are best-effort cleanup, not complete containment: unrestricted Pi tools may create descendants outside the recorded PGID. After a Local Agent Service lifetime boundary in the same Linux boot, an unresolved real Pi worker keeps its workspace fail-closed and unavailable. A Linux reboot supplies the v0.1 complete process-lifetime proof through the kernel boot ID; pi-sand does not adopt, replay, or resume the old worker. Stronger cgroup-style containment is not part of v0.1.
+The command reports a small non-sensitive status proving the Extension is active. Its status includes the current Pi `mode`, working directory (`cwd`), Pi session identifier, and pi-sand activity (`idle`, `running`, or `waiting_for_user`). It does not expose prompts, system context, credentials, provider secrets, or the full transcript.
+
+Normal v0.2 use does **not** require Chromium, a localhost endpoint, manual port management, the legacy Local Agent Service, or `npm run launch`. Do not start a second Pi process for an ordinary prompt: Pi owns the foreground conversation and execution.
+
+## Ownership boundary
+
+Pi owns the foreground:
+
+- Session identity and session navigation;
+- the conversation transcript;
+- model context and compaction;
+- ordinary user input and execution;
+- providers, tools, Skills, retries, and the autonomous work loop.
+
+The Extension observes and presents a small host-status projection. It does not create a parallel foreground Agent/Turn/transcript database, replay the transcript into model context, add a planner or scheduler, or route ordinary prompts through the v0.1 service.
+
+Future pi-sand **runtime state** is a separate concern from Pi conversation state. This v0.2 host migration does not implement Fresh Executors, durable `Task`/`Attempt` state, a scheduler, `Mission`, or self-hosting. Completion wake, scheduling, and worker orchestration are also not implemented. Those are later primitives with their own contracts, not names for the current Pi conversation.
 
 ## Test seams
 
-The v0.1.0 release proof has exactly three durable seams:
+The v0.2 host contract has two durable seams, as defined by GitHub issue [#22](https://github.com/TimCole666/pi-sand/issues/22):
 
-1. **Actual Desktop E2E** — supported Chromium is rendered and driven through the product. These tests live in `test/desktop-actual-e2e.test.js`, `test/desktop-attachment-e2e.test.js`, `test/desktop-chromium-e2e.test.js`, `test/desktop-process-e2e.test.js`, and `test/product-boundary.test.js` (Chromium-dependent tests are skipped when the supported runtime is unavailable).
-2. **Local Agent Service integration** — deterministic narrow Pi fakes prove persistence, lifecycle, reconnect, workspace safety, attachments, ownership, and control-plane behavior. `test/service.test.js`, `test/attachments.test.js`, `test/orphan-worker.test.js`, `test/product-boundary.test.js`, and `test/stop-isolation.test.js` contain this coverage. `test/service-http-e2e.test.js` proves HTTP/SSE transport only; it is not Actual Desktop E2E.
-3. **Small Real-Pi smoke** — `test/real-pi.acceptance.test.js` contains the three production contracts: basic execution, two-Turn Pi-native conversational continuity, and production attachment consumption. It is skipped by the deterministic suite and requires `PI_SAND_REAL_PI=1` with a configured model.
+1. **Real Pi Extension Host Acceptance** — `test/v0.2-host.acceptance.test.js` loads the repository package in a real Pi process, proves `/pi-sand` registration and RPC dispatch on Pi 0.84.4, checks the non-sensitive status, and does so without an LLM call. Run it with:
 
-The renamed `desktop-client-harness*.test.js` files are fake-DOM/client harness support tests, not Actual Desktop E2E. They remain useful for narrow rendering behavior but do not count as the compatibility authority.
+   ```sh
+   node --test test/v0.2-host.acceptance.test.js
+   ```
 
-Run the deterministic suite and Pi contract self-test with:
+2. **Deterministic Extension Lifecycle Integration** — `test/v0.2-activity.integration.test.js` and `test/v0.2-extension.integration.test.js` exercise the public Extension event/registration/UI boundary with deterministic host events, including session start, agent start, user-prompt waiting, `agent_settled`, reload/session replacement, and shutdown. It is intentionally distinct from the real-host acceptance seam; the current implementation is only a host-status projection, does not intercept ordinary prompts, and does not add a parallel runtime.
+
+The v0.2 completion authority is Pi's settled lifecycle, not a low-level `agent_end` event. Lifecycle work must preserve Pi's ownership and must not introduce a reload manager, parallel runtime, Fresh Executor, durable Task/Attempt state, scheduler, Mission, or self-hosting implementation into this host migration.
+
+Run the repository's deterministic checks with:
 
 ```sh
 npm test
 npm run spike:self-test
 ```
 
-Run the opt-in production smoke layer with:
+The opt-in `npm run test:real-pi` suite is historical v0.1 Local Agent Service smoke coverage and requires a configured model. It is not the v0.2 Extension Host Acceptance seam.
 
-```sh
-npm run test:real-pi
+## Historical v0.1 implementation and evidence
+
+The v0.1 Web/Desktop product path remains in the repository as proven historical implementation and test evidence. It is not the normal v0.2 product path and its browser/service architecture must not be inferred as the current host contract:
+
+```text
+Desktop Client → Local Agent Service → pi --mode rpc → Agent workspace
 ```
+
+The retained v0.1 implementation covers durable product Agents, Turns, transcript and attachment state, canonical workspaces, service-owned Pi process lifetime, Desktop reconnect, interruption, failure, and same-workspace safety. It also contains the historical Chromium/Desktop presentation and Local Agent Service tests. Do not delete, migrate, or clean up that source or its SQLite conversations as part of v0.2 host documentation.
+
+Historical v0.1 test classifications remain useful but are not v0.2 compatibility authority:
+
+- **Actual Desktop E2E:** `test/desktop-actual-e2e.test.js`, `test/desktop-attachment-e2e.test.js`, `test/desktop-chromium-e2e.test.js`, `test/desktop-process-e2e.test.js`, and the relevant parts of `test/product-boundary.test.js`.
+- **Local Agent Service integration:** `test/service.test.js`, `test/attachments.test.js`, `test/orphan-worker.test.js`, `test/stop-isolation.test.js`, and transport coverage in `test/service-http-e2e.test.js`.
+- **v0.1 Real-Pi smoke:** `test/real-pi.acceptance.test.js`, which tests the historical subprocess adapter with a configured model.
+- **Historical client harness support:** `test/desktop-client-harness.test.js` and `test/desktop-client-harness-http.test.js`; these are not Actual Desktop E2E and are not v0.2 host tests.
+
+The v0.1 evidence remains accurate in its own boundary: `SPEC-v0.1.md` is the normative v0.1 release specification, `REFERENCE.md` is the non-normative Grok Bot 0.18 evidence ledger, and `docs/v0.1-lifecycle-evidence.md` records v0.1 evidence classifications and intentional extensions.
 
 ## Documentation authorities
 
-- [`SPEC-v0.1.md`](SPEC-v0.1.md) is the sole normative v0.1.0 product specification.
-- [`REFERENCE.md`](REFERENCE.md) is the explicitly non-normative Grok Bot 0.18 evidence ledger.
-- [`docs/v0.1-lifecycle-evidence.md`](docs/v0.1-lifecycle-evidence.md) records current evidence classifications and pi-sand extensions.
-- [`SPEC.md`](SPEC.md) is retained as superseded historical material and must not be used as a competing release authority.
+- **Current v0.2 host contract:** GitHub issue [#22](https://github.com/TimCole666/pi-sand/issues/22), with the package/command tracer bullet delivered by [#23](https://github.com/TimCole666/pi-sand/issues/23).
+- **Current v0.2 repository guidance:** this README and the package manifest's `pi.extensions` declaration.
+- **Normative v0.1 contract:** [`SPEC-v0.1.md`](SPEC-v0.1.md), for the retained v0.1 implementation only.
+- **Non-normative v0.1 evidence:** [`REFERENCE.md`](REFERENCE.md) and [`docs/v0.1-lifecycle-evidence.md`](docs/v0.1-lifecycle-evidence.md).
+- [`SPEC.md`](SPEC.md) is superseded historical v0.1 material and is not a competing authority.
+- The older unmerged [`spec/v0.2-productization`](https://github.com/TimCole666/pi-sand/tree/spec/v0.2-productization) direction is **superseded** by issue #22. It must not be used to reintroduce browser productization, Chromium launch requirements, localhost/service requirements, or a competing v0.2 architecture.
+
+The v0.2 boundary is intentionally a host migration, not Web/Desktop cleanup or the later runtime platform. Preserve accurate v0.1 evidence while keeping the current Pi Extension path unambiguous.

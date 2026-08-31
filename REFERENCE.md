@@ -4,7 +4,7 @@ Status: **Non-normative evidence ledger**
 
 This document is the evidence companion to `SPEC-v0.1.md`.
 
-Its job is to record what user-visible Grok Bot 0.18 behavior is actually supported by inspectable evidence, what remains uncertain, and where that evidence lives.
+Its job is to record what user-visible Grok Bot 0.18 behavior is actually supported by inspectable evidence, what remains uncertain, and where that evidence lives. It remains a v0.1 evidence ledger only; it is not the v0.2 Pi Extension host authority. The current v0.2 contract is GitHub issue [#22](https://github.com/TimCole666/pi-sand/issues/22) and the repository-facing guidance in [`README.md`](README.md).
 
 It does **not** define v0.1 release scope. `SPEC-v0.1.md` is the normative product specification.
 
