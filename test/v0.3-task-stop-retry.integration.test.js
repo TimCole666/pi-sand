@@ -57,6 +57,82 @@ const optionsFor = (source, model = { provider: "provider", id: "model" }) => ({
   thinkingLevel: "high",
 });
 
+test("startup failure keeps an unretired worker fail-closed and capacity blocked", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-startup-failure-"));
+  const source = await repository(parent);
+  const piCommand = await fakePi(parent);
+  let worker;
+  const runtime = new TaskRuntime({
+    dbPath: join(parent, "runtime.sqlite"),
+    piCommand,
+    workerRetireTimeoutMs: 0,
+    workerFactory: ({ onWorkerSpawn }) => {
+      worker = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+      onWorkerSpawn({ pid: worker.pid, processGroupId: worker.pid });
+      const error = new Error("handshake failed");
+      error.workerMetadata = { pid: worker.pid, processGroupId: worker.pid };
+      return Promise.reject(error);
+    },
+    worktreeRoot: join(parent, "worktrees"),
+  });
+  try {
+    await assert.rejects(runtime.createTask(optionsFor(source)), /handshake failed/);
+    const blocked = runtime.listTasks()[0];
+    assert.equal(blocked.state, "blocked");
+    assert.equal(blocked.attempts[0].state, "orphaned");
+    assert.equal(blocked.attempts[0].workerTerminated, false);
+    assert.equal(processGroupIsAlive(worker.pid), true);
+    await assert.rejects(runtime.createTask({ ...optionsFor(source), goal: "second task" }), /already active/);
+  } finally {
+    if (worker?.pid) killGroup(worker);
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("explicit Stop can terminate an accepted Task during worker startup", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-stop-starting-"));
+  const source = await repository(parent);
+  const piCommand = await fakePi(parent);
+  let worker;
+  let releaseFactory;
+  const factoryReleased = new Promise((resolveRelease) => { releaseFactory = resolveRelease; });
+  const runtime = new TaskRuntime({
+    dbPath: join(parent, "runtime.sqlite"),
+    piCommand,
+    workerFactory: ({ onWorkerSpawn }) => {
+      worker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+      onWorkerSpawn({ pid: worker.pid, processGroupId: worker.pid });
+      return factoryReleased.then(() => ({ pid: worker.pid, processGroupId: worker.pid, close() {} }));
+    },
+    worktreeRoot: join(parent, "worktrees"),
+  });
+  let creating;
+  try {
+    creating = runtime.createTask(optionsFor(source));
+    let accepted;
+    for (let index = 0; index < 100; index += 1) {
+      accepted = runtime.listTasks()[0];
+      if (accepted?.state === "accepted" && accepted.attempts[0]?.workerPid) break;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+    assert.equal(accepted.state, "accepted");
+    assert.equal(accepted.attempts[0].state, "starting");
+    const stopped = await runtime.stopTask(accepted.id);
+    assert.equal(stopped.state, "stopped");
+    releaseFactory();
+    const created = await creating;
+    assert.equal(created.state, "stopped");
+    assert.equal(processGroupIsAlive(worker.pid), false);
+  } finally {
+    releaseFactory?.();
+    if (worker?.pid) killGroup(worker);
+    if (creating) await creating.catch(() => {});
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
 test("daemon Stop proves ownership, terminates TERM-resistant groups, and Retry reuses the Task worktree with a new Attempt", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-stop-retry-"));
   const source = await repository(parent);

@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readProcessIdentity } from "./process.js";
+import { readProcessIdentity, stopOwnedProcessGroupSync, WORKER_STOP_TIMEOUT_MS } from "./process.js";
 
 export const FRESH_PI_VERSION = "0.84.4";
 export const FRESH_EXECUTOR_ARGS = [
@@ -93,6 +93,7 @@ class FreshExecutorClient {
       command: process.env.PI_BIN ?? "pi",
       env: process.env,
       timeoutMs: 10_000,
+      workerStopTimeoutMs: WORKER_STOP_TIMEOUT_MS,
       spawnImpl: spawn,
       spawnSyncImpl: spawnSync,
       ...options,
@@ -168,7 +169,9 @@ class FreshExecutorClient {
           code: "RPC_STARTUP_FAILED",
           cause: error,
         });
-      this.#terminate(failure);
+      const workerTerminated = await this.#terminate(failure);
+      failure.workerMetadata = this.#metadata;
+      failure.workerTerminated = workerTerminated;
       throw failure;
     }
   }
@@ -185,6 +188,7 @@ class FreshExecutorClient {
       throw startupError("Fresh Executor could not be spawned.", { code: "SPAWN_FAILED", cause: error });
     }
     this.#metadata = processMetadata(this.#child);
+    this.#options.onWorkerSpawn?.(this.#metadata);
     this.#child.stdout?.setEncoding?.("utf8");
     this.#child.stdout?.on("data", (chunk) => this.#onStdout(chunk));
     this.#child.stderr?.on("data", () => {
@@ -316,22 +320,24 @@ class FreshExecutorClient {
     this.#pending.clear();
   }
 
-  #terminate(error) {
-    if (this.#closing) return;
+  async #terminate(error) {
+    if (this.#closing) return this.#metadata ? stopOwnedProcessGroupSync(this.#metadata, {
+      timeoutMs: this.#options.workerStopTimeoutMs,
+    }) : true;
     this.#closing = true;
     this.#rejectPending(error);
-    const pid = this.#metadata?.processGroupId;
-    if (!pid) {
+    if (!this.#metadata?.processGroupId) {
       try { this.#child.kill?.("SIGTERM"); } catch { /* The process is already unavailable. */ }
-      return;
+      return true;
     }
-    try {
-      process.kill(-pid, "SIGTERM");
-    } catch (killError) {
-      if (killError.code !== "ESRCH") {
-        try { this.#child.kill("SIGTERM"); } catch { /* The process is already unavailable. */ }
-      }
-    }
+    return stopOwnedProcessGroupSync({
+      workerPid: this.#metadata.pid,
+      workerPgid: this.#metadata.processGroupId,
+      workerStartIdentity: this.#metadata.processStartIdentity,
+      workerBootId: this.#metadata.bootId,
+    }, {
+      timeoutMs: this.#options.workerStopTimeoutMs,
+    });
   }
 
   #handle() {

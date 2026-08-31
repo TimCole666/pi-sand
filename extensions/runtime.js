@@ -21,6 +21,10 @@ class SessionRuntime {
 }
 
 function notifyResult(ctx, result) { ctx.ui.notify(JSON.stringify(result), result.ok ? "info" : "error"); return result; }
+async function ipcResult(ctx, key, operation) {
+  try { return notifyResult(ctx, { ok: true, [key]: await operation() }); }
+  catch (error) { return notifyResult(ctx, { ok: false, error: error.message }); }
+}
 function configuredAuthAvailable(ctx) { const signal = ctx.modelRegistry?.hasConfiguredAuth; return typeof signal !== "function" || signal.call(ctx.modelRegistry, ctx.model) !== false; }
 function trustedProject(ctx, command) {
   return typeof ctx.isProjectTrusted === "function" && ctx.isProjectTrusted() === true
@@ -37,11 +41,6 @@ async function createTask(client, args, ctx) {
   if (trustError) return notifyResult(ctx, { ok: false, error: trustError });
   if (!configuredAuthAvailable(ctx)) return notifyResult(ctx, { ok: false, error: "/task requires configured authentication for the selected provider." });
   try { return notifyResult(ctx, { ok: true, task: await client.createTask({ goal: args, cwd: ctx.cwd, trusted: true, model: modelSnapshot(ctx), thinkingLevel: ctx.thinkingLevel }) }); }
-  catch (error) { return notifyResult(ctx, { ok: false, error: error.message }); }
-}
-
-async function stopTask(client, args, ctx) {
-  try { return notifyResult(ctx, { ok: true, task: await client.stopTask(String(args ?? "").trim()) }); }
   catch (error) { return notifyResult(ctx, { ok: false, error: error.message }); }
 }
 
@@ -69,14 +68,14 @@ export function registerPiSandExtension(pi, { runtimeClientFactory } = {}) {
   const currentRuntime = (ctx) => (runtime?.matches(ctx) ? runtime : undefined);
   const currentRuntimeClient = () => (runtimeClient ??= (runtimeClientFactory ?? defaultRuntimeClientFactory)());
 
-  pi.registerCommand("tasks", { description: "List durable background Tasks", handler: async (_args, ctx) => { try { return notifyResult(ctx, { ok: true, tasks: await currentRuntimeClient().listTasks() }); } catch (error) { return notifyResult(ctx, { ok: false, error: error.message }); } } });
+  pi.registerCommand("tasks", { description: "List durable background Tasks", handler: async (_args, ctx) => ipcResult(ctx, "tasks", () => currentRuntimeClient().listTasks()) });
   const supportsTaskMutations = !runtimeClientFactory || typeof injectedClient?.createTask === "function";
   const supportsTaskControls = !runtimeClientFactory || (typeof injectedClient?.stopTask === "function" && typeof injectedClient?.retryTask === "function");
   if (supportsTaskMutations) {
     pi.registerCommand("task", { description: "Start one durable background Task in an isolated Fresh Executor", handler: async (args, ctx) => createTask(currentRuntimeClient(), args, ctx) });
-    pi.registerCommand("task-show", { description: "Show one durable background Task", handler: async (args, ctx) => { try { return notifyResult(ctx, { ok: true, task: await currentRuntimeClient().getTask(String(args ?? "").trim()) }); } catch (error) { return notifyResult(ctx, { ok: false, error: error.message }); } } });
+    pi.registerCommand("task-show", { description: "Show one durable background Task", handler: async (args, ctx) => ipcResult(ctx, "task", () => currentRuntimeClient().getTask(String(args ?? "").trim())) });
     if (supportsTaskControls) {
-      pi.registerCommand("task-stop", { description: "Stop an active durable background Task", handler: async (args, ctx) => stopTask(currentRuntimeClient(), args, ctx) });
+      pi.registerCommand("task-stop", { description: "Stop an active durable background Task", handler: async (args, ctx) => ipcResult(ctx, "task", () => currentRuntimeClient().stopTask(String(args ?? "").trim())) });
       pi.registerCommand("task-retry", { description: "Retry a failed, stopped, or interrupted Task with a fresh executor", handler: async (args, ctx) => retryTask(currentRuntimeClient(), args, ctx) });
     }
   }

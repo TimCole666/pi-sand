@@ -3,12 +3,14 @@ import assert from "node:assert/strict";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
+import { createConnection } from "node:net";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { registerPiSandExtension } from "../extensions/runtime.js";
 import { createExtensionHarness } from "./helpers/v0.2-extension-harness.js";
 import { MAX_TASK_GOAL_LENGTH, buildTaskPacket } from "../src/task-runtime.js";
+import { runtimeSocketPath } from "../src/runtime-ipc.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const wait = (ms) => new Promise((resolveWait) => setTimeout(resolveWait, ms));
@@ -40,6 +42,33 @@ test("client A disappears while daemon Task and worker remain reconnectable", { 
     const second = await client(parent, env, "task.create", { goal: "must fail capacity", cwd: source, trusted: true, model: { provider: "provider", id: "model" }, thinkingLevel: "high" }).catch((error) => error); assert.match(second.message, /already active/);
     const lines = (await waitForFile(packet)).trim().split("\n").map(JSON.parse); const prompts = lines.filter((line) => line.type === "prompt"); assert.equal(prompts.length, 1); assert.match(prompts[0].message, new RegExp(started.task.id)); assert.doesNotMatch(prompts[0].message, /SECRET_TRANSCRIPT|credential|token|api.key/i); assert.doesNotThrow(() => process.kill(daemonPid, 0));
   } finally { if (daemonPid) { try { process.kill(daemonPid, "SIGTERM"); } catch (error) { if (error.code !== "ESRCH") throw error; } } await wait(100); await rm(parent, { recursive: true, force: true }); }
+});
+
+test("dropping a live Task IPC connection does not transition or signal its worker", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-connection-drop-"));
+  const { source, fake, packet } = await makeFixture(parent);
+  const env = { ...process.env, PI_BIN: fake, PI_SAND_PACKET: packet, XDG_RUNTIME_DIR: join(parent, "runtime"), PI_SAND_RUNTIME_DB: join(parent, "runtime.sqlite"), PI_SAND_TASK_WORKTREE_ROOT: join(parent, "worktrees") };
+  let daemonPid;
+  try {
+    const started = await client(parent, env, "task.create", { goal: "connection drop", cwd: source, trusted: true, model: { provider: "provider", id: "model" }, thinkingLevel: "high" });
+    daemonPid = (await client(parent, env, "runtime.status")).daemonPid;
+    const workerPid = started.task.attempts[0].workerPid;
+    assert.equal(started.task.state, "running");
+    const socket = createConnection({ path: runtimeSocketPath({ env }) });
+    await new Promise((resolveConnection, rejectConnection) => {
+      socket.once("connect", resolveConnection);
+      socket.once("error", rejectConnection);
+    });
+    socket.destroy();
+    await wait(100);
+    const shown = await client(parent, env, "task.get", { id: started.task.id });
+    assert.equal(shown.task.state, "running");
+    assert.doesNotThrow(() => process.kill(workerPid, 0), "an IPC disconnect must not signal the live worker");
+  } finally {
+    if (daemonPid) { try { process.kill(daemonPid, "SIGTERM"); } catch (error) { if (error.code !== "ESRCH") throw error; } }
+    await wait(100);
+    await rm(parent, { recursive: true, force: true });
+  }
 });
 
 test("daemon rejects dirty sources before Task acceptance and bounds packets", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {

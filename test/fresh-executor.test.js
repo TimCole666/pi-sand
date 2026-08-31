@@ -51,8 +51,13 @@ process.stdin.on("data", (chunk) => {
       if (behavior.promptRejected) {
         send({ type: "response", command: "prompt", success: false, id: command.id });
       } else {
-        send({ type: "response", command: "prompt", success: true, id: command.id });
-        send({ type: "agent_settled", result: "fake settled" }, 5);
+        const response = { type: "response", command: "prompt", success: true, id: command.id };
+        if (behavior.sameChunk) {
+          process.stdout.write(JSON.stringify(response) + "\\n" + JSON.stringify({ type: "agent_settled", result: "fake settled" }) + "\\n");
+        } else {
+          send(response);
+          send({ type: "agent_settled", result: "fake settled" }, 5);
+        }
       }
     }
   }
@@ -198,6 +203,14 @@ test("prompt rejection is distinct from configuration failure and does not repor
   await withExecutor({ promptRejected: true }, async ({ fake, taskCwd }) => {
     await assert.rejects(start(fake, taskCwd), (error) => error.code === "PROMPT_REJECTED" && error.phase === "prompt");
     assert.deepEqual((await readCommands(fake.log)).slice(1).map(({ type }) => type), ["set_model", "set_thinking_level", "get_state", "prompt"]);
+  });
+});
+
+test("prompt response and settlement in one stdout chunk remain available in handle history", async () => {
+  await withExecutor({ sameChunk: true }, async ({ fake, taskCwd }) => {
+    const handle = await start(fake, taskCwd);
+    assert.equal(handle.events.some((event) => event.type === "agent_settled"), true);
+    return handle;
   });
 });
 

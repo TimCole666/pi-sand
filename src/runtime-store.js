@@ -41,6 +41,19 @@ const boundedDetail = (value) => bounded(value, MAX_TERMINAL_DETAIL_LENGTH);
 const RESTART_DETAIL = "pi-sandd restarted before the Fresh Executor finished; the Attempt was not resumed or replayed.";
 const ORPHAN_DETAIL = "The prior Fresh Executor could not be safely identified or terminated. The Task is blocked and its worktree was retained.";
 const DAEMON_SHUTDOWN_REASON = "daemon-shutdown";
+const TASK_SELECT = `SELECT id, source_repo_root AS sourceRepoRoot, base_commit AS baseCommit,
+  task_branch AS taskBranch, task_worktree AS taskWorktree, goal, state,
+  latest_attempt_id AS latestAttemptId, created_at AS createdAt, updated_at AS updatedAt,
+  final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead,
+  shutdown_reason AS shutdownReason
+  FROM tasks`;
+const ATTEMPT_SELECT = `SELECT id, task_id AS taskId, number, provider, model_id AS modelId,
+  thinking_level AS thinkingLevel, state, started_at AS startedAt, finished_at AS finishedAt,
+  worker_pid AS workerPid, worker_pgid AS workerPgid, worker_terminated AS workerTerminated,
+  worker_start_identity AS workerStartIdentity, worker_boot_id AS workerBootId,
+  final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead,
+  shutdown_reason AS shutdownReason
+  FROM attempts`;
 
 function assistantText(message) {
   if (typeof message?.content === "string") return message.content;
@@ -288,41 +301,26 @@ export class RuntimeStore {
 
   listTasks() {
     this.open();
-    const rows = this.db.prepare(`SELECT id, source_repo_root AS sourceRepoRoot, base_commit AS baseCommit,
-      task_branch AS taskBranch, task_worktree AS taskWorktree, goal, state,
-      latest_attempt_id AS latestAttemptId, created_at AS createdAt, updated_at AS updatedAt,
-      final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead,
-      shutdown_reason AS shutdownReason
-      FROM tasks ORDER BY created_at, id`).all();
-    const attempts = this.db.prepare(`SELECT id, task_id AS taskId, number, provider, model_id AS modelId,
-      thinking_level AS thinkingLevel, state, started_at AS startedAt, finished_at AS finishedAt,
-      worker_pid AS workerPid, worker_pgid AS workerPgid, worker_terminated AS workerTerminated,
-      worker_start_identity AS workerStartIdentity, worker_boot_id AS workerBootId,
-      final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead,
-      shutdown_reason AS shutdownReason
-      FROM attempts ORDER BY task_id, number`).all();
+    const rows = this.db.prepare(`${TASK_SELECT} ORDER BY created_at, id`).all();
+    const attempts = this.db.prepare(`${ATTEMPT_SELECT} ORDER BY task_id, number`).all();
     const grouped = new Map();
     for (const attempt of attempts) grouped.set(attempt.taskId, [...(grouped.get(attempt.taskId) ?? []), attemptSnapshot(attempt)]);
     return rows.map((row) => taskSnapshot(row, grouped.get(row.id) ?? []));
   }
 
+  #taskRow(id) {
+    return this.db.prepare(`${TASK_SELECT} WHERE id = ?`).get(id);
+  }
+
+  #taskAttemptRows(id) {
+    return this.db.prepare(`${ATTEMPT_SELECT} WHERE task_id = ? ORDER BY number`).all(id);
+  }
+
   getTask(id) {
     this.open();
-    const row = this.db.prepare(`SELECT id, source_repo_root AS sourceRepoRoot, base_commit AS baseCommit,
-      task_branch AS taskBranch, task_worktree AS taskWorktree, goal, state,
-      latest_attempt_id AS latestAttemptId, created_at AS createdAt, updated_at AS updatedAt,
-      final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead,
-      shutdown_reason AS shutdownReason
-      FROM tasks WHERE id = ?`).get(id);
+    const row = this.#taskRow(id);
     if (!row) return null;
-    const attempts = this.db.prepare(`SELECT id, task_id AS taskId, number, provider, model_id AS modelId,
-      thinking_level AS thinkingLevel, state, started_at AS startedAt, finished_at AS finishedAt,
-      worker_pid AS workerPid, worker_pgid AS workerPgid, worker_terminated AS workerTerminated,
-      worker_start_identity AS workerStartIdentity, worker_boot_id AS workerBootId,
-      final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead,
-      shutdown_reason AS shutdownReason
-      FROM attempts WHERE task_id = ? ORDER BY number`).all(id);
-    return taskSnapshot(row, attempts.map(attemptSnapshot));
+    return taskSnapshot(row, this.#taskAttemptRows(id).map(attemptSnapshot));
   }
 
   createWorktree({ repoRoot, baseCommit, taskId }) {
@@ -387,6 +385,20 @@ export class RuntimeStore {
     return this.launchAttempt({ task, attemptId, number: 1, model, thinkingLevel, packet });
   }
 
+  #recordAttemptWorker(attemptId, worker) {
+    const metadata = workerMetadata(worker);
+    if (!metadata) return null;
+    this.db.prepare(`UPDATE attempts SET worker_pid = ?, worker_pgid = ?, worker_start_identity = ?, worker_boot_id = ?, worker_terminated = 0
+      WHERE id = ? AND state = 'starting'`).run(
+      metadata.workerPid,
+      metadata.workerPgid,
+      metadata.workerStartIdentity,
+      metadata.workerBootId,
+      attemptId,
+    );
+    return metadata;
+  }
+
   async launchAttempt({ task, attemptId, number, model, thinkingLevel, packet, priorState, priorDetail }) {
     const taskPacket = packet ?? buildTaskPacket({
       taskId: task.id,
@@ -424,37 +436,48 @@ export class RuntimeStore {
         taskPrompt: taskPacket,
         onEvent: (event) => this.handleWorkerEvent(active, event),
         onClose: (details) => this.handleWorkerClose(active, details),
+        workerStopTimeoutMs: this.workerStopTimeoutMs,
+        onWorkerSpawn: (worker) => {
+          active.workerMetadata = this.#recordAttemptWorker(attemptId, worker);
+        },
       });
       if (this.active !== active) return this.getTask(task.id);
       active.worker = worker;
-      const metadata = workerMetadata(worker);
+      const metadata = workerMetadata(worker) ?? active.workerMetadata;
+      if (metadata) {
+        active.workerMetadata = this.#recordAttemptWorker(attemptId, metadata) ?? metadata;
+      }
+      const workerPid = active.workerMetadata?.workerPid ?? (Number.isInteger(worker?.pid) ? worker.pid : null);
+      const workerPgid = active.workerMetadata?.workerPgid ?? (Number.isInteger(worker?.processGroupId) ? worker.processGroupId : null);
+      this.db.prepare("UPDATE tasks SET state = 'running', updated_at = ? WHERE id = ? AND state IN ('accepted', 'running')").run(now(), task.id);
+      this.db.prepare("UPDATE attempts SET state = 'running', worker_pid = ?, worker_pgid = ?, worker_start_identity = ?, worker_boot_id = ? WHERE id = ? AND state = 'starting'").run(workerPid, workerPgid, active.workerMetadata?.workerStartIdentity ?? null, this.bootId ?? active.workerMetadata?.workerBootId ?? null, attemptId);
       // Constructor callbacks are attached by the production Fresh Executor.
-      // Older deterministic handles expose callbacks only after startup, so
-      // replay their history before subscribing in that case.
-      if (worker?.callbacksAttached) {
-        for (const event of active.pendingEvents) this.handleWorkerEvent(active, event);
-        active.pendingEvents = [];
-      } else {
-        if (Array.isArray(worker?.events)) for (const event of worker.events) this.handleWorkerEvent(active, event);
+      // Its event history covers the prompt response and agent_settled event
+      // when both arrive before this startup promise resumes.
+      if (!worker?.callbacksAttached) {
         worker?.onEvent?.((event) => this.handleWorkerEvent(active, event));
         worker?.onClose?.((details) => this.handleWorkerClose(active, details));
       }
-      const workerPid = metadata?.workerPid ?? (Number.isInteger(worker?.pid) ? worker.pid : null);
-      const workerPgid = metadata?.workerPgid ?? (Number.isInteger(worker?.processGroupId) ? worker.processGroupId : null);
-      this.db.prepare("UPDATE tasks SET state = 'running', updated_at = ? WHERE id = ? AND state IN ('accepted', 'running')").run(now(), task.id);
-      this.db.prepare("UPDATE attempts SET state = 'running', worker_pid = ?, worker_pgid = ?, worker_start_identity = ?, worker_boot_id = ? WHERE id = ? AND state = 'starting'").run(workerPid, workerPgid, metadata?.workerStartIdentity ?? null, this.bootId ?? metadata?.workerBootId ?? null, attemptId);
-      active.workerMetadata = metadata;
+      const replayed = new Set();
+      for (const event of (Array.isArray(worker?.events) ? worker.events : [])) {
+        replayed.add(event);
+        this.handleWorkerEvent(active, event);
+      }
+      for (const event of active.pendingEvents) {
+        if (!replayed.has(event)) this.handleWorkerEvent(active, event);
+      }
+      active.pendingEvents = [];
       // The production Fresh Executor has already accepted its packet before
       // returning. A small prompt method remains useful for deterministic
       // worker doubles without adding a second production transport path.
       if (typeof worker?.prompt === "function") await worker.prompt({ id: `${task.id}-prompt`, message: taskPacket });
-      for (const event of active.pendingEvents) this.handleWorkerEvent(active, event);
-      active.pendingEvents = [];
       if (active.pendingClose) this.handleWorkerClose(active, active.pendingClose);
       active.pendingClose = null;
       return this.getTask(task.id);
     } catch (error) {
       if (this.active === active && !active.finalizing) {
+        active.workerMetadata = active.workerMetadata ?? workerMetadata(error.workerMetadata);
+        if (active.workerMetadata) this.#recordAttemptWorker(attemptId, active.workerMetadata);
         await this.settle(active, {
           success: false,
           result: null,
@@ -520,8 +543,8 @@ export class RuntimeStore {
   }
 
   async retireWorker(worker, metadata) {
-    if (!worker) return true;
     const recorded = metadata ?? workerMetadata(worker);
+    if (!worker && !recorded) return true;
     if (!recorded) return !worker.pid && !worker.processGroupId;
     if (recordedWorkerIsGone(recorded)) return true;
     // Preserve #42's zero-timeout retirement boundary: it deliberately keeps
@@ -627,7 +650,7 @@ export class RuntimeStore {
     this.open();
     const task = this.getTask(id.trim());
     if (!task) throw new Error(`Task ${id} was not found.`);
-    if (task.state !== "running") throw new Error(`Task ${id} is already terminal (${task.state}); it is not active.`);
+    if (!["accepted", "running"].includes(task.state)) throw new Error(`Task ${id} is already terminal (${task.state}); it is not active.`);
     const attempt = task.attempts.find(({ id: attemptId }) => attemptId === task.latestAttemptId);
     if (!attempt || !ACTIVE_ATTEMPT_STATES.has(attempt.state)) throw new Error(`Task ${id} has no active Attempt to stop.`);
     const worker = attempt;
@@ -641,7 +664,7 @@ export class RuntimeStore {
     this.db.exec("BEGIN");
     try {
       this.db.prepare("UPDATE attempts SET state = 'stopped', finished_at = ?, worker_terminated = 1, terminal_detail = ? WHERE id = ? AND state IN ('starting', 'running')").run(timestamp, "The Task was intentionally stopped by the user.", attempt.id);
-      this.db.prepare("UPDATE tasks SET state = 'stopped', terminal_detail = ?, updated_at = ? WHERE id = ? AND state = 'running'").run("The Task was intentionally stopped by the user.", timestamp, task.id);
+      this.db.prepare("UPDATE tasks SET state = 'stopped', terminal_detail = ?, updated_at = ? WHERE id = ? AND state IN ('accepted', 'running')").run("The Task was intentionally stopped by the user.", timestamp, task.id);
       this.db.exec("COMMIT");
     } catch (error) {
       try { this.db.exec("ROLLBACK"); } catch {}

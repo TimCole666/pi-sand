@@ -169,6 +169,30 @@ test("daemon completes a Task after the submitting client disappears", { skip: p
   }
 });
 
+test("Fresh Executor history settles when prompt acceptance and agent_settled share startup", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-history-settle-"));
+  const source = await repository(parent);
+  const piCommand = await versionCommand(parent);
+  const workerFactory = async () => ({
+    callbacksAttached: true,
+    events: [
+      { type: "message_end", message: { role: "assistant", content: "history result", stopReason: "stop" } },
+      { type: "agent_settled" },
+    ],
+    close() {},
+  });
+  const runtime = new RuntimeStore({ ...startOptions(source, workerFactory, piCommand), dbPath: join(parent, "runtime.sqlite") });
+  try {
+    const started = await runtime.createTask(optionsFor(source));
+    const completed = await eventually(() => runtime.getTask(started.id), (task) => task.state !== "running");
+    assert.equal(completed.state, "completed");
+    assert.equal(completed.finalResult, "history result");
+  } finally {
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
 test("settlement rules preserve commits, checkpoint residual changes, avoid empty commits, and retain failed worktrees", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
   const cases = [
     { name: "changed", worker: deterministicWorker({ events: [{ type: "agent_end" }], change: true }), state: "completed", commits: 2 },
