@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, realpathSync } from "node:fs";
+import { stopOwnedProcessGroup, workerProcessMetadata } from "./process-group.js";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -13,8 +14,10 @@ export const TASK_RUNTIME_DB_ENV = "PI_SAND_RUNTIME_DB";
 export const MAX_TASK_GOAL_LENGTH = 4_000;
 export const MAX_TASK_RESULT_LENGTH = 4_000;
 export const MAX_TASK_DETAIL_LENGTH = 2_000;
+export const TASK_SHUTDOWN_REASONS = Object.freeze(["quit", "reload", "new", "resume", "fork"]);
 
 const ACTIVE_STATES = "('starting', 'running')";
+const SHUTDOWN_REASON_SQL = "('quit', 'reload', 'new', 'resume', 'fork')";
 const now = () => new Date().toISOString();
 const errorText = (error) => String(error?.stderr || error?.message || "command failed").trim();
 function bounded(value, limit) { return String(value ?? "").slice(0, limit); }
@@ -64,7 +67,10 @@ function attemptView(row) {
   return {
     id: row.id, taskId: row.taskId, number: row.number, provider: row.provider, modelId: row.modelId,
     thinkingLevel: row.thinkingLevel, state: row.state, startedAt: row.startedAt, finishedAt: row.finishedAt ?? null,
+    shutdownReason: row.shutdownReason ?? null,
     workerPid: row.workerPid ?? null, workerPgid: row.workerPgid ?? null,
+    workerStartIdentity: row.workerStartIdentity ?? null, workerBootId: row.workerBootId ?? null,
+    workerTerminated: row.workerTerminated === 1,
     finalResult: row.finalResult ?? null, terminalDetail: row.terminalDetail ?? null,
     finalBranchHead: row.finalBranchHead ?? null,
   };
@@ -73,14 +79,14 @@ function attemptView(row) {
 export class TaskRuntime {
   constructor({ dbPath = process.env[TASK_RUNTIME_DB_ENV] ?? defaultTaskRuntimeDatabasePath(), piCommand = process.env.PI_BIN ?? "pi", workerFactory = spawnFreshExecutor, workerEnv, worktreeRoot } = {}) {
     this.dbPath = dbPath; this.piCommand = piCommand; this.workerFactory = workerFactory; this.workerEnv = workerEnv; this.worktreeRoot = worktreeRoot;
-    this.db = null; this.lock = null; this.active = null; this.closed = false;
+    this.db = null; this.lock = null; this.active = null; this.closed = false; this.shuttingDown = false; this.shutdownPromise = null;
   }
 
   ensureSupported() { if (process.platform !== "linux") throw new Error(FRESH_EXECUTOR_UNSUPPORTED_ERROR); }
 
   ensureOwner() {
     this.ensureSupported();
-    if (this.closed) throw new Error("The pi-sand Task Runtime is closed.");
+    if (this.closed || this.shuttingDown) throw new Error("The pi-sand Task Runtime is closed.");
     if (this.db) return this.db;
     if (this.dbPath !== ":memory:") mkdirSync(dirname(this.dbPath), { recursive: true, mode: 0o700 });
     try {
@@ -92,16 +98,19 @@ export class TaskRuntime {
         CREATE TABLE IF NOT EXISTS tasks (
           id TEXT PRIMARY KEY, source_repo_root TEXT NOT NULL, base_commit TEXT NOT NULL,
           task_branch TEXT NOT NULL UNIQUE, task_worktree TEXT NOT NULL UNIQUE, goal TEXT NOT NULL,
-          state TEXT NOT NULL CHECK(state IN ('accepted','running','completed','failed')), latest_attempt_id TEXT,
+          state TEXT NOT NULL CHECK(state IN ('accepted','running','completed','failed','interrupted')), latest_attempt_id TEXT,
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL, final_result TEXT,
-          terminal_detail TEXT, final_branch_head TEXT
+          terminal_detail TEXT, final_branch_head TEXT,
+          shutdown_reason TEXT CHECK(shutdown_reason IS NULL OR shutdown_reason IN ${SHUTDOWN_REASON_SQL})
         );
         CREATE TABLE IF NOT EXISTS attempts (
           id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), number INTEGER NOT NULL,
           provider TEXT NOT NULL, model_id TEXT NOT NULL, thinking_level TEXT NOT NULL,
-          state TEXT NOT NULL CHECK(state IN ('starting','running','completed','failed')), started_at TEXT NOT NULL,
-          finished_at TEXT, worker_pid INTEGER, worker_pgid INTEGER, final_result TEXT,
-          terminal_detail TEXT, final_branch_head TEXT, UNIQUE(task_id, number)
+          state TEXT NOT NULL CHECK(state IN ('starting','running','completed','failed','interrupted')), started_at TEXT NOT NULL,
+          finished_at TEXT, worker_pid INTEGER, worker_pgid INTEGER, worker_start_identity TEXT,
+          worker_boot_id TEXT, worker_terminated INTEGER NOT NULL DEFAULT 1 CHECK(worker_terminated IN (0, 1)),
+          final_result TEXT, terminal_detail TEXT, final_branch_head TEXT,
+          shutdown_reason TEXT CHECK(shutdown_reason IS NULL OR shutdown_reason IN ${SHUTDOWN_REASON_SQL}), UNIQUE(task_id, number)
         );
         CREATE INDEX IF NOT EXISTS tasks_created ON tasks(created_at, id);
         CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id, number);
@@ -120,44 +129,50 @@ export class TaskRuntime {
   migrateCompletionSchema() {
     const tasksSql = this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'").get()?.sql ?? "";
     const attemptsSql = this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'attempts'").get()?.sql ?? "";
-    if (!tasksSql || !attemptsSql || tasksSql.includes("'completed'") && attemptsSql.includes("'completed'")) return;
+    const complete = tasksSql.includes("'interrupted'") && attemptsSql.includes("'interrupted'")
+      && tasksSql.includes("shutdown_reason") && attemptsSql.includes("worker_start_identity");
+    if (!tasksSql || !attemptsSql || complete) return;
     this.db.exec("PRAGMA foreign_keys = OFF; BEGIN; ALTER TABLE attempts RENAME TO attempts_legacy; ALTER TABLE tasks RENAME TO tasks_legacy; DROP INDEX IF EXISTS tasks_created; DROP INDEX IF EXISTS attempts_task;");
     this.db.exec(`
       CREATE TABLE tasks (
         id TEXT PRIMARY KEY, source_repo_root TEXT NOT NULL, base_commit TEXT NOT NULL,
         task_branch TEXT NOT NULL UNIQUE, task_worktree TEXT NOT NULL UNIQUE, goal TEXT NOT NULL,
-        state TEXT NOT NULL CHECK(state IN ('accepted','running','completed','failed')), latest_attempt_id TEXT,
-        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, final_result TEXT,
-        terminal_detail TEXT, final_branch_head TEXT
+        state TEXT NOT NULL CHECK(state IN ('accepted','running','completed','failed','interrupted')), latest_attempt_id TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, final_result TEXT, terminal_detail TEXT, final_branch_head TEXT,
+        shutdown_reason TEXT CHECK(shutdown_reason IS NULL OR shutdown_reason IN ${SHUTDOWN_REASON_SQL})
       );
       CREATE TABLE attempts (
         id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), number INTEGER NOT NULL,
         provider TEXT NOT NULL, model_id TEXT NOT NULL, thinking_level TEXT NOT NULL,
-        state TEXT NOT NULL CHECK(state IN ('starting','running','completed','failed')), started_at TEXT NOT NULL,
-        finished_at TEXT, worker_pid INTEGER, worker_pgid INTEGER, final_result TEXT,
-        terminal_detail TEXT, final_branch_head TEXT, UNIQUE(task_id, number)
+        state TEXT NOT NULL CHECK(state IN ('starting','running','completed','failed','interrupted')), started_at TEXT NOT NULL,
+        finished_at TEXT, worker_pid INTEGER, worker_pgid INTEGER, worker_start_identity TEXT, worker_boot_id TEXT,
+        worker_terminated INTEGER NOT NULL DEFAULT 1 CHECK(worker_terminated IN (0, 1)), final_result TEXT, terminal_detail TEXT, final_branch_head TEXT,
+        shutdown_reason TEXT CHECK(shutdown_reason IS NULL OR shutdown_reason IN ${SHUTDOWN_REASON_SQL}), UNIQUE(task_id, number)
       );
-      INSERT INTO tasks (id, source_repo_root, base_commit, task_branch, task_worktree, goal, state, latest_attempt_id, created_at, updated_at)
-        SELECT id, source_repo_root, base_commit, task_branch, task_worktree, goal, state, latest_attempt_id, created_at, updated_at FROM tasks_legacy;
-      INSERT INTO attempts (id, task_id, number, provider, model_id, thinking_level, state, started_at, finished_at, worker_pid, worker_pgid)
-        SELECT id, task_id, number, provider, model_id, thinking_level, state, started_at, finished_at, worker_pid, worker_pgid FROM attempts_legacy;
+      INSERT INTO tasks (id, source_repo_root, base_commit, task_branch, task_worktree, goal, state, latest_attempt_id, created_at, updated_at, final_result, terminal_detail, final_branch_head)
+        SELECT id, source_repo_root, base_commit, task_branch, task_worktree, goal, state, latest_attempt_id, created_at, updated_at,
+          ${tasksSql.includes("final_result") ? "final_result" : "NULL"}, ${tasksSql.includes("terminal_detail") ? "terminal_detail" : "NULL"}, ${tasksSql.includes("final_branch_head") ? "final_branch_head" : "NULL"} FROM tasks_legacy;
+      INSERT INTO attempts (id, task_id, number, provider, model_id, thinking_level, state, started_at, finished_at, worker_pid, worker_pgid, worker_terminated, final_result, terminal_detail, final_branch_head)
+        SELECT id, task_id, number, provider, model_id, thinking_level, state, started_at, finished_at, worker_pid, worker_pgid,
+          CASE WHEN worker_pid IS NULL AND worker_pgid IS NULL THEN 1 ELSE 0 END,
+          ${attemptsSql.includes("final_result") ? "final_result" : "NULL"}, ${attemptsSql.includes("terminal_detail") ? "terminal_detail" : "NULL"}, ${attemptsSql.includes("final_branch_head") ? "final_branch_head" : "NULL"} FROM attempts_legacy;
     `);
     this.db.exec("DROP TABLE attempts_legacy; DROP TABLE tasks_legacy; COMMIT; PRAGMA foreign_keys = ON");
   }
 
   taskRow(id) {
-    return this.db.prepare(`SELECT id, source_repo_root AS sourceRepoRoot, base_commit AS baseCommit, task_branch AS taskBranch, task_worktree AS taskWorktree, goal, state, latest_attempt_id AS latestAttemptId, created_at AS createdAt, updated_at AS updatedAt, final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead FROM tasks WHERE id = ?`).get(id);
+    return this.db.prepare(`SELECT id, source_repo_root AS sourceRepoRoot, base_commit AS baseCommit, task_branch AS taskBranch, task_worktree AS taskWorktree, goal, state, latest_attempt_id AS latestAttemptId, created_at AS createdAt, updated_at AS updatedAt, final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead, shutdown_reason AS shutdownReason FROM tasks WHERE id = ?`).get(id);
   }
 
   taskWithAttempts(row) {
     if (!row) return null;
-    const attempts = this.db.prepare(`SELECT id, task_id AS taskId, number, provider, model_id AS modelId, thinking_level AS thinkingLevel, state, started_at AS startedAt, finished_at AS finishedAt, worker_pid AS workerPid, worker_pgid AS workerPgid, final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead FROM attempts WHERE task_id = ? ORDER BY number`).all(row.id).map(attemptView);
+    const attempts = this.db.prepare(`SELECT id, task_id AS taskId, number, provider, model_id AS modelId, thinking_level AS thinkingLevel, state, started_at AS startedAt, finished_at AS finishedAt, shutdown_reason AS shutdownReason, worker_pid AS workerPid, worker_pgid AS workerPgid, worker_start_identity AS workerStartIdentity, worker_boot_id AS workerBootId, worker_terminated AS workerTerminated, final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead FROM attempts WHERE task_id = ? ORDER BY number`).all(row.id).map(attemptView);
     return { ...row, attempts };
   }
 
   listTasks() {
     this.ensureOwner();
-    return this.db.prepare(`SELECT id, source_repo_root AS sourceRepoRoot, base_commit AS baseCommit, task_branch AS taskBranch, task_worktree AS taskWorktree, goal, state, latest_attempt_id AS latestAttemptId, created_at AS createdAt, updated_at AS updatedAt, final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead FROM tasks ORDER BY created_at, id`).all().map((row) => this.taskWithAttempts(row));
+    return this.db.prepare(`SELECT id, source_repo_root AS sourceRepoRoot, base_commit AS baseCommit, task_branch AS taskBranch, task_worktree AS taskWorktree, goal, state, latest_attempt_id AS latestAttemptId, created_at AS createdAt, updated_at AS updatedAt, final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead, shutdown_reason AS shutdownReason FROM tasks ORDER BY created_at, id`).all().map((row) => this.taskWithAttempts(row));
   }
 
   getTask(id) { this.ensureOwner(); return this.taskWithAttempts(this.taskRow(id)); }
@@ -203,6 +218,7 @@ export class TaskRuntime {
     }
     try {
       const lifecycle = { events: [], closed: false, close: null };
+      const processMetadata = workerProcessMetadata({ pid: null, processGroupId: null });
       const worker = this.workerFactory({
         cwd: taskWorktree, command: this.piCommand, env: this.workerEnv,
         provider: model.provider, modelId: model.id, thinkingLevel,
@@ -216,8 +232,13 @@ export class TaskRuntime {
         },
       });
       db.prepare("UPDATE tasks SET state='running',updated_at=? WHERE id=?").run(now(), taskId);
-      db.prepare("UPDATE attempts SET state='running',worker_pid=?,worker_pgid=? WHERE id=?").run(Number.isInteger(worker?.pid) ? worker.pid : null, Number.isInteger(worker?.processGroupId) ? worker.processGroupId : null, attemptId);
-      this.active = { taskId, attemptId, worker, packet, settled: false, closed: false, finalizing: false, finalAssistant: null };
+      const recordedProcess = workerProcessMetadata(worker);
+      db.prepare("UPDATE attempts SET state='running',worker_pid=?,worker_pgid=?,worker_start_identity=?,worker_boot_id=?,worker_terminated=? WHERE id=?").run(
+        recordedProcess?.workerPid ?? null, recordedProcess?.workerPgid ?? null,
+        recordedProcess?.workerStartIdentity ?? null, recordedProcess?.workerBootId ?? null,
+        recordedProcess ? 0 : 1, attemptId,
+      );
+      this.active = { taskId, attemptId, worker, packet, processMetadata: recordedProcess ?? processMetadata, settled: false, closed: false, finalizing: false, finalAssistant: null };
       worker.setModel?.({ provider: model.provider, modelId: model.id });
       worker.setThinkingLevel?.(thinkingLevel);
       for (const event of lifecycle.events) this.handleWorkerEvent(taskId, attemptId, event);
@@ -337,6 +358,50 @@ export class TaskRuntime {
     if (this.active !== active) return;
     this.active = null;
     try { active.worker?.close?.(); } catch {}
+  }
+
+  async shutdown(reason = "quit") {
+    if (!TASK_SHUTDOWN_REASONS.includes(reason)) throw new Error(`Unsupported Task Runtime shutdown reason: ${reason}`);
+    if (this.shutdownPromise) return this.shutdownPromise;
+    this.shutdownPromise = (async () => {
+      if (this.closed) return;
+      this.shuttingDown = true;
+      const active = this.active;
+      if (active) {
+        const row = this.db?.prepare("SELECT worker_pid AS workerPid, worker_pgid AS workerPgid, worker_start_identity AS workerStartIdentity, worker_boot_id AS workerBootId FROM attempts WHERE id = ?").get(active.attemptId);
+        const worker = row ?? active.processMetadata;
+        const hasRecordedProcess = Number.isInteger(worker?.workerPid) || Number.isInteger(worker?.workerPgid);
+        const terminated = hasRecordedProcess ? await stopOwnedProcessGroup(worker) : true;
+        if (terminated) {
+          try { active.worker?.close?.(); } catch {}
+        }
+        if (this.db) {
+          const timestamp = now();
+          this.db.exec("BEGIN");
+          try {
+            this.db.prepare(`UPDATE attempts SET state='interrupted',finished_at=?,shutdown_reason=?,worker_terminated=? WHERE id=? AND state IN ${ACTIVE_STATES}`).run(timestamp, reason, terminated ? 1 : 0, active.attemptId);
+            this.db.prepare("UPDATE tasks SET state='interrupted',updated_at=?,shutdown_reason=? WHERE id=? AND latest_attempt_id=?").run(timestamp, reason, active.taskId, active.attemptId);
+            this.db.exec("COMMIT");
+          } catch (error) {
+            try { this.db.exec("ROLLBACK"); } catch {}
+            throw error;
+          }
+        }
+        this.active = null;
+      }
+      this.releaseResources();
+    })();
+    return this.shutdownPromise;
+  }
+
+  releaseResources() {
+    this.closed = true;
+    this.shuttingDown = false;
+    this.active = null;
+    try { this.db?.close(); } catch {}
+    this.db = null;
+    try { this.lock?.release(); } catch {}
+    this.lock = null;
   }
 
   close() {
