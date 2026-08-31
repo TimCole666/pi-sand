@@ -6,6 +6,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TaskRuntime, TASK_RUNTIME_OWNERSHIP_ERROR } from "../src/task-runtime.js";
+import { processGroupIsAlive } from "../src/process-group.js";
 import { registerPiSandExtension } from "../extensions/runtime.js";
 import { createExtensionHarness } from "./helpers/v0.2-extension-harness.js";
 
@@ -82,15 +83,6 @@ function gitOutput(cwd, args) {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 }
 
-function processGroupIsAlive(processGroupId) {
-  try {
-    process.kill(-processGroupId, 0);
-    return true;
-  } catch (error) {
-    return error.code === "EPERM";
-  }
-}
-
 test("Extension /task persists an isolated Task and sends one bounded fresh-worker packet", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-"));
   const source = await repository(parent);
@@ -130,6 +122,38 @@ test("Extension /task persists an isolated Task and sends one bounded fresh-work
     runtime.close();
     await rm(parent, { recursive: true, force: true });
   }
+});
+
+test("explicit stop and fresh retry preserve the task worktree and snapshot new model settings", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-stop-retry-"));
+  const source = await repository(parent);
+  const fake = await fakePi(parent);
+  const runtime = new TaskRuntime({ dbPath: join(parent, "runtime.sqlite"), piCommand: fake.command, workerEnv: { ...process.env, ARGS_PATH: fake.args, PACKET_PATH: fake.packet }, worktreeRoot: join(parent, "worktrees") });
+  try {
+    const started = runtime.startTask({ goal: "preserve progress", cwd: source, trusted: true, model: { provider: "p1", id: "m1" }, thinkingLevel: "high" });
+    const progress = join(started.taskWorktree, "progress.txt");
+    await writeFile(progress, "keep\n");
+    const stopped = runtime.stopTask(started.id);
+    assert.equal(stopped.state, "stopped");
+    assert.equal(stopped.attempts[0].state, "stopped");
+    assert.match(stopped.attempts[0].terminalDetail, /intentionally stopped/);
+    assert.throws(() => runtime.stopTask(started.id), /already terminal/);
+    const retried = runtime.retryTask({ id: started.id, trusted: true, model: { provider: "p2", id: "m2" }, thinkingLevel: "low" });
+    assert.equal(retried.state, "running");
+    assert.equal(retried.taskWorktree, started.taskWorktree);
+    assert.equal(retried.taskBranch, started.taskBranch);
+    assert.equal(retried.attempts.length, 2);
+    assert.equal(retried.attempts[1].number, 2);
+    assert.equal(retried.attempts[1].provider, "p2");
+    assert.equal(retried.attempts[1].modelId, "m2");
+    assert.equal(retried.attempts[1].thinkingLevel, "low");
+    assert.notEqual(retried.attempts[0].workerPid, retried.attempts[1].workerPid);
+    assert.equal(await readFile(progress, "utf8"), "keep\n");
+    const packet = (await waitForPrompt(fake.packet)).filter((line) => line.type === "prompt").at(-1);
+    assert.match(packet.message, /Attempt: 2/);
+    assert.match(packet.message, /Previous attempt outcome: stopped/);
+    assert.match(packet.message, /Existing filesystem changes/);
+  } finally { runtime.close(); await rm(parent, { recursive: true, force: true }); }
 });
 
 test("Task Git preflight rejects dirty and non-Git sources before opening its store", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
@@ -285,10 +309,11 @@ test("graceful reload and session replacement interrupt the owned worker before 
       assert.equal(listed.ok, true);
       assert.equal(listed.tasks[0].state, "interrupted");
       assert.equal(listed.tasks[0].shutdownReason, reason);
+      assert.equal(listed.tasks[0].attempts.length, 1, "shutdown must record exactly one Attempt");
       assert.equal(listed.tasks[0].attempts[0].state, "interrupted");
       assert.equal(listed.tasks[0].attempts[0].shutdownReason, reason);
       assert.equal(listed.tasks[0].attempts[0].workerTerminated, true);
-      assert.equal((await readFile(fake.packet, "utf8")).trim().split("\\n").filter(Boolean).length, 3, "replacement must not replay the Task Packet");
+      assert.equal((await readFile(fake.packet, "utf8")).trim().split("\n").filter(Boolean).length, 3, "replacement must not replay the Task Packet");
     } finally {
       interrupted?.close();
       runtime.close();
