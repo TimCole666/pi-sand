@@ -1,18 +1,22 @@
 // v0.2 durable seam: Real Pi Extension Host Acceptance on Pi 0.84.4.
-// Deterministic Extension Lifecycle Integration is a separate later seam; this
-// test intentionally proves package loading and command dispatch only.
+// Deterministic Extension Lifecycle Integration is the companion durable seam;
+// this test proves package loading, command dispatch, and reload in real Pi.
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { StringDecoder } from "node:string_decoder";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const extensionPath = join(repositoryRoot, "extensions", "pi-sand.ts");
+const extensionSourcePaths = [
+  join(repositoryRoot, "extensions", "pi-sand.ts"),
+  join(repositoryRoot, "extensions", "runtime.js"),
+];
 const piCommand = process.env.PI_BIN ?? "pi";
 const piVersionProbe = spawnSync(piCommand, ["--version"], { encoding: "utf8" });
 const piAvailable = piVersionProbe.status === 0;
@@ -68,6 +72,7 @@ function attachJsonlReader(stream, onLine) {
 }
 
 async function runHostAcceptance() {
+  const hostCwd = await mkdtemp(join(tmpdir(), "pi-sand-v02-host-"));
   const child = spawn(piCommand, [
     "--mode", "rpc",
     "--no-session",
@@ -78,9 +83,8 @@ async function runHostAcceptance() {
     "--no-context-files",
     "--no-tools",
     "--offline",
-    "--approve",
-    "--extension", repositoryRoot,
-  ], { cwd: repositoryRoot, stdio: ["pipe", "pipe", "pipe"] });
+    "-e", repositoryRoot,
+  ], { cwd: hostCwd, stdio: ["pipe", "pipe", "pipe"] });
   const close = once(child, "close");
   const events = [];
   let changed;
@@ -100,10 +104,11 @@ async function runHostAcceptance() {
     send({ id: "commands", type: "get_commands" }, child);
     const commandsResponse = await waitForEvent(events, (event) => event.type === "response" && event.id === "commands", child);
     assert.equal(commandsResponse.success, true);
-    const command = commandsResponse.data.commands.find((candidate) => candidate.name === "pi-sand");
-    assert.deepEqual(command && {
-      name: command.name,
-      source: command.source,
+    const piSandCommands = commandsResponse.data.commands.filter((candidate) => candidate.name === "pi-sand");
+    assert.equal(piSandCommands.length, 1);
+    assert.deepEqual({
+      name: piSandCommands[0].name,
+      source: piSandCommands[0].source,
     }, {
       name: "pi-sand",
       source: "extension",
@@ -115,7 +120,7 @@ async function runHostAcceptance() {
     assert.deepEqual(Object.keys(status).sort(), ["activity", "cwd", "extension", "mode", "session"]);
     assert.equal(status.extension, "pi-sand");
     assert.equal(status.mode, "rpc");
-    assert.equal(status.cwd, repositoryRoot);
+    assert.equal(status.cwd, hostCwd);
     assert.match(status.session, /^[0-9a-f-]{36}$/);
     assert.equal(status.activity, "idle");
     assert.equal(statusRequest.notifyType, "info");
@@ -175,6 +180,7 @@ async function runHostAcceptance() {
   } finally {
     child.stdin.end();
     await close;
+    await rm(hostCwd, { recursive: true, force: true });
     assert.equal(stderr.join(""), "", `Pi RPC wrote unexpected stderr: ${stderr.join("")}`);
   }
 }
@@ -194,8 +200,10 @@ test("v0.2 host acceptance loads the package in real Pi 0.84.4 and dispatches /p
 });
 
 test("v0.2 host extension leaves ordinary prompts with foreground Pi", async () => {
-  const source = await readFile(extensionPath, "utf8");
-  assert.doesNotMatch(source, /AgentService|Local Agent Service|spawn\s*\(|execFile\s*\(/);
+  const source = (await Promise.all(extensionSourcePaths.map((path) => readFile(path, "utf8")))).join("\n");
+  assert.doesNotMatch(source, /AgentService|Local Agent Service|child_process|spawn\s*\(|execFile\s*\(/);
+  assert.doesNotMatch(source, /chromium|localhost|http\.createServer|\.listen\s*\(/i);
   assert.doesNotMatch(source, /pi\.on\(\s*["']input["']/);
   assert.doesNotMatch(source, /send(?:User)?Message\s*\(/);
+  assert.doesNotMatch(source, /appendEntry|transcript|sqlite|database/i);
 });

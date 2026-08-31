@@ -120,6 +120,32 @@ test("session lifecycle projects activity, preserves agent_end authority, and cl
   assert.equal(status.activity, "idle");
 });
 
+test("session replacement clears the old surfaces before binding one fresh runtime", async () => {
+  const harness = createHarness();
+  registerPiSandExtension(harness.pi);
+  const oldContext = harness.context("old");
+  const newContext = harness.context("new");
+
+  await harness.invoke("session_start", { type: "session_start", reason: "startup" }, oldContext);
+  await harness.invoke("agent_start", { type: "agent_start" }, oldContext);
+  await harness.invoke("session_start", { type: "session_start", reason: "new" }, newContext);
+
+  assert.deepEqual(harness.status.slice(-2), [
+    { session: "old", key: "pi-sand", text: undefined },
+    { session: "new", key: "pi-sand", text: "pi-sand: idle" },
+  ]);
+  assert.deepEqual(harness.widgets.slice(-2), [
+    { session: "old", key: "pi-sand", lines: undefined },
+    { session: "new", key: "pi-sand", lines: ["pi-sand activity: idle"] },
+  ]);
+
+  const oldRunningCount = harness.status.filter(({ session, text }) => session === "old" && text === "pi-sand: running").length;
+  await harness.invoke("agent_start", { type: "agent_start" }, oldContext);
+  assert.equal(harness.status.filter(({ session, text }) => session === "old" && text === "pi-sand: running").length, oldRunningCount);
+  await harness.commands.get("pi-sand").handler("", newContext);
+  assert.equal(JSON.parse(harness.notifications.at(-1).message).session, "new");
+});
+
 test("reload replacement starts one fresh projection without duplicate registrations", async () => {
   const first = createHarness();
   registerPiSandExtension(first.pi);

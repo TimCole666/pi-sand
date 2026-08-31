@@ -12,12 +12,14 @@ function getSessionId(ctx) {
 
 class SessionRuntime {
   #sessionId;
+  #context;
   #activity = ACTIVITY.IDLE;
   #agentWorkActive = false;
   #closed = false;
 
   constructor(ctx) {
     this.#sessionId = getSessionId(ctx);
+    this.#context = ctx;
   }
 
   get sessionId() {
@@ -61,14 +63,12 @@ class SessionRuntime {
     this.#agentWorkActive = active;
   }
 
-  close(ctx) {
+  close(ctx = this.#context) {
     if (this.#closed) return;
-    const matches = this.matches(ctx);
     this.#closed = true;
-    if (matches) {
-      ctx.ui.setStatus(STATUS_KEY, undefined);
-      ctx.ui.setWidget(WIDGET_KEY, undefined);
-    }
+    this.#context = undefined;
+    ctx?.ui.setStatus(STATUS_KEY, undefined);
+    ctx?.ui.setWidget(WIDGET_KEY, undefined);
   }
 }
 
@@ -96,7 +96,10 @@ export function registerPiSandExtension(pi) {
   pi.on("project_trust", async () => ({ trusted: "undecided" }));
 
   pi.on("session_start", async (_event, ctx) => {
-    runtime?.close(ctx);
+    // Pi normally emits session_shutdown before this event. Closing the prior
+    // runtime defensively also keeps replacement safe if the host coalesces
+    // lifecycle delivery.
+    runtime?.close();
     runtime = new SessionRuntime(ctx);
     runtime.render(ctx);
   });
