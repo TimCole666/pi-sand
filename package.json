@@ -1,6 +1,7 @@
 {
   "name": "pi-sand",
-  "version": "0.2.0",
+  "version": "0.3.0",
+  "description": "v0.3 persistent local Task Runtime for Pi 0.84.4",
   "private": true,
   "keywords": ["pi-package"],
   "peerDependencies": {
@@ -9,7 +10,7 @@
   "pi": {
     "extensions": ["./extensions/pi-sand.ts"]
   },
-  "bin": { "pi-sand": "src/launcher.js" },
+  "bin": { "pi-sand": "src/launcher.js", "pi-sandd": "src/daemon.js" },
   "type": "module",
   "engines": { "node": ">=22.13" },
   "scripts": {
@@ -17,6 +18,7 @@
     "launch": "node src/launcher.js",
     "test": "node --test --test-concurrency=1",
     "test:real-pi": "PI_SAND_REAL_PI=1 node --test test/real-pi.acceptance.test.js",
+    "test:real-runtime": "PI_SAND_REAL_RUNTIME=1 node --test test/v0.3-real-pi.acceptance.test.js",
     "spike:self-test": "node spikes/pi-contract.mjs self-test"
   }
 }
