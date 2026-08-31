@@ -88,6 +88,48 @@ async function waitForGroupGone(processGroupId, timeoutMs) {
   return true;
 }
 
+function sleepSync(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function waitForGroupGoneSync(processGroupId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (processGroupIsAlive(processGroupId)) {
+    if (Date.now() >= deadline) return false;
+    sleepSync(25);
+  }
+  return true;
+}
+
+function recordedWorkerIsCurrent(worker) {
+  return ownershipIsProven(worker)
+    && (!worker.workerBootId || worker.workerBootId === readLinuxBootId());
+}
+
+function signalCurrentGroup(worker, signal) {
+  if (!recordedWorkerIsCurrent(worker)) return false;
+  try {
+    process.kill(-worker.workerPgid, signal);
+  } catch (error) {
+    if (error.code === "ESRCH") return true;
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Synchronous counterpart for user-command handlers that must not report a
+ * stopped Task until the owned process group has disappeared.
+ */
+export function stopOwnedProcessGroupSync(worker, { timeoutMs = WORKER_STOP_TIMEOUT_MS } = {}) {
+  if (!Number.isInteger(worker?.workerPid) || !Number.isInteger(worker?.workerPgid)) return false;
+  if (!processGroupIsAlive(worker.workerPgid)) return true;
+  if (!signalCurrentGroup(worker, "SIGTERM")) return false;
+  if (waitForGroupGoneSync(worker.workerPgid, timeoutMs)) return true;
+  if (!signalCurrentGroup(worker, "SIGKILL")) return false;
+  return waitForGroupGoneSync(worker.workerPgid, timeoutMs);
+}
+
 /**
  * Stop one recorded worker group without ever signalling a reused PID/PGID.
  * A false result is deliberately conservative: callers retain all process
