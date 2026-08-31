@@ -71,7 +71,7 @@ The v0.2 host contract has two durable seams, as defined by GitHub issue [#22](h
    node --test test/v0.2-host.acceptance.test.js
    ```
 
-2. **Deterministic Extension Lifecycle Integration** — `test/v0.2-activity.integration.test.js` and `test/v0.2-extension.integration.test.js` exercise the public Extension event/registration/UI boundary with deterministic host events, including session start, agent start, user-prompt waiting, `agent_settled`, reload/session replacement, and shutdown. It is intentionally distinct from the real-host acceptance seam; the current implementation is only a host-status projection and does not add a parallel runtime.
+2. **Deterministic Extension Lifecycle Integration** — `test/v0.2-activity.integration.test.js` and `test/v0.2-extension.integration.test.js` exercise the public Extension event/registration/UI boundary with deterministic host events, including session start, agent start, user-prompt waiting, `agent_settled`, reload/session replacement, and shutdown. It is intentionally distinct from the real-host acceptance seam; the current implementation is only a host-status projection, does not intercept ordinary prompts, and does not add a parallel runtime.
 
 The v0.2 completion authority is Pi's settled lifecycle, not a low-level `agent_end` event. Lifecycle work must preserve Pi's ownership and must not introduce a reload manager, parallel runtime, Fresh Executor, durable Task/Attempt state, scheduler, Mission, or self-hosting implementation into this host migration.
 

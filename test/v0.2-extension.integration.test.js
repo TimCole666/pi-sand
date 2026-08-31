@@ -9,7 +9,7 @@ function createHarness() {
   return harness;
 }
 
-test("factory only binds Pi-native handlers and does not start runtime resources", () => {
+test("factory only binds the status command and Pi lifecycle observers; Pi owns ordinary prompts", () => {
   const harness = createHarness();
 
   assert.deepEqual([...harness.commands.keys()], ["pi-sand"]);
