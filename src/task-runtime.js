@@ -11,12 +11,20 @@ export const TASK_RUNTIME_OWNERSHIP_ERROR = "The pi-sand Task Runtime is already
 export const FRESH_EXECUTOR_UNSUPPORTED_ERROR = "Fresh Executor Tasks are supported only on Linux.";
 export const TASK_RUNTIME_DB_ENV = "PI_SAND_RUNTIME_DB";
 export const MAX_TASK_GOAL_LENGTH = 4_000;
+export const MAX_TASK_RESULT_LENGTH = 4_000;
+export const MAX_TASK_DETAIL_LENGTH = 2_000;
 
 const ACTIVE_STATES = "('starting', 'running')";
 const now = () => new Date().toISOString();
 const errorText = (error) => String(error?.stderr || error?.message || "command failed").trim();
+function bounded(value, limit) { return String(value ?? "").slice(0, limit); }
 function git(cwd, args) { return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim(); }
 function canonical(path) { return realpathSync.native(resolve(path)); }
+function assistantText(message) {
+  if (typeof message?.content === "string") return message.content;
+  if (!Array.isArray(message?.content)) return "";
+  return message.content.filter((part) => part?.type === "text").map((part) => part.text ?? "").join("");
+}
 
 export function defaultTaskRuntimeDatabasePath() {
   return join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "pi-sand", "task-runtime.sqlite");
@@ -57,6 +65,8 @@ function attemptView(row) {
     id: row.id, taskId: row.taskId, number: row.number, provider: row.provider, modelId: row.modelId,
     thinkingLevel: row.thinkingLevel, state: row.state, startedAt: row.startedAt, finishedAt: row.finishedAt ?? null,
     workerPid: row.workerPid ?? null, workerPgid: row.workerPgid ?? null,
+    finalResult: row.finalResult ?? null, terminalDetail: row.terminalDetail ?? null,
+    finalBranchHead: row.finalBranchHead ?? null,
   };
 }
 
@@ -76,19 +86,22 @@ export class TaskRuntime {
     try {
       this.lock = acquireDatabaseLock(this.dbPath);
       this.db = new DatabaseSync(this.dbPath);
+      this.db.exec("PRAGMA foreign_keys = ON");
+      this.migrateCompletionSchema();
       this.db.exec(`
-        PRAGMA foreign_keys = ON;
         CREATE TABLE IF NOT EXISTS tasks (
           id TEXT PRIMARY KEY, source_repo_root TEXT NOT NULL, base_commit TEXT NOT NULL,
           task_branch TEXT NOT NULL UNIQUE, task_worktree TEXT NOT NULL UNIQUE, goal TEXT NOT NULL,
-          state TEXT NOT NULL CHECK(state IN ('accepted','running')), latest_attempt_id TEXT,
-          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+          state TEXT NOT NULL CHECK(state IN ('accepted','running','completed','failed')), latest_attempt_id TEXT,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL, final_result TEXT,
+          terminal_detail TEXT, final_branch_head TEXT
         );
         CREATE TABLE IF NOT EXISTS attempts (
           id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), number INTEGER NOT NULL,
           provider TEXT NOT NULL, model_id TEXT NOT NULL, thinking_level TEXT NOT NULL,
-          state TEXT NOT NULL CHECK(state IN ('starting','running')), started_at TEXT NOT NULL,
-          finished_at TEXT, worker_pid INTEGER, worker_pgid INTEGER, UNIQUE(task_id, number)
+          state TEXT NOT NULL CHECK(state IN ('starting','running','completed','failed')), started_at TEXT NOT NULL,
+          finished_at TEXT, worker_pid INTEGER, worker_pgid INTEGER, final_result TEXT,
+          terminal_detail TEXT, final_branch_head TEXT, UNIQUE(task_id, number)
         );
         CREATE INDEX IF NOT EXISTS tasks_created ON tasks(created_at, id);
         CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id, number);
@@ -104,19 +117,47 @@ export class TaskRuntime {
     }
   }
 
+  migrateCompletionSchema() {
+    const tasksSql = this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'").get()?.sql ?? "";
+    const attemptsSql = this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'attempts'").get()?.sql ?? "";
+    if (!tasksSql || !attemptsSql || tasksSql.includes("'completed'") && attemptsSql.includes("'completed'")) return;
+    this.db.exec("PRAGMA foreign_keys = OFF; BEGIN; ALTER TABLE attempts RENAME TO attempts_legacy; ALTER TABLE tasks RENAME TO tasks_legacy; DROP INDEX IF EXISTS tasks_created; DROP INDEX IF EXISTS attempts_task;");
+    this.db.exec(`
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY, source_repo_root TEXT NOT NULL, base_commit TEXT NOT NULL,
+        task_branch TEXT NOT NULL UNIQUE, task_worktree TEXT NOT NULL UNIQUE, goal TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('accepted','running','completed','failed')), latest_attempt_id TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, final_result TEXT,
+        terminal_detail TEXT, final_branch_head TEXT
+      );
+      CREATE TABLE attempts (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), number INTEGER NOT NULL,
+        provider TEXT NOT NULL, model_id TEXT NOT NULL, thinking_level TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('starting','running','completed','failed')), started_at TEXT NOT NULL,
+        finished_at TEXT, worker_pid INTEGER, worker_pgid INTEGER, final_result TEXT,
+        terminal_detail TEXT, final_branch_head TEXT, UNIQUE(task_id, number)
+      );
+      INSERT INTO tasks (id, source_repo_root, base_commit, task_branch, task_worktree, goal, state, latest_attempt_id, created_at, updated_at)
+        SELECT id, source_repo_root, base_commit, task_branch, task_worktree, goal, state, latest_attempt_id, created_at, updated_at FROM tasks_legacy;
+      INSERT INTO attempts (id, task_id, number, provider, model_id, thinking_level, state, started_at, finished_at, worker_pid, worker_pgid)
+        SELECT id, task_id, number, provider, model_id, thinking_level, state, started_at, finished_at, worker_pid, worker_pgid FROM attempts_legacy;
+    `);
+    this.db.exec("DROP TABLE attempts_legacy; DROP TABLE tasks_legacy; COMMIT; PRAGMA foreign_keys = ON");
+  }
+
   taskRow(id) {
-    return this.db.prepare(`SELECT id, source_repo_root AS sourceRepoRoot, base_commit AS baseCommit, task_branch AS taskBranch, task_worktree AS taskWorktree, goal, state, latest_attempt_id AS latestAttemptId, created_at AS createdAt, updated_at AS updatedAt FROM tasks WHERE id = ?`).get(id);
+    return this.db.prepare(`SELECT id, source_repo_root AS sourceRepoRoot, base_commit AS baseCommit, task_branch AS taskBranch, task_worktree AS taskWorktree, goal, state, latest_attempt_id AS latestAttemptId, created_at AS createdAt, updated_at AS updatedAt, final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead FROM tasks WHERE id = ?`).get(id);
   }
 
   taskWithAttempts(row) {
     if (!row) return null;
-    const attempts = this.db.prepare(`SELECT id, task_id AS taskId, number, provider, model_id AS modelId, thinking_level AS thinkingLevel, state, started_at AS startedAt, finished_at AS finishedAt, worker_pid AS workerPid, worker_pgid AS workerPgid FROM attempts WHERE task_id = ? ORDER BY number`).all(row.id).map(attemptView);
+    const attempts = this.db.prepare(`SELECT id, task_id AS taskId, number, provider, model_id AS modelId, thinking_level AS thinkingLevel, state, started_at AS startedAt, finished_at AS finishedAt, worker_pid AS workerPid, worker_pgid AS workerPgid, final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead FROM attempts WHERE task_id = ? ORDER BY number`).all(row.id).map(attemptView);
     return { ...row, attempts };
   }
 
   listTasks() {
     this.ensureOwner();
-    return this.db.prepare(`SELECT id, source_repo_root AS sourceRepoRoot, base_commit AS baseCommit, task_branch AS taskBranch, task_worktree AS taskWorktree, goal, state, latest_attempt_id AS latestAttemptId, created_at AS createdAt, updated_at AS updatedAt FROM tasks ORDER BY created_at, id`).all().map((row) => this.taskWithAttempts(row));
+    return this.db.prepare(`SELECT id, source_repo_root AS sourceRepoRoot, base_commit AS baseCommit, task_branch AS taskBranch, task_worktree AS taskWorktree, goal, state, latest_attempt_id AS latestAttemptId, created_at AS createdAt, updated_at AS updatedAt, final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead FROM tasks ORDER BY created_at, id`).all().map((row) => this.taskWithAttempts(row));
   }
 
   getTask(id) { this.ensureOwner(); return this.taskWithAttempts(this.taskRow(id)); }
@@ -161,15 +202,141 @@ export class TaskRuntime {
       throw error;
     }
     try {
-      const worker = this.workerFactory({ cwd: taskWorktree, command: this.piCommand, env: this.workerEnv, provider: model.provider, modelId: model.id, thinkingLevel, onEvent: () => {}, onClose: () => {} });
+      const lifecycle = { events: [], closed: false, close: null };
+      const worker = this.workerFactory({
+        cwd: taskWorktree, command: this.piCommand, env: this.workerEnv,
+        provider: model.provider, modelId: model.id, thinkingLevel,
+        onEvent: (event) => {
+          if (this.active?.attemptId === attemptId) this.handleWorkerEvent(taskId, attemptId, event);
+          else lifecycle.events.push(event);
+        },
+        onClose: (result) => {
+          if (this.active?.attemptId === attemptId) this.handleWorkerClose(taskId, attemptId, result);
+          else { lifecycle.closed = true; lifecycle.close = result; }
+        },
+      });
       db.prepare("UPDATE tasks SET state='running',updated_at=? WHERE id=?").run(now(), taskId);
       db.prepare("UPDATE attempts SET state='running',worker_pid=?,worker_pgid=? WHERE id=?").run(Number.isInteger(worker?.pid) ? worker.pid : null, Number.isInteger(worker?.processGroupId) ? worker.processGroupId : null, attemptId);
-      this.active = { taskId, attemptId, worker, packet };
+      this.active = { taskId, attemptId, worker, packet, settled: false, closed: false, finalizing: false, finalAssistant: null };
       worker.setModel?.({ provider: model.provider, modelId: model.id });
       worker.setThinkingLevel?.(thinkingLevel);
-      worker.prompt({ id: `task-${attemptId}`, message: packet });
-    } catch (error) { throw new Error(`Fresh Executor could not start: ${errorText(error)}`, { cause: error }); }
+      for (const event of lifecycle.events) this.handleWorkerEvent(taskId, attemptId, event);
+      if (lifecycle.closed) this.handleWorkerClose(taskId, attemptId, lifecycle.close ?? {});
+      else worker.prompt({ id: `task-${attemptId}`, message: packet });
+    } catch (error) {
+      this.failAttempt(taskId, attemptId, `Fresh Executor could not start: ${errorText(error)}`);
+      throw new Error(`Fresh Executor could not start: ${errorText(error)}`, { cause: error });
+    }
     return this.getTask(taskId);
+  }
+
+  handleWorkerEvent(taskId, attemptId, event) {
+    const active = this.active;
+    if (this.closed || !active || active.taskId !== taskId || active.attemptId !== attemptId || active.closed) return;
+    if (event?.type === "response" && event.command === "prompt" && event.success === false) {
+      this.failAttempt(taskId, attemptId, `Fresh Executor rejected the prompt: ${bounded(errorText(event.error || event.message), MAX_TASK_DETAIL_LENGTH)}`);
+      return;
+    }
+    if (event?.type === "message_end" && event.message?.role === "assistant") {
+      active.finalAssistant = {
+        result: bounded(assistantText(event.message), MAX_TASK_RESULT_LENGTH),
+        stopReason: event.message.stopReason ?? null,
+        errorMessage: event.message.errorMessage ?? null,
+      };
+    }
+    if (event?.type === "agent_settled") active.settled = true;
+    this.maybeFinalize(taskId, attemptId);
+  }
+
+  handleWorkerClose(taskId, attemptId, { code = null, signal = null, error } = {}) {
+    const active = this.active;
+    if (this.closed || !active || active.taskId !== taskId || active.attemptId !== attemptId) return;
+    active.closed = true;
+    this.maybeFinalize(taskId, attemptId);
+    if (this.active === active) {
+      const detail = error ? errorText(error) : signal ? `Pi exited with ${signal}` : `Pi exited with code ${code}`;
+      this.failAttempt(taskId, attemptId, `Fresh Executor closed before successful settlement: ${detail}`, active.finalAssistant?.result ?? "");
+    }
+  }
+
+  maybeFinalize(taskId, attemptId) {
+    const active = this.active;
+    if (!active || active.taskId !== taskId || active.attemptId !== attemptId || active.finalizing || !active.settled) return;
+    if (!active.finalAssistant) return;
+    active.finalizing = true;
+    const outcome = active.finalAssistant;
+    if (outcome.stopReason === "error" || outcome.stopReason === "aborted" || outcome.errorMessage) {
+      const detail = outcome.stopReason === "aborted"
+        ? "Fresh Executor assistant run was aborted."
+        : outcome.errorMessage ? `Fresh Executor assistant error: ${bounded(outcome.errorMessage, MAX_TASK_DETAIL_LENGTH)}` : "Fresh Executor assistant ended with an error.";
+      this.failAttempt(taskId, attemptId, detail, outcome.result);
+      return;
+    }
+    try {
+      const task = this.taskRow(taskId);
+      const finalBranchHead = this.checkpointTask(task);
+      this.persistTerminal(taskId, attemptId, "completed", outcome.result, "Fresh Executor settled successfully.", finalBranchHead);
+      this.clearActive(active);
+    } catch (error) {
+      this.failAttempt(taskId, attemptId, `Task completion failed: ${bounded(errorText(error), MAX_TASK_DETAIL_LENGTH)}`, outcome.result);
+    }
+  }
+
+  checkpointTask(task) {
+    try {
+      const dirty = git(task.taskWorktree, ["status", "--porcelain=v1", "--untracked-files=all"]);
+      if (dirty) {
+        execFileSync("git", ["add", "-A"], { cwd: task.taskWorktree, stdio: ["ignore", "pipe", "pipe"] });
+        execFileSync("git", ["commit", "-m", `pi-sand: checkpoint completed Task ${task.id}`], {
+          cwd: task.taskWorktree,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            GIT_AUTHOR_NAME: "pi-sand",
+            GIT_AUTHOR_EMAIL: "pi-sand@localhost",
+            GIT_COMMITTER_NAME: "pi-sand",
+            GIT_COMMITTER_EMAIL: "pi-sand@localhost",
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      }
+      return git(task.taskWorktree, ["rev-parse", "HEAD"]);
+    } catch (error) {
+      throw new Error(`Git checkpoint failed: ${errorText(error)}`, { cause: error });
+    }
+  }
+
+  persistTerminal(taskId, attemptId, state, finalResult, terminalDetail, finalBranchHead) {
+    const timestamp = now();
+    const result = bounded(finalResult, MAX_TASK_RESULT_LENGTH);
+    const detail = bounded(terminalDetail, MAX_TASK_DETAIL_LENGTH);
+    this.db.exec("BEGIN");
+    try {
+      this.db.prepare("UPDATE attempts SET state=?,finished_at=?,final_result=?,terminal_detail=?,final_branch_head=? WHERE id=? AND state IN ('starting','running')").run(state, timestamp, result, detail, finalBranchHead, attemptId);
+      this.db.prepare("UPDATE tasks SET state=?,updated_at=?,final_result=?,terminal_detail=?,final_branch_head=? WHERE id=?").run(state, timestamp, result, detail, finalBranchHead, taskId);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+
+  failAttempt(taskId, attemptId, terminalDetail, finalResult = "") {
+    if (!this.db) return false;
+    const attempt = this.db.prepare("SELECT state FROM attempts WHERE id=? AND task_id=?").get(attemptId, taskId);
+    if (!attempt || !["starting", "running"].includes(attempt.state)) {
+      if (this.active?.attemptId === attemptId) this.clearActive(this.active);
+      return false;
+    }
+    this.persistTerminal(taskId, attemptId, "failed", finalResult, terminalDetail, null);
+    if (this.active?.attemptId === attemptId) this.clearActive(this.active);
+    return true;
+  }
+
+  clearActive(active) {
+    if (this.active !== active) return;
+    this.active = null;
+    try { active.worker?.close?.(); } catch {}
   }
 
   close() {
