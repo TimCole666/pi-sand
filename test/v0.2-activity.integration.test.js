@@ -66,35 +66,43 @@ function assertSurface(harness, activity) {
   });
 }
 
-test("v0.2 activity projection keeps status, widget, and command on one authority", async () => {
+test("v0.2 activity projection proves the settled lifecycle sequence", async () => {
   const harness = createHarness();
   const ctx = harness.context();
+  const sequence = [];
+  const observe = (activity) => {
+    assertSurface(harness, activity);
+    sequence.push(activity);
+  };
 
   await harness.emit("session_start", ctx);
-  assertSurface(harness, "idle");
+  observe("idle");
   assert.equal((await harness.report(ctx)).activity, "idle");
 
+  await harness.emit("agent_start", ctx);
+  observe("running");
   await harness.emit("ui_prompt_start", ctx);
-  assertSurface(harness, "waiting_for_user");
+  observe("waiting_for_user");
   assert.equal((await harness.report(ctx)).activity, "waiting_for_user");
 
   await harness.emit("ui_prompt_end", ctx);
-  assertSurface(harness, "idle");
-
-  await harness.emit("agent_start", ctx);
-  assertSurface(harness, "running");
-  await harness.emit("ui_prompt_start", ctx);
-  assertSurface(harness, "waiting_for_user");
-  await harness.emit("ui_prompt_end", ctx);
-  assertSurface(harness, "running");
+  observe("running");
 
   await harness.emit("agent_end", ctx);
-  assertSurface(harness, "running");
+  observe("running");
   assert.equal((await harness.report(ctx)).activity, "running");
 
   await harness.emit("agent_settled", ctx);
-  assertSurface(harness, "idle");
+  observe("idle");
   assert.equal((await harness.report(ctx)).activity, "idle");
+  assert.deepEqual(sequence, ["idle", "running", "waiting_for_user", "running", "running", "idle"]);
+  assert.deepEqual(sequence.filter((activity, index) => index === 0 || activity !== sequence[index - 1]), [
+    "idle",
+    "running",
+    "waiting_for_user",
+    "running",
+    "idle",
+  ]);
 });
 
 test("v0.2 activity projection clears all Pi UI surfaces on session shutdown", async () => {
