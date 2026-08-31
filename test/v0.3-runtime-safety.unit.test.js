@@ -272,6 +272,14 @@ test("Stop wins over a concurrent settled completion", linuxOnly, async () => {
   const source = await repository(parent);
   let child;
   let emit;
+  let releaseSettlement;
+  let enterSettlement;
+  const settlement = new Promise((resolveSettlement) => {
+    releaseSettlement = resolveSettlement;
+  });
+  const settlementEntered = new Promise((resolveSettlement) => {
+    enterSettlement = resolveSettlement;
+  });
   const runtime = new TaskRuntime({
     dbPath: join(parent, "runtime.sqlite"),
     piCommand: await versionCommand(parent),
@@ -288,6 +296,12 @@ test("Stop wins over a concurrent settled completion", linuxOnly, async () => {
     worktreeRoot: join(parent, "worktrees"),
     workerStopTimeoutMs: 100,
   });
+  const settleInitialRun = runtime.settleInitialRun.bind(runtime);
+  runtime.settleInitialRun = async (...args) => {
+    enterSettlement();
+    await settlement;
+    return settleInitialRun(...args);
+  };
   try {
     const started = await runtime.createTask(taskOptions(source));
     emit({
@@ -299,14 +313,16 @@ test("Stop wins over a concurrent settled completion", linuxOnly, async () => {
       },
     });
     emit({ type: "agent_settled" });
-    await eventually(
-      () => runtime.getTask(started.id),
-      (task) => task.attempts[0].attemptRuns[0].state === "settled",
-    );
+    await settlementEntered;
     const stopped = await runtime.stopTask(started.id);
     assert.equal(stopped.state, "stopped");
-    assert.equal(runtime.getTask(started.id).state, "stopped");
+    releaseSettlement();
+    await new Promise((resolveWait) => setImmediate(resolveWait));
+    const afterSettlement = runtime.getTask(started.id);
+    assert.equal(afterSettlement.state, "stopped");
+    assert.equal(afterSettlement.attempts[0].attemptRuns[0].state, "aborted");
   } finally {
+    releaseSettlement?.();
     killGroup(child);
     await waitForExit(child).catch(() => {});
     runtime.close();
@@ -324,6 +340,14 @@ test(
     const source = await repository(parent);
     let child;
     let emit;
+    let releaseSettlement;
+    let enterSettlement;
+    const settlement = new Promise((resolveSettlement) => {
+      releaseSettlement = resolveSettlement;
+    });
+    const settlementEntered = new Promise((resolveSettlement) => {
+      enterSettlement = resolveSettlement;
+    });
     const runtime = new TaskRuntime({
       dbPath: join(parent, "runtime.sqlite"),
       piCommand: await versionCommand(parent),
@@ -344,6 +368,12 @@ test(
       worktreeRoot: join(parent, "worktrees"),
       workerStopTimeoutMs: 100,
     });
+    const settleInitialRun = runtime.settleInitialRun.bind(runtime);
+    runtime.settleInitialRun = async (...args) => {
+      enterSettlement();
+      await settlement;
+      return settleInitialRun(...args);
+    };
     try {
       const started = await runtime.createTask(taskOptions(source));
       emit({
@@ -355,16 +385,17 @@ test(
         },
       });
       emit({ type: "agent_settled" });
-      await eventually(
-        () => runtime.getTask(started.id),
-        (task) => task.attempts[0].attemptRuns[0].state === "settled",
-      );
+      await settlementEntered;
       assert.equal(await runtime.shutdown("daemon-shutdown"), "interrupted");
+      releaseSettlement();
+      await new Promise((resolveWait) => setImmediate(resolveWait));
       const interrupted = runtime.getTask(started.id);
       assert.equal(interrupted.state, "interrupted");
       assert.equal(interrupted.shutdownReason, "daemon-shutdown");
       assert.equal(interrupted.attempts[0].state, "interrupted");
+      assert.equal(interrupted.attempts[0].attemptRuns[0].state, "aborted");
     } finally {
+      releaseSettlement?.();
       killGroup(child);
       await waitForExit(child).catch(() => {});
       runtime.close();
