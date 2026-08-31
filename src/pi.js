@@ -30,6 +30,19 @@ export function checkPiCompatibility({ command = process.env.PI_BIN ?? "pi", cwd
 // controlled contract; those flags are not product behavior.
 const commonArgs = ["--mode", "rpc", "--no-session", "--approve"];
 
+export {
+  FRESH_EXECUTOR_ARGS,
+  FRESH_EXECUTOR_VERSION_ERROR,
+  FRESH_PI_VERSION,
+  FreshExecutorError,
+  checkFreshExecutorCompatibility,
+  processMetadata,
+  readLinuxBootId,
+  readProcessStartIdentity,
+  spawnFreshExecutor,
+  startFreshExecutor,
+} from "./fresh-executor.js";
+
 /** Spawn the installed Pi RPC process using the concrete contract proven by the spike. */
 export function spawnPi({ cwd, onEvent, onClose, command = process.env.PI_BIN ?? "pi" }) {
   // A detached process group is only best-effort cleanup. Pi tools may create
