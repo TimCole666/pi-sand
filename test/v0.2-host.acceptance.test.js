@@ -1,3 +1,7 @@
+// v0.2 durable seam: Real Pi Extension Host Acceptance on Pi 0.84.4.
+// Deterministic Extension Lifecycle Integration is a separate later seam; this
+// test intentionally proves package loading and command dispatch only.
+
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
