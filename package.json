@@ -17,6 +17,7 @@
     "launch": "node src/launcher.js",
     "test": "node --test --test-concurrency=1",
     "test:real-pi": "PI_SAND_REAL_PI=1 node --test test/real-pi.acceptance.test.js",
+    "test:real-runtime": "PI_SAND_REAL_RUNTIME=1 node --test test/v0.3-real-pi.acceptance.test.js",
     "spike:self-test": "node spikes/pi-contract.mjs self-test"
   }
 }
