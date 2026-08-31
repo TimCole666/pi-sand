@@ -1,6 +1,6 @@
 {
   "name": "pi-sand",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "keywords": ["pi-package"],
   "peerDependencies": {
@@ -9,7 +9,7 @@
   "pi": {
     "extensions": ["./extensions/pi-sand.ts"]
   },
-  "bin": { "pi-sand": "src/launcher.js" },
+  "bin": { "pi-sand": "src/launcher.js", "pi-sandd": "src/daemon.js" },
   "type": "module",
   "engines": { "node": ">=22.13" },
   "scripts": {

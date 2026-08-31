@@ -1,6 +1,6 @@
 # pi-sand
 
-`pi-sand` is a Pi package with a TypeScript Extension. The current product path is **v0.2: load pi-sand into the installed Pi 0.84.4 host and start Pi**. Pi's normal CLI/TUI remains the interactive product host; RPC is an automation and test seam.
+`pi-sand` is a Pi package with a TypeScript Extension. The foreground product path remains **v0.2: load pi-sand into the installed Pi 0.84.4 host and start Pi**. The v0.3 tracer bullet adds a Linux-only, independently-lived read-only runtime inspection path. Pi's normal CLI/TUI remains the interactive product host; RPC is an automation and test seam.
 
 ```text
 Pi CLI / TUI
@@ -46,6 +46,12 @@ Once Pi is running, invoke:
 The command reports a small non-sensitive status proving the Extension is active. Its status includes the current Pi `mode`, working directory (`cwd`), Pi session identifier, and pi-sand activity (`idle`, `running`, or `waiting_for_user`). It does not expose prompts, system context, credentials, provider secrets, or the full transcript.
 
 Normal v0.2 use does **not** require Chromium, a localhost endpoint, manual port management, the legacy Local Agent Service, or `npm run launch`. Do not start a second Pi process for an ordinary prompt: Pi owns the foreground conversation and execution.
+
+## v0.3 persistent runtime tracer
+
+On Linux, `/tasks` is an Extension client command for the independent `pi-sandd` runtime. When the owner-only Unix socket is absent, the client starts the package's detached `pi-sandd` entrypoint and reconnects to it. The socket is `$XDG_RUNTIME_DIR/pi-sand/pi-sand.sock`, or an owner-specific temporary runtime directory containing the numeric UID when `XDG_RUNTIME_DIR` is unavailable. The protocol is version 1 newline-delimited JSON and currently exposes only `runtime.status` and the empty/read-only `task.list` operation. The daemon owns its separate runtime database and remains alive after the Pi client exits.
+
+This tracer bullet deliberately does not create Tasks, launch workers, stop or retry work, schedule execution, persist conversations, or add an HTTP/TCP server. The v0.2 foreground ownership boundary remains unchanged.
 
 ## Ownership boundary
 

@@ -1,3 +1,5 @@
+import { RuntimeClient } from "../src/runtime-client.js";
+
 const STATUS_KEY = "pi-sand";
 const WIDGET_KEY = "pi-sand";
 const ACTIVITY = {
@@ -83,10 +85,27 @@ function formatStatus(status) {
   return JSON.stringify(status);
 }
 
-export function registerPiSandExtension(pi) {
+export function registerPiSandExtension(pi, { runtimeClientFactory = () => new RuntimeClient() } = {}) {
   let runtime;
+  let runtimeClient;
 
   const currentRuntime = (ctx) => (runtime?.matches(ctx) ? runtime : undefined);
+  const currentRuntimeClient = () => (runtimeClient ??= runtimeClientFactory());
+
+  pi.registerCommand("tasks", {
+    description: "List durable background Tasks",
+    handler: async (_args, ctx) => {
+      try {
+        const result = { ok: true, tasks: await currentRuntimeClient().listTasks() };
+        ctx.ui.notify(JSON.stringify(result), "info");
+        return result;
+      } catch (error) {
+        const result = { ok: false, error: error.message };
+        ctx.ui.notify(JSON.stringify(result), "error");
+        return result;
+      }
+    },
+  });
 
   // pi-sand has no project-local configuration yet. Defer trust decisions to
   // Pi so a future configuration reader cannot accidentally bypass this boundary.
@@ -105,6 +124,7 @@ export function registerPiSandExtension(pi) {
     if (current) {
       current.close(ctx);
       runtime = undefined;
+      runtimeClient = undefined;
     }
   });
 
