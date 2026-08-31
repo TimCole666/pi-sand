@@ -6,6 +6,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TaskRuntime, TASK_RUNTIME_OWNERSHIP_ERROR } from "../src/task-runtime.js";
+import { processGroupIsAlive } from "../src/process-group.js";
 import { registerPiSandExtension } from "../extensions/runtime.js";
 import { createExtensionHarness } from "./helpers/v0.2-extension-harness.js";
 
@@ -80,15 +81,6 @@ function deterministicWorkerFactory({ change = false, workerCommit = false, resu
 
 function gitOutput(cwd, args) {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
-}
-
-function processGroupIsAlive(processGroupId) {
-  try {
-    process.kill(-processGroupId, 0);
-    return true;
-  } catch (error) {
-    return error.code === "EPERM";
-  }
 }
 
 test("Extension /task persists an isolated Task and sends one bounded fresh-worker packet", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
@@ -317,10 +309,11 @@ test("graceful reload and session replacement interrupt the owned worker before 
       assert.equal(listed.ok, true);
       assert.equal(listed.tasks[0].state, "interrupted");
       assert.equal(listed.tasks[0].shutdownReason, reason);
+      assert.equal(listed.tasks[0].attempts.length, 1, "shutdown must record exactly one Attempt");
       assert.equal(listed.tasks[0].attempts[0].state, "interrupted");
       assert.equal(listed.tasks[0].attempts[0].shutdownReason, reason);
       assert.equal(listed.tasks[0].attempts[0].workerTerminated, true);
-      assert.equal((await readFile(fake.packet, "utf8")).trim().split("\\n").filter(Boolean).length, 3, "replacement must not replay the Task Packet");
+      assert.equal((await readFile(fake.packet, "utf8")).trim().split("\n").filter(Boolean).length, 3, "replacement must not replay the Task Packet");
     } finally {
       interrupted?.close();
       runtime.close();

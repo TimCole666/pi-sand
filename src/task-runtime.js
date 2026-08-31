@@ -105,7 +105,7 @@ export class TaskRuntime {
         CREATE TABLE IF NOT EXISTS tasks (
           id TEXT PRIMARY KEY, source_repo_root TEXT NOT NULL, base_commit TEXT NOT NULL,
           task_branch TEXT NOT NULL UNIQUE, task_worktree TEXT NOT NULL UNIQUE, goal TEXT NOT NULL,
-          state TEXT NOT NULL CHECK(state IN ('accepted','running','completed','failed','interrupted')), latest_attempt_id TEXT,
+          state TEXT NOT NULL CHECK(state IN ('accepted','running','completed','failed','stopped','interrupted')), latest_attempt_id TEXT,
           created_at TEXT NOT NULL, updated_at TEXT NOT NULL, final_result TEXT,
           terminal_detail TEXT, final_branch_head TEXT,
           shutdown_reason TEXT CHECK(shutdown_reason IS NULL OR shutdown_reason IN ${SHUTDOWN_REASON_SQL})
@@ -113,7 +113,7 @@ export class TaskRuntime {
         CREATE TABLE IF NOT EXISTS attempts (
           id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), number INTEGER NOT NULL,
           provider TEXT NOT NULL, model_id TEXT NOT NULL, thinking_level TEXT NOT NULL,
-          state TEXT NOT NULL CHECK(state IN ('starting','running','completed','failed','interrupted')), started_at TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('starting','running','completed','failed','stopped','interrupted')), started_at TEXT NOT NULL,
           finished_at TEXT, worker_pid INTEGER, worker_pgid INTEGER, worker_start_identity TEXT,
           worker_boot_id TEXT, worker_terminated INTEGER NOT NULL DEFAULT 1 CHECK(worker_terminated IN (0, 1)),
           final_result TEXT, terminal_detail TEXT, final_branch_head TEXT,
@@ -137,6 +137,7 @@ export class TaskRuntime {
     const tasksSql = this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'").get()?.sql ?? "";
     const attemptsSql = this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'attempts'").get()?.sql ?? "";
     const complete = tasksSql.includes("'interrupted'") && attemptsSql.includes("'interrupted'")
+      && tasksSql.includes("'stopped'") && attemptsSql.includes("'stopped'")
       && tasksSql.includes("shutdown_reason") && attemptsSql.includes("worker_start_identity");
     if (!tasksSql || !attemptsSql || complete) return;
     this.db.exec("PRAGMA foreign_keys = OFF; BEGIN; ALTER TABLE attempts RENAME TO attempts_legacy; ALTER TABLE tasks RENAME TO tasks_legacy; DROP INDEX IF EXISTS tasks_created; DROP INDEX IF EXISTS attempts_task;");
@@ -144,14 +145,14 @@ export class TaskRuntime {
       CREATE TABLE tasks (
         id TEXT PRIMARY KEY, source_repo_root TEXT NOT NULL, base_commit TEXT NOT NULL,
         task_branch TEXT NOT NULL UNIQUE, task_worktree TEXT NOT NULL UNIQUE, goal TEXT NOT NULL,
-        state TEXT NOT NULL CHECK(state IN ('accepted','running','completed','failed','interrupted')), latest_attempt_id TEXT,
+        state TEXT NOT NULL CHECK(state IN ('accepted','running','completed','failed','stopped','interrupted')), latest_attempt_id TEXT,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL, final_result TEXT, terminal_detail TEXT, final_branch_head TEXT,
         shutdown_reason TEXT CHECK(shutdown_reason IS NULL OR shutdown_reason IN ${SHUTDOWN_REASON_SQL})
       );
       CREATE TABLE attempts (
         id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), number INTEGER NOT NULL,
         provider TEXT NOT NULL, model_id TEXT NOT NULL, thinking_level TEXT NOT NULL,
-        state TEXT NOT NULL CHECK(state IN ('starting','running','completed','failed','interrupted')), started_at TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('starting','running','completed','failed','stopped','interrupted')), started_at TEXT NOT NULL,
         finished_at TEXT, worker_pid INTEGER, worker_pgid INTEGER, worker_start_identity TEXT, worker_boot_id TEXT,
         worker_terminated INTEGER NOT NULL DEFAULT 1 CHECK(worker_terminated IN (0, 1)), final_result TEXT, terminal_detail TEXT, final_branch_head TEXT,
         shutdown_reason TEXT CHECK(shutdown_reason IS NULL OR shutdown_reason IN ${SHUTDOWN_REASON_SQL}), UNIQUE(task_id, number)
@@ -220,7 +221,7 @@ export class TaskRuntime {
         recordedProcess?.workerStartIdentity ?? null, recordedProcess?.workerBootId ?? null,
         recordedProcess ? 0 : 1, attemptId,
       );
-      this.active = { taskId: task.id, attemptId, worker, packet, processMetadata: recordedProcess, settled: false, closed: false, finalizing: false, finalAssistant: null };
+      this.active = { taskId: task.id, attemptId, worker, packet, processMetadata: recordedProcess, settled: false, closed: false, interrupting: false, finalizing: false, finalAssistant: null };
       worker.setModel?.({ provider: model.provider, modelId: model.id });
       worker.setThinkingLevel?.(thinkingLevel);
       for (const event of lifecycle.events) this.handleWorkerEvent(task.id, attemptId, event);
@@ -263,7 +264,7 @@ export class TaskRuntime {
 
   handleWorkerEvent(taskId, attemptId, event) {
     const active = this.active;
-    if (this.closed || !active || active.taskId !== taskId || active.attemptId !== attemptId || active.closed) return;
+    if (this.closed || !active || active.taskId !== taskId || active.attemptId !== attemptId || active.closed || active.interrupting) return;
     if (event?.type === "response" && event.command === "prompt" && event.success === false) {
       this.failAttempt(taskId, attemptId, `Fresh Executor rejected the prompt: ${bounded(errorText(event.error || event.message), MAX_TASK_DETAIL_LENGTH)}`);
       return;
@@ -281,7 +282,7 @@ export class TaskRuntime {
 
   handleWorkerClose(taskId, attemptId, { code = null, signal = null, error } = {}) {
     const active = this.active;
-    if (this.closed || !active || active.taskId !== taskId || active.attemptId !== attemptId) return;
+    if (this.closed || !active || active.taskId !== taskId || active.attemptId !== attemptId || active.interrupting) return;
     active.closed = true;
     this.maybeFinalize(taskId, attemptId);
     if (this.active === active) {
@@ -292,7 +293,7 @@ export class TaskRuntime {
 
   maybeFinalize(taskId, attemptId) {
     const active = this.active;
-    if (!active || active.taskId !== taskId || active.attemptId !== attemptId || active.finalizing || !active.settled) return;
+    if (!active || active.taskId !== taskId || active.attemptId !== attemptId || active.interrupting || active.finalizing || !active.settled) return;
     if (!active.finalAssistant) return;
     active.finalizing = true;
     const outcome = active.finalAssistant;
@@ -450,6 +451,10 @@ export class TaskRuntime {
       this.shuttingDown = true;
       const active = this.active;
       if (active) {
+        // TERM/KILL can deliver worker callbacks before process-group
+        // verification finishes. Mark the Attempt first so close and
+        // settlement cannot race shutdown's interrupted write.
+        active.interrupting = true;
         const row = this.db?.prepare("SELECT worker_pid AS workerPid, worker_pgid AS workerPgid, worker_start_identity AS workerStartIdentity, worker_boot_id AS workerBootId FROM attempts WHERE id = ?").get(active.attemptId);
         const worker = row ?? active.processMetadata;
         const hasRecordedProcess = Number.isInteger(worker?.workerPid) || Number.isInteger(worker?.workerPgid);
