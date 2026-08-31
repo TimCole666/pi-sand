@@ -54,12 +54,12 @@ function processGroupGone(processGroupId) {
   }
   let uncertain = false;
   for (const entry of entries) {
-    if (!entry.isDirectory() || !/^\\d+$/.test(entry.name)) continue;
+    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
     try {
       const stat = readFileSync(`/proc/${entry.name}/stat`, "utf8");
       const closingParen = stat.lastIndexOf(")");
       if (closingParen < 0) { uncertain = true; continue; }
-      const fields = stat.slice(closingParen + 2).trim().split(/\\s+/);
+      const fields = stat.slice(closingParen + 2).trim().split(/\s+/);
       if (Number(fields[2]) === processGroupId && fields[0] !== "Z") return false;
     } catch (error) {
       if (error.code !== "ENOENT") uncertain = true;
