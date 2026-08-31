@@ -2,7 +2,7 @@
 
 Status: **Normative v0.1 product specification**
 
-This document is the sole normative authority for the v0.1.0 dogfood-ready product boundary. [`REFERENCE.md`](REFERENCE.md) is the companion non-normative evidence ledger; [`SPEC.md`](SPEC.md) is historical and superseded.
+This document is the sole normative authority for the retained v0.1.0 product boundary. [`REFERENCE.md`](REFERENCE.md) is the companion non-normative evidence ledger; [`SPEC.md`](SPEC.md) is historical and superseded. It does not define the current v0.2 host: that contract is GitHub issue [#22](https://github.com/TimCole666/pi-sand/issues/22), which makes Pi 0.84.4 with the pi-sand Extension the current product path.
 
 ## Problem Statement
 
