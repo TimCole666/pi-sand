@@ -1,4 +1,4 @@
-import { TaskRuntime } from "../src/task-runtime.js";
+import { TASK_SHUTDOWN_REASONS, TaskRuntime } from "../src/task-runtime.js";
 
 const STATUS_KEY = "pi-sand";
 const WIDGET_KEY = "pi-sand";
@@ -130,9 +130,15 @@ export function registerPiSandExtension(pi, { taskRuntimeFactory = () => new Tas
     runtime.render(ctx);
   });
 
-  pi.on("session_shutdown", async (_event, ctx) => {
+  pi.on("session_shutdown", async (event, ctx) => {
     const current = currentRuntime(ctx);
-    if (current) {
+    if (!current) return;
+    // Pi 0.84.4 guarantees this event runs before the old Extension runtime is
+    // torn down. Stop the owned Fresh Executor first; the replacement
+    // Extension gets a new TaskRuntime and can only inspect durable state.
+    try {
+      await taskRuntime.shutdown(TASK_SHUTDOWN_REASONS.includes(event?.reason) ? event.reason : "quit");
+    } finally {
       current.close(ctx);
       runtime = undefined;
     }

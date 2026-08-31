@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TaskRuntime, TASK_RUNTIME_OWNERSHIP_ERROR } from "../src/task-runtime.js";
@@ -43,6 +44,15 @@ async function waitForPrompt(path) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error("timed out waiting for worker prompt");
+}
+
+function processGroupIsAlive(processGroupId) {
+  try {
+    process.kill(-processGroupId, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
 }
 
 test("Extension /task persists an isolated Task and sends one bounded fresh-worker packet", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
@@ -97,6 +107,94 @@ test("Task Git preflight rejects dirty and non-Git sources before opening its st
     assert.equal(runtime.db, null);
     assert.throws(() => runtime.startTask({ goal: "reject", cwd: parent, trusted: true, model: { provider: "p", id: "m" }, thinkingLevel: "low" }), /Git preflight/);
   } finally { runtime.close(); await rm(parent, { recursive: true, force: true }); }
+});
+
+test("graceful reload and session replacement interrupt the owned worker before replacement ownership", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+  for (const reason of ["quit", "reload", "new", "resume", "fork"]) {
+    const parent = await mkdtemp(join(tmpdir(), `pi-sand-v03-shutdown-${reason}-`));
+    const source = await repository(parent);
+    const fake = await fakePi(parent);
+    const dbPath = join(parent, "task-runtime.sqlite");
+    const runtime = new TaskRuntime({ dbPath, piCommand: fake.command, workerEnv: { ...process.env, ARGS_PATH: fake.args, PACKET_PATH: fake.packet }, worktreeRoot: join(parent, "worktrees") });
+    let interrupted;
+    const first = createExtensionHarness({ cwd: () => source });
+    registerPiSandExtension(first.pi, { taskRuntimeFactory: () => runtime });
+    const oldContext = { ...first.context("manager"), cwd: source, model: { provider: "provider-a", id: "model-a" }, thinkingLevel: "high", isProjectTrusted: () => true };
+    try {
+      await first.invoke("session_start", { type: "session_start", reason: "startup" }, oldContext);
+      const started = await first.commands.get("task").handler(`Shutdown on ${reason}`, oldContext);
+      assert.equal(started.ok, true, JSON.stringify(started));
+      await waitForPrompt(fake.packet);
+      const workerPid = started.task.attempts[0].workerPid;
+      const worktree = started.task.taskWorktree;
+      assert.equal(processGroupIsAlive(workerPid), true);
+
+      await first.invoke("session_shutdown", { type: "session_shutdown", reason }, oldContext);
+      await first.invoke("session_shutdown", { type: "session_shutdown", reason: "quit" }, oldContext);
+      assert.equal(processGroupIsAlive(workerPid), false, `${reason} must stop the recorded worker group`);
+      assert.equal(existsSync(worktree), true, "interruption must preserve the task worktree");
+      assert.equal(runtime.closed, true);
+
+      interrupted = new TaskRuntime({ dbPath, piCommand: fake.command, workerEnv: { ...process.env, ARGS_PATH: fake.args, PACKET_PATH: fake.packet }, worktreeRoot: join(parent, "worktrees") });
+      const second = createExtensionHarness({ cwd: () => source });
+      registerPiSandExtension(second.pi, { taskRuntimeFactory: () => interrupted });
+      const replacement = { ...second.context("replacement"), cwd: source };
+      await second.invoke("session_start", { type: "session_start", reason }, replacement);
+      const listed = await second.commands.get("tasks").handler("", replacement);
+      assert.equal(listed.ok, true);
+      assert.equal(listed.tasks[0].state, "interrupted");
+      assert.equal(listed.tasks[0].shutdownReason, reason);
+      assert.equal(listed.tasks[0].attempts[0].state, "interrupted");
+      assert.equal(listed.tasks[0].attempts[0].shutdownReason, reason);
+      assert.equal(listed.tasks[0].attempts[0].workerTerminated, true);
+      assert.equal((await readFile(fake.packet, "utf8")).trim().split("\n").filter(Boolean).length, 3, "replacement must not replay the Task Packet");
+    } finally {
+      interrupted?.close();
+      runtime.close();
+      await rm(parent, { recursive: true, force: true });
+    }
+  }
+});
+
+test("an unprovable worker group stays interrupted and keeps its unsafe process metadata", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-unsafe-shutdown-"));
+  const source = await repository(parent);
+  const fake = await fakePi(parent);
+  const foreign = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+  let worker;
+  const runtime = new TaskRuntime({
+    dbPath: join(parent, "task-runtime.sqlite"),
+    piCommand: fake.command,
+    workerFactory: () => {
+      worker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+      return { pid: worker.pid, processGroupId: foreign.pid, prompt() {}, close() {} };
+    },
+    worktreeRoot: join(parent, "worktrees"),
+  });
+  try {
+    const started = runtime.startTask({ goal: "Keep unsafe metadata", cwd: source, trusted: true, model: { provider: "p", id: "m" }, thinkingLevel: "low" });
+    await runtime.shutdown("reload");
+    assert.equal(processGroupIsAlive(foreign.pid), true, "an unproven group must not be signalled");
+    const replacement = new TaskRuntime({ dbPath: join(parent, "task-runtime.sqlite") });
+    try {
+      const task = replacement.getTask(started.taskId ?? started.id);
+      assert.equal(task.state, "interrupted");
+      assert.equal(task.shutdownReason, "reload");
+      assert.equal(task.attempts[0].workerTerminated, false);
+      assert.equal(task.attempts[0].workerPid, worker.pid);
+      assert.equal(task.attempts[0].workerPgid, foreign.pid);
+    } finally {
+      replacement.close();
+    }
+  } finally {
+    runtime.close();
+    for (const child of [worker, foreign]) {
+      if (child?.pid) {
+        try { process.kill(-child.pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
+      }
+    }
+    await rm(parent, { recursive: true, force: true });
+  }
 });
 
 test("Task Runtime ownership is lazy, separate, and non-fatal to basic Extension loading", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
