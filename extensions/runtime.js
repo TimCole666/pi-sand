@@ -1,3 +1,5 @@
+import { TASK_SHUTDOWN_REASONS, TaskRuntime } from "../src/task-runtime.js";
+
 const STATUS_KEY = "pi-sand";
 const WIDGET_KEY = "pi-sand";
 const ACTIVITY = {
@@ -5,6 +7,85 @@ const ACTIVITY = {
   RUNNING: "running",
   WAITING_FOR_USER: "waiting_for_user",
 };
+
+function managerModelAuthPreflight(ctx) {
+  if (typeof ctx.modelRegistry?.hasConfiguredAuth !== "function") return undefined;
+  return (model) => {
+    // Pi exposes no synchronous credential-resolution probe to extensions.
+    // hasConfiguredAuth(model) is its documented current Manager model/auth
+    // state signal, so preserve rejection before Task/worktree acceptance.
+    const current = ctx.model;
+    return Boolean(current)
+      && current.provider === model?.provider
+      && current.id === model?.id
+      && ctx.modelRegistry.hasConfiguredAuth(current) === true;
+  };
+}
+
+async function taskCommand(taskRuntime, args, ctx) {
+  try {
+    const task = taskRuntime.startTask({ goal: args, cwd: ctx.cwd, trusted: ctx.isProjectTrusted?.() === true, model: ctx.model, thinkingLevel: ctx.thinkingLevel, modelAuthPreflight: managerModelAuthPreflight(ctx) });
+    const result = { ok: true, task };
+    ctx.ui.notify(JSON.stringify(result), "info");
+    return result;
+  } catch (error) {
+    const result = { ok: false, error: error.message };
+    ctx.ui.notify(JSON.stringify(result), "error");
+    return result;
+  }
+}
+
+async function tasksCommand(taskRuntime, _args, ctx) {
+  try {
+    const result = { ok: true, tasks: taskRuntime.listTasks() };
+    ctx.ui.notify(JSON.stringify(result), "info");
+    return result;
+  } catch (error) {
+    const result = { ok: false, error: error.message };
+    ctx.ui.notify(JSON.stringify(result), "error");
+    return result;
+  }
+}
+
+async function taskStopCommand(taskRuntime, args, ctx) {
+  try {
+    const result = { ok: true, task: taskRuntime.stopTask(String(args ?? "").trim()) };
+    ctx.ui.notify(JSON.stringify(result), "info");
+    return result;
+  } catch (error) {
+    const result = { ok: false, error: error.message };
+    ctx.ui.notify(JSON.stringify(result), "error");
+    return result;
+  }
+}
+
+async function taskRetryCommand(taskRuntime, args, ctx) {
+  try {
+    const result = { ok: true, task: taskRuntime.retryTask({ id: String(args ?? "").trim(), trusted: ctx.isProjectTrusted?.() === true, model: ctx.model, thinkingLevel: ctx.thinkingLevel, modelAuthPreflight: managerModelAuthPreflight(ctx) }) };
+    ctx.ui.notify(JSON.stringify(result), "info");
+    return result;
+  } catch (error) {
+    const result = { ok: false, error: error.message };
+    ctx.ui.notify(JSON.stringify(result), "error");
+    return result;
+  }
+}
+
+async function taskShowCommand(taskRuntime, args, ctx) {
+  try {
+    const taskId = String(args ?? "").trim();
+    if (!taskId) throw new Error("/task-show requires a Task id");
+    const task = taskRuntime.getTask(taskId);
+    if (!task) throw new Error(`Task not found: ${taskId}`);
+    const result = { ok: true, task };
+    ctx.ui.notify(JSON.stringify(result), "info");
+    return result;
+  } catch (error) {
+    const result = { ok: false, error: error.message };
+    ctx.ui.notify(JSON.stringify(result), "error");
+    return result;
+  }
+}
 
 function getSessionId(ctx) {
   return ctx.sessionManager.getSessionId();
@@ -83,9 +164,13 @@ function formatStatus(status) {
   return JSON.stringify(status);
 }
 
-export function registerPiSandExtension(pi) {
+export function registerPiSandExtension(pi, { taskRuntimeFactory = () => new TaskRuntime() } = {}) {
   let runtime;
-
+  let taskRuntime;
+  // The Task Runtime object and its SQLite owner lock are both session-scoped:
+  // create them lazily on the first Task command, then discard the closed
+  // instance so a replacement session can acquire ownership again.
+  const currentTaskRuntime = () => (taskRuntime ??= taskRuntimeFactory());
   const currentRuntime = (ctx) => (runtime?.matches(ctx) ? runtime : undefined);
 
   // pi-sand has no project-local configuration yet. Defer trust decisions to
@@ -100,9 +185,17 @@ export function registerPiSandExtension(pi) {
     runtime.render(ctx);
   });
 
-  pi.on("session_shutdown", async (_event, ctx) => {
+  pi.on("session_shutdown", async (event, ctx) => {
     const current = currentRuntime(ctx);
-    if (current) {
+    if (!current) return;
+    // Pi 0.84.4 guarantees this event runs before the old Extension runtime is
+    // torn down. Stop the owned Fresh Executor first; the replacement
+    // Extension gets a new TaskRuntime and can only inspect durable state.
+    const closingTaskRuntime = taskRuntime;
+    taskRuntime = undefined;
+    try {
+      await closingTaskRuntime?.shutdown(TASK_SHUTDOWN_REASONS.includes(event?.reason) ? event.reason : "quit");
+    } finally {
       current.close(ctx);
       runtime = undefined;
     }
@@ -133,6 +226,31 @@ export function registerPiSandExtension(pi) {
 
   pi.on("ui_prompt_end", async (_event, ctx) => {
     currentRuntime(ctx)?.endUserPrompt(ctx);
+  });
+
+  pi.registerCommand("task", {
+    description: "Start one durable background Task in an isolated Fresh Executor",
+    handler: async (args, ctx) => taskCommand(currentTaskRuntime(), args, ctx),
+  });
+
+  pi.registerCommand("tasks", {
+    description: "List durable background Tasks",
+    handler: async (args, ctx) => tasksCommand(currentTaskRuntime(), args, ctx),
+  });
+
+  pi.registerCommand("task-show", {
+    description: "Show one durable background Task and its Attempts",
+    handler: async (args, ctx) => taskShowCommand(currentTaskRuntime(), args, ctx),
+  });
+
+  pi.registerCommand("task-stop", {
+    description: "Stop an active durable background Task",
+    handler: async (args, ctx) => taskStopCommand(currentTaskRuntime(), args, ctx),
+  });
+
+  pi.registerCommand("task-retry", {
+    description: "Retry a failed, stopped, or interrupted Task with a fresh executor",
+    handler: async (args, ctx) => taskRetryCommand(currentTaskRuntime(), args, ctx),
   });
 
   pi.registerCommand("pi-sand", {
