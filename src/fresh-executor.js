@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { readProcessIdentity } from "./process.js";
 
 export const FRESH_PI_VERSION = "0.84.4";
 export const FRESH_EXECUTOR_ARGS = [
@@ -46,44 +46,21 @@ export function checkFreshExecutorCompatibility({
   return { compatible: version === FRESH_PI_VERSION, version, error: null };
 }
 
-function readProcessStartIdentity(pid) {
-  if (process.platform !== "linux") return null;
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    const closingParen = stat.lastIndexOf(")");
-    if (closingParen < 0) return null;
-    return stat.slice(closingParen + 2).trim().split(/\s+/)[19] ?? null;
-  } catch {
-    return null;
-  }
-}
-
-function readLinuxBootId() {
-  if (process.platform !== "linux") return null;
-  try {
-    const bootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
-    return bootId || null;
-  } catch {
-    return null;
-  }
-}
-
 function processMetadata(child) {
   const pid = Number(child.pid);
   const processGroupId = Number.isInteger(pid) && pid > 0 ? pid : null;
-  const processStartIdentity = processGroupId ? readProcessStartIdentity(pid) : null;
-  const bootId = processGroupId ? readLinuxBootId() : null;
+  const identity = processGroupId ? readProcessIdentity(processGroupId) : null;
   return {
     pid: processGroupId,
     processGroupId,
-    processStartIdentity,
-    bootId,
+    processStartIdentity: identity?.processStartIdentity ?? null,
+    bootId: identity?.bootId ?? null,
     // These names match the durable worker metadata vocabulary used by the
     // later runtime without introducing any Task persistence here.
     workerPid: processGroupId,
     workerPgid: processGroupId,
-    workerStartIdentity: processStartIdentity,
-    workerBootId: bootId,
+    workerStartIdentity: identity?.processStartIdentity ?? null,
+    workerBootId: identity?.bootId ?? null,
   };
 }
 
@@ -394,4 +371,5 @@ export async function startFreshExecutor(options) {
 // acknowledged startup operation and no fire-and-forget configuration API.
 export const spawnFreshExecutor = startFreshExecutor;
 
-export { processMetadata, readLinuxBootId, readProcessStartIdentity };
+export { processMetadata };
+export { readLinuxBootId, readProcessStartIdentity } from "./process.js";

@@ -176,9 +176,12 @@ export async function startRuntimeDaemon({
   }
 
   let closed = false;
-  const close = async () => {
+  const close = async ({ shutdownReason } = {}) => {
     if (closed) return;
     closed = true;
+    // The daemon is the lifetime root. Reconcile/terminate its owned worker
+    // before releasing either singleton ownership marker or socket ownership.
+    if (shutdownReason) await store.shutdown(shutdownReason);
     for (const connection of connections) connection.destroy();
     await new Promise((resolveClose) => server.close(() => resolveClose()));
     unlinkOwnedSocket(socketPath);
@@ -197,7 +200,12 @@ function ensureRuntimeDirectoryForSocket(socketPath) {
 
 export async function runRuntimeDaemon(options = {}) {
   const runtime = await startRuntimeDaemon(options);
-  const shutdown = () => { runtime.close().then(() => process.exit(0), () => process.exit(1)); };
+  let shuttingDown = false;
+  const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    runtime.close({ shutdownReason: "daemon-shutdown" }).then(() => process.exit(0), () => process.exit(1));
+  };
   process.once("SIGTERM", shutdown);
   process.once("SIGINT", shutdown);
   return runtime;

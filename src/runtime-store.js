@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { dirname, join, resolve } from "node:path";
 import { acquireDatabaseLock } from "./database-lock.js";
 import { checkFreshExecutorCompatibility, startFreshExecutor } from "./fresh-executor.js";
+import { processGroupStatus, stopOwnedProcessGroupSync } from "./process.js";
 import { runtimeDatabasePath } from "./runtime-ipc.js";
 import {
   linuxBootIdentity,
@@ -37,6 +38,9 @@ const git = (cwd, args, options = {}) => execFileSync("git", args, {
 const canonicalPath = (path) => realpathSync.native(resolve(path));
 const bounded = (value, limit) => String(value ?? "").slice(0, limit);
 const boundedDetail = (value) => bounded(value, MAX_TERMINAL_DETAIL_LENGTH);
+const RESTART_DETAIL = "pi-sandd restarted before the Fresh Executor finished; the Attempt was not resumed or replayed.";
+const ORPHAN_DETAIL = "The prior Fresh Executor could not be safely identified or terminated. The Task is blocked and its worktree was retained.";
+const DAEMON_SHUTDOWN_REASON = "daemon-shutdown";
 
 function assistantText(message) {
   if (typeof message?.content === "string") return message.content;
@@ -54,10 +58,6 @@ function assistantOutcome(event) {
     stopReason: String(event.message.stopReason ?? "").toLowerCase(),
     hasError: Boolean(event.message.error || event.message.errorMessage),
   };
-}
-
-function delay(milliseconds) {
-  return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
 }
 
 export function resolveGitRepositoryRoot(cwd) {
@@ -90,6 +90,7 @@ function attemptSnapshot(row) {
     state: row.state,
     startedAt: row.startedAt,
     finishedAt: row.finishedAt ?? null,
+    shutdownReason: row.shutdownReason ?? null,
     workerPid: row.workerPid ?? null,
     workerPgid: row.workerPgid ?? null,
     finalResult: row.finalResult ?? null,
@@ -113,6 +114,7 @@ function taskSnapshot(row, attempts = []) {
     latestAttemptId: row.latestAttemptId ?? null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
+    shutdownReason: row.shutdownReason ?? null,
     finalResult: row.finalResult ?? null,
     terminalDetail: row.terminalDetail ?? null,
     finalBranchHead: row.finalBranchHead ?? null,
@@ -158,7 +160,7 @@ function workerMetadata(worker) {
 }
 
 export class RuntimeStore {
-  constructor({ dbPath = runtimeDatabasePath(), piCommand = process.env.PI_BIN ?? "pi", workerFactory = startFreshExecutor, workerEnv = process.env, worktreeRoot, workerRetireTimeoutMs = WORKER_RETIRE_TIMEOUT_MS, workerStopTimeoutMs = WORKER_STOP_TIMEOUT_MS } = {}) {
+  constructor({ dbPath = runtimeDatabasePath(), piCommand = process.env.PI_BIN ?? "pi", workerFactory = startFreshExecutor, workerEnv = process.env, worktreeRoot, workerRetireTimeoutMs = WORKER_RETIRE_TIMEOUT_MS, workerStopTimeoutMs = WORKER_STOP_TIMEOUT_MS, bootId = linuxBootIdentity() } = {}) {
     this.dbPath = dbPath;
     this.piCommand = piCommand;
     this.workerFactory = workerFactory;
@@ -166,10 +168,12 @@ export class RuntimeStore {
     this.worktreeRoot = worktreeRoot;
     this.workerRetireTimeoutMs = Math.max(0, Number(workerRetireTimeoutMs) || 0);
     this.workerStopTimeoutMs = Math.max(0, Number(workerStopTimeoutMs) || 0);
+    this.bootId = bootId;
     this.databaseLock = null;
     this.db = null;
     this.active = null;
     this.closed = false;
+    this.shuttingDown = false;
   }
 
   ensureSupported() {
@@ -185,6 +189,10 @@ export class RuntimeStore {
       if (!attemptColumns.has(name)) this.db.exec(`ALTER TABLE attempts ADD COLUMN ${name} ${type}`);
     }
     if (!attemptColumns.has("worker_terminated")) this.db.exec("ALTER TABLE attempts ADD COLUMN worker_terminated INTEGER NOT NULL DEFAULT 1");
+    for (const [table, column] of [["tasks", "shutdown_reason"], ["attempts", "shutdown_reason"]]) {
+      const columnsForTable = table === "tasks" ? taskColumns : attemptColumns;
+      if (!columnsForTable.has(column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
+    }
     for (const column of ["worker_start_identity", "worker_boot_id"]) {
       if (!attemptColumns.has(column)) this.db.exec(`ALTER TABLE attempts ADD COLUMN ${column} TEXT`);
     }
@@ -204,18 +212,19 @@ export class RuntimeStore {
           id TEXT PRIMARY KEY, source_repo_root TEXT NOT NULL, base_commit TEXT NOT NULL,
           task_branch TEXT NOT NULL UNIQUE, task_worktree TEXT NOT NULL UNIQUE, goal TEXT NOT NULL,
           state TEXT NOT NULL, latest_attempt_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-          final_result TEXT, terminal_detail TEXT, final_branch_head TEXT
+          final_result TEXT, terminal_detail TEXT, final_branch_head TEXT, shutdown_reason TEXT
         );
         CREATE TABLE IF NOT EXISTS attempts (
           id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), number INTEGER NOT NULL,
           provider TEXT NOT NULL, model_id TEXT NOT NULL, thinking_level TEXT NOT NULL, state TEXT NOT NULL,
           started_at TEXT NOT NULL, finished_at TEXT, worker_pid INTEGER, worker_pgid INTEGER,
           worker_terminated INTEGER NOT NULL DEFAULT 1, final_result TEXT, terminal_detail TEXT,
-          final_branch_head TEXT, UNIQUE(task_id, number)
+          final_branch_head TEXT, shutdown_reason TEXT, UNIQUE(task_id, number)
         );
         CREATE INDEX IF NOT EXISTS tasks_created ON tasks(created_at, id);
         CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id, number);`);
       this.ensureCompletionColumns();
+      this.reconcilePriorAttempts();
       return this;
     } catch (error) {
       this.release();
@@ -224,18 +233,73 @@ export class RuntimeStore {
     }
   }
 
+  attemptRows() {
+    return this.db.prepare(`SELECT id, task_id AS taskId, state, worker_pid AS workerPid,
+      worker_pgid AS workerPgid, worker_start_identity AS workerStartIdentity,
+      worker_boot_id AS workerBootId, worker_terminated AS workerTerminated
+      FROM attempts WHERE state IN ('starting', 'running', 'orphaned')
+      OR (state = 'interrupted' AND worker_terminated = 0) ORDER BY started_at, id`).all();
+  }
+
+  updateTaskForAttempt(attempt, state, detail, shutdownReason = null) {
+    const timestamp = now();
+    this.db.prepare(`UPDATE attempts SET state = ?, finished_at = COALESCE(finished_at, ?),
+      terminal_detail = ?, shutdown_reason = COALESCE(?, shutdown_reason), worker_terminated = ? WHERE id = ?`).run(
+      state, timestamp, boundedDetail(detail), shutdownReason, state === "interrupted" ? 1 : 0, attempt.id,
+    );
+    this.db.prepare(`UPDATE tasks SET state = ?, updated_at = ?, terminal_detail = ?,
+      shutdown_reason = COALESCE(?, shutdown_reason) WHERE id = ? AND latest_attempt_id = ?`).run(
+      state === "orphaned" ? "blocked" : "interrupted", timestamp, boundedDetail(detail), shutdownReason, attempt.taskId, attempt.id,
+    );
+  }
+
+  reconcileAttempt(attempt, { reason = null } = {}) {
+    const detail = reason
+      ? `pi-sandd ${reason} could not prove safe worker termination; the Task is blocked and its worktree was retained.`
+      : ORPHAN_DETAIL;
+    // A Linux boot boundary is a complete proof that the old worker cannot
+    // execute. It is checked before any signal is considered.
+    if (attempt.workerBootId && this.bootId && attempt.workerBootId !== this.bootId) {
+      this.updateTaskForAttempt(attempt, "interrupted", "The recorded Fresh Executor belongs to a prior Linux boot; it was not resumed or replayed.", reason);
+      return "interrupted";
+    }
+    const status = processGroupStatus(attempt.workerPgid);
+    if (status === "gone") {
+      this.updateTaskForAttempt(attempt, "interrupted", reason ? "The daemon stopped the Fresh Executor; its process group is proven gone." : RESTART_DETAIL, reason);
+      return "interrupted";
+    }
+    const worker = {
+      workerPid: attempt.workerPid,
+      workerPgid: attempt.workerPgid,
+      workerStartIdentity: attempt.workerStartIdentity,
+      workerBootId: attempt.workerBootId,
+    };
+    if (status === "alive" && stopOwnedProcessGroupSync(worker, { timeoutMs: this.workerStopTimeoutMs, currentBootId: this.bootId })) {
+      this.updateTaskForAttempt(attempt, "interrupted", reason ? "The daemon stopped the owned Fresh Executor; its process group is proven gone." : RESTART_DETAIL, reason);
+      return "interrupted";
+    }
+    this.updateTaskForAttempt(attempt, "orphaned", detail, reason);
+    return "orphaned";
+  }
+
+  reconcilePriorAttempts() {
+    for (const attempt of this.attemptRows()) this.reconcileAttempt(attempt);
+  }
+
   listTasks() {
     this.open();
     const rows = this.db.prepare(`SELECT id, source_repo_root AS sourceRepoRoot, base_commit AS baseCommit,
       task_branch AS taskBranch, task_worktree AS taskWorktree, goal, state,
       latest_attempt_id AS latestAttemptId, created_at AS createdAt, updated_at AS updatedAt,
-      final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead
+      final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead,
+      shutdown_reason AS shutdownReason
       FROM tasks ORDER BY created_at, id`).all();
     const attempts = this.db.prepare(`SELECT id, task_id AS taskId, number, provider, model_id AS modelId,
       thinking_level AS thinkingLevel, state, started_at AS startedAt, finished_at AS finishedAt,
       worker_pid AS workerPid, worker_pgid AS workerPgid, worker_terminated AS workerTerminated,
       worker_start_identity AS workerStartIdentity, worker_boot_id AS workerBootId,
-      final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead
+      final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead,
+      shutdown_reason AS shutdownReason
       FROM attempts ORDER BY task_id, number`).all();
     const grouped = new Map();
     for (const attempt of attempts) grouped.set(attempt.taskId, [...(grouped.get(attempt.taskId) ?? []), attemptSnapshot(attempt)]);
@@ -247,14 +311,16 @@ export class RuntimeStore {
     const row = this.db.prepare(`SELECT id, source_repo_root AS sourceRepoRoot, base_commit AS baseCommit,
       task_branch AS taskBranch, task_worktree AS taskWorktree, goal, state,
       latest_attempt_id AS latestAttemptId, created_at AS createdAt, updated_at AS updatedAt,
-      final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead
+      final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead,
+      shutdown_reason AS shutdownReason
       FROM tasks WHERE id = ?`).get(id);
     if (!row) return null;
     const attempts = this.db.prepare(`SELECT id, task_id AS taskId, number, provider, model_id AS modelId,
       thinking_level AS thinkingLevel, state, started_at AS startedAt, finished_at AS finishedAt,
       worker_pid AS workerPid, worker_pgid AS workerPgid, worker_terminated AS workerTerminated,
       worker_start_identity AS workerStartIdentity, worker_boot_id AS workerBootId,
-      final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead
+      final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead,
+      shutdown_reason AS shutdownReason
       FROM attempts WHERE task_id = ? ORDER BY number`).all(id);
     return taskSnapshot(row, attempts.map(attemptSnapshot));
   }
@@ -290,7 +356,7 @@ export class RuntimeStore {
     if (!compatibility.compatible) throw new Error("/task requires an installed Pi 0.84.4 executable.");
 
     this.open();
-    if (this.hasCapacityConflict()) throw new Error("A Fresh Executor is already active; v0.3 does not queue Tasks.");
+    if (this.hasCapacityConflict()) throw new Error("A Fresh Executor is already active or unresolved; v0.3 does not queue Tasks.");
     const taskId = randomUUID();
     const attemptId = randomUUID();
     const timestamp = now();
@@ -376,7 +442,7 @@ export class RuntimeStore {
       const workerPid = metadata?.workerPid ?? (Number.isInteger(worker?.pid) ? worker.pid : null);
       const workerPgid = metadata?.workerPgid ?? (Number.isInteger(worker?.processGroupId) ? worker.processGroupId : null);
       this.db.prepare("UPDATE tasks SET state = 'running', updated_at = ? WHERE id = ? AND state IN ('accepted', 'running')").run(now(), task.id);
-      this.db.prepare("UPDATE attempts SET state = 'running', worker_pid = ?, worker_pgid = ?, worker_start_identity = ?, worker_boot_id = ? WHERE id = ? AND state = 'starting'").run(workerPid, workerPgid, metadata?.workerStartIdentity ?? null, metadata?.workerBootId ?? null, attemptId);
+      this.db.prepare("UPDATE attempts SET state = 'running', worker_pid = ?, worker_pgid = ?, worker_start_identity = ?, worker_boot_id = ? WHERE id = ? AND state = 'starting'").run(workerPid, workerPgid, metadata?.workerStartIdentity ?? null, this.bootId ?? metadata?.workerBootId ?? null, attemptId);
       active.workerMetadata = metadata;
       // The production Fresh Executor has already accepted its packet before
       // returning. A small prompt method remains useful for deterministic
@@ -455,23 +521,16 @@ export class RuntimeStore {
 
   async retireWorker(worker, metadata) {
     if (!worker) return true;
-    let processGroupId = null;
-    if (Number.isInteger(metadata?.workerPgid)) processGroupId = metadata.workerPgid;
-    else if (Number.isInteger(worker.processGroupId)) processGroupId = worker.processGroupId;
-    if (!processGroupId) {
-      try { worker.close?.(); } catch { return false; }
-      return true;
-    }
-    if (!metadata || !recordedWorkerIsGone(metadata)) {
-      if (!metadata || !recordedWorkerIsOwned(metadata)) return false;
-      try { worker.close?.(); } catch { return false; }
-    }
-    const deadline = Date.now() + this.workerRetireTimeoutMs;
-    while (processGroupIsAlive(processGroupId)) {
-      if (Date.now() >= deadline) return false;
-      await delay(25);
-    }
-    return true;
+    const recorded = metadata ?? workerMetadata(worker);
+    if (!recorded) return !worker.pid && !worker.processGroupId;
+    if (recordedWorkerIsGone(recorded)) return true;
+    // Preserve #42's zero-timeout retirement boundary: it deliberately keeps
+    // an unretired worker fenced instead of escalating immediately to KILL.
+    if (this.workerRetireTimeoutMs === 0) return false;
+    return stopOwnedProcessGroupSync(recorded, {
+      timeoutMs: this.workerRetireTimeoutMs,
+      currentBootId: this.bootId,
+    });
   }
 
   currentBranchHead(taskWorktree) {
@@ -542,24 +601,10 @@ export class RuntimeStore {
   }
 
   async terminateOwnedWorker(worker) {
-    if (recordedWorkerIsGone(worker)) return true;
-    if (!recordedWorkerIsOwned(worker)) return false;
-    try { process.kill(-worker.workerPgid, "SIGTERM"); }
-    catch (error) { if (error.code !== "ESRCH") return false; }
-    const termDeadline = Date.now() + this.workerStopTimeoutMs;
-    while (Date.now() < termDeadline) {
-      if (!processGroupIsAlive(worker.workerPgid)) return true;
-      await delay(25);
-    }
-    if (!recordedWorkerIsOwned(worker)) return false;
-    try { process.kill(-worker.workerPgid, "SIGKILL"); }
-    catch (error) { if (error.code !== "ESRCH") return false; }
-    const killDeadline = Date.now() + this.workerStopTimeoutMs;
-    while (Date.now() < killDeadline) {
-      if (!processGroupIsAlive(worker.workerPgid)) return true;
-      await delay(25);
-    }
-    return !processGroupIsAlive(worker.workerPgid);
+    return stopOwnedProcessGroupSync(worker, {
+      timeoutMs: this.workerStopTimeoutMs,
+      currentBootId: this.bootId,
+    });
   }
 
   markBlocked(taskId, attemptId, detail) {
@@ -644,6 +689,31 @@ export class RuntimeStore {
     }
     const retryTask = { id: task.id, sourceRepoRoot: task.sourceRepoRoot, baseCommit: task.baseCommit, taskBranch: task.taskBranch, taskWorktree: task.taskWorktree, goal: task.goal };
     return this.launchAttempt({ task: retryTask, attemptId, number, model, thinkingLevel, priorState: prior.state, priorDetail: prior.terminalDetail });
+  }
+
+  /** Stop the active daemon-owned worker before releasing DB/socket ownership. */
+  async shutdown(reason = DAEMON_SHUTDOWN_REASON) {
+    this.open();
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
+    const active = this.active;
+    if (active) {
+      const attempt = this.db.prepare(`SELECT id, task_id AS taskId, state, worker_pid AS workerPid,
+        worker_pgid AS workerPgid, worker_start_identity AS workerStartIdentity,
+        worker_boot_id AS workerBootId, worker_terminated AS workerTerminated
+        FROM attempts WHERE id = ?`).get(active.attemptId);
+      const outcome = attempt && ["starting", "running"].includes(attempt.state)
+        ? this.reconcileAttempt(attempt, { reason })
+        : "orphaned";
+      // FreshExecutor.close() is itself a signal operation. Never invoke it
+      // after an uncertain ownership result; the orphan path leaves durable
+      // metadata and any surviving worker untouched for next startup.
+      this.active = null;
+      return outcome;
+    }
+    // This also handles a graceful boundary after the in-memory handle was
+    // lost: reconcile durable metadata rather than declaring capacity free.
+    for (const attempt of this.attemptRows()) this.reconcileAttempt(attempt, { reason });
   }
 
   release() {
