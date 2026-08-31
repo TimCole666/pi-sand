@@ -34,8 +34,7 @@ function runClient(environment) {
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.once("error", rejectClient);
     child.once("close", (code, signal) => {
-      if (code !== 0) rejectClient(new Error(`client failed (${code}, ${signal}): ${stderr}`));
-      else resolveClient(JSON.parse(stdout.trim()));
+      if (code === 0) resolveClient(JSON.parse(stdout.trim())); else rejectClient(new Error(`client failed (${code}, ${signal}): ${stderr}`));
     });
   });
 }
