@@ -235,7 +235,7 @@ test("unsafe worker retirement keeps the result inspectable and blocks capacity"
     assert.equal(blocked.attempts[0].state, "orphaned");
     assert.equal(blocked.attempts[0].workerTerminated, false);
     assert.match(blocked.finalResult, /bounded/);
-    assert.throws(() => runtime.createTask(optionsFor(source)), /already active/);
+    await assert.rejects(() => runtime.createTask(optionsFor(source)), /already active/);
   } finally {
     runtime.close();
     try { process.kill(-lingering.pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
