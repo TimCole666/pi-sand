@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { createExtensionHarness } from "./helpers/v0.2-extension-harness.js";
 import { registerPiSandExtension } from "../extensions/runtime.js";
 import { RuntimeClient } from "../src/runtime-client.js";
+import { PROTOCOL_VERSION } from "../src/runtime-ipc.js";
 
 const repositoryRoot = resolve(new URL("..", import.meta.url).pathname);
 const daemonPath = join(repositoryRoot, "src", "daemon.js");
@@ -167,7 +168,13 @@ function startDaemon(env) {
 async function waitForDaemon(client, child) {
   return eventually(async () => {
     if (child.exitCode !== null) throw new Error(`daemon exited with ${child.exitCode}`);
-    try { return await client.status(); } catch { return null; }
+    try {
+      // Do not use RuntimeClient.request here: its recovery path can spawn a
+      // second daemon while the explicitly-started daemon is still binding.
+      const response = await client.requestSocket("runtime.status", {}, PROTOCOL_VERSION, 250);
+      const status = response.success ? response.data : null;
+      return status?.daemonPid === child.pid ? status : null;
+    } catch { return null; }
   }, Boolean, "daemon did not become ready");
 }
 
@@ -258,9 +265,6 @@ async function runJourney({ repair = false } = {}) {
 
     daemon = startDaemon(env);
     await waitForDaemon(client, daemon);
-    const activeWaitAfterRestart = (await client.getTask(acceptedTask.id)).waitSubscriptions.find((subscription) => subscription.status === "active");
-    if (activeWaitAfterRestart)
-      await client.request("wait.reconcile", { id: activeWaitAfterRestart.id });
     let current = await eventually(
       () => client.getTask(acceptedTask.id),
       (task) => repair ? task.attempts.length === 2 && task.state === "waiting" : task.state === "completed",
@@ -284,9 +288,6 @@ async function runJourney({ repair = false } = {}) {
       });
       daemon = startDaemon(env);
       await waitForDaemon(client, daemon);
-      const activeR2Wait = (await client.getTask(acceptedTask.id)).waitSubscriptions.find((subscription) => subscription.status === "active");
-      if (activeR2Wait)
-        await client.request("wait.reconcile", { id: activeR2Wait.id });
       current = await eventually(() => client.getTask(acceptedTask.id), (task) => task.state === "completed", `R2 CI did not complete the Task (${JSON.stringify(github.requests)})`);
       assert.equal(current.finalRevision, candidateR2);
     }
