@@ -8466,7 +8466,6 @@ export class RuntimeStore {
     const nextContractVersion = oldContractVersion + (meaningChanged ? 1 : 0);
     const oldAttempt = task.attempts.find(({ id: attemptId }) => attemptId === task.latestAttemptId);
     const active = this.active?.taskId === targetId ? this.active : null;
-    if (active) active.stopRequested = true;
 
     const selectedModel = model ?? (active
       ? { provider: active.provider, id: active.modelId }
@@ -8564,6 +8563,10 @@ export class RuntimeStore {
       throw error;
     }
 
+    if (active) {
+      active.stopRequested = true;
+      this.#clearAttemptWatchdog(active);
+    }
     const gateStopped = active ? this.#cancelLocalGate(active) : true;
     const workerStopped = !oldAttempt || (oldAttempt.state === "parked_wait" && oldAttempt.workerTerminated)
       ? true

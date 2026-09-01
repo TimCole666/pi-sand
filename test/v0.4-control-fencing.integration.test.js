@@ -5,6 +5,8 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { execFileSync, spawn } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { startRuntimeDaemon } from "../src/daemon.js";
+import { RuntimeClient } from "../src/runtime-client.js";
 import { RuntimeStore } from "../src/runtime-store.js";
 import { processGroupIsAlive } from "../src/process.js";
 
@@ -97,6 +99,119 @@ function seedEvidence(runtime, taskId, attemptId, payload) {
     );
   return id;
 }
+
+test("malformed public correction is side-effect free and the active Attempt can settle afterward", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-control-correction-validation-"));
+  const source = await repository(parent);
+  let emit;
+  const runtime = new RuntimeStore({
+    dbPath: join(parent, "runtime.sqlite"),
+    piCommand: await versionCommand(parent),
+    worktreeRoot: join(parent, "worktrees"),
+    workerFactory: async ({ onEvent }) => {
+      emit = onEvent;
+      return {
+        callbacksAttached: true,
+        executionSnapshot: { sessionId: "session-1", capability: "fixed" },
+        prompt() {
+          return Promise.resolve({ accepted: true });
+        },
+        close() {},
+      };
+    },
+  });
+  try {
+    const started = await runtime.createTask(taskOptions(source));
+    const before = runtime.getTask(started.id);
+    await assert.rejects(
+      runtime.correctTask({ id: started.id, model: {} }),
+      /current or an explicit model and thinking level/,
+    );
+    const after = runtime.getTask(started.id);
+    assert.equal(after.controlVersion, before.controlVersion);
+    assert.equal(after.contractVersion, before.contractVersion);
+    assert.equal(after.state, "running");
+    assert.equal(after.attempts.length, 1);
+    assert.equal(after.attempts[0].state, "running");
+    assert.equal(after.attempts[0].workerTerminated, false);
+    assert.equal(runtime.active.stopRequested, false);
+
+    emit({ type: "agent_start" });
+    emit({
+      type: "message_end",
+      message: { role: "assistant", content: "settled after rejected correction", stopReason: "stop" },
+    });
+    emit({ type: "agent_settled" });
+    const settled = await eventually(
+      () => runtime.getTask(started.id),
+      (task) => task.attempts[0].attemptRuns[0].state === "settled",
+    );
+    assert.equal(settled.state, "running");
+  } finally {
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("invalid thinking correction over daemon IPC is side-effect free and later settlement remains possible", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-control-correction-ipc-"));
+  const source = await repository(parent);
+  let emit;
+  const store = new RuntimeStore({
+    dbPath: join(parent, "runtime.sqlite"),
+    piCommand: await versionCommand(parent),
+    worktreeRoot: join(parent, "worktrees"),
+    workerFactory: async ({ onEvent }) => {
+      emit = onEvent;
+      return {
+        callbacksAttached: true,
+        executionSnapshot: { sessionId: "session-1", capability: "fixed" },
+        prompt() {
+          return Promise.resolve({ accepted: true });
+        },
+        close() {},
+      };
+    },
+  });
+  const socketPath = join(parent, "runtime", "pi-sand.sock");
+  let daemon;
+  try {
+    daemon = await startRuntimeDaemon({
+      dbPath: join(parent, "runtime.sqlite"),
+      socketPath,
+      store,
+    });
+    const client = new RuntimeClient({ socketPath, dbPath: join(parent, "runtime.sqlite") });
+    const started = await client.createTask(taskOptions(source));
+    const before = await client.getTask(started.id);
+    await assert.rejects(
+      client.correctTask({ id: started.id, thinkingLevel: "" }),
+      /current or an explicit model and thinking level/,
+    );
+    const after = await client.getTask(started.id);
+    assert.equal(after.controlVersion, before.controlVersion);
+    assert.equal(after.contractVersion, before.contractVersion);
+    assert.equal(after.state, "running");
+    assert.equal(after.attempts[0].state, "running");
+    assert.equal(after.attempts[0].workerTerminated, false);
+    assert.equal(store.active.stopRequested, false);
+
+    emit({ type: "agent_start" });
+    emit({
+      type: "message_end",
+      message: { role: "assistant", content: "settled after rejected thinking", stopReason: "stop" },
+    });
+    emit({ type: "agent_settled" });
+    const settled = await eventually(
+      () => client.getTask(started.id),
+      (task) => task.attempts[0].attemptRuns[0].state === "settled",
+    );
+    assert.equal(settled.state, "running");
+  } finally {
+    await daemon?.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
 
 test("task.stop commits the control fence before retiring work and stale settlement cannot complete", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-control-stop-"));
