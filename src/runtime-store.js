@@ -1668,16 +1668,25 @@ export class RuntimeStore {
         .all()
         .map((column) => column.name),
     );
+    const addedVersionColumns = [];
     for (const [name, type] of [
       ["control_version", "INTEGER NOT NULL DEFAULT 1"],
       ["contract_version", "INTEGER NOT NULL DEFAULT 1"],
     ]) {
-      if (!refreshedColumns.has(name))
+      if (!refreshedColumns.has(name)) {
         this.db.exec(`ALTER TABLE attempts ADD COLUMN ${name} ${type}`);
+        addedVersionColumns.push(name);
+      }
     }
-    this.db.exec(`UPDATE attempts SET
-      control_version = COALESCE((SELECT t.control_version FROM tasks AS t WHERE t.id = attempts.task_id), 1),
-      contract_version = COALESCE((SELECT t.contract_version FROM tasks AS t WHERE t.id = attempts.task_id), 1)`);
+    // Only legacy Attempt columns need their captured versions backfilled.
+    // Once a column exists, its values are historical facts and must not be
+    // rewritten to the Task's current fence on every daemon restart.
+    if (addedVersionColumns.length > 0) {
+      const assignments = addedVersionColumns.map(
+        (name) => `${name} = COALESCE((SELECT t.${name} FROM tasks AS t WHERE t.id = attempts.task_id), 1)`,
+      );
+      this.db.exec(`UPDATE attempts SET ${assignments.join(", ")}`);
+    }
   }
 
   ensureCommitmentColumns() {

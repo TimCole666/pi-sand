@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
@@ -36,6 +37,15 @@ function taskOptions(source) {
   };
 }
 
+async function eventually(read, predicate, turns = 100) {
+  for (let turn = 0; turn < turns; turn += 1) {
+    const value = await read();
+    if (predicate(value)) return value;
+    await new Promise((resolveTurn) => setImmediate(resolveTurn));
+  }
+  throw new Error("timed out waiting for deterministic runtime state");
+}
+
 function settledWorker(onEvent) {
   onEvent({
     type: "message_end",
@@ -50,6 +60,41 @@ function settledWorker(onEvent) {
     },
     close() {},
   };
+}
+
+function hangingWorker() {
+  return {
+    callbacksAttached: true,
+    executionSnapshot: { sessionId: "session-1", capability: "fixed" },
+    prompt() {
+      return new Promise(() => {});
+    },
+    close() {},
+  };
+}
+
+function seedEvidence(runtime, taskId, attemptId, payload) {
+  const id = randomUUID();
+  const serialized = JSON.stringify(payload);
+  runtime.db.prepare(`INSERT INTO evidence (
+    id, task_id, attempt_id, attempt_run_id, kind, source, subject,
+    subject_digest, payload, payload_digest, dedupe_key, observed_at
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(
+      id,
+      taskId,
+      attemptId,
+      `${attemptId}:1`,
+      "control_test",
+      "runtime",
+      "control_test",
+      "subject-digest",
+      serialized,
+      "payload-digest",
+      `control-test:${id}`,
+      new Date().toISOString(),
+    );
+  return id;
 }
 
 test("task.stop commits the control fence before retiring work and stale settlement cannot complete", async () => {
@@ -70,6 +115,255 @@ test("task.stop commits the control fence before retiring work and stale settlem
     assert.equal(stopped.attempts[0].attemptRuns[0].state, "settled");
     assert.equal(stopped.remoteEffects.length, 0);
     assert.equal((await runtime.stopTask(accepted.id)).state, "stopped");
+  } finally {
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("restart preserves captured Attempt, AttemptRun, and Evidence versions after stop advances Task control", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-control-restart-"));
+  const source = await repository(parent);
+  const options = {
+    dbPath: join(parent, "runtime.sqlite"),
+    piCommand: await versionCommand(parent),
+    worktreeRoot: join(parent, "worktrees"),
+    workerFactory: async ({ onEvent }) => settledWorker(onEvent),
+  };
+  let runtime = new RuntimeStore(options);
+  try {
+    const accepted = await runtime.createTask({
+      ...taskOptions(source),
+      completionContract: {
+        objective: "fence one Task",
+        localGates: [{
+          id: "failing-gate",
+          command: [process.execPath, "-e", "process.exit(1)"],
+        }],
+      },
+      budget: { maxTotalAttempts: 2 },
+    });
+    await eventually(
+      () => runtime.getTask(accepted.id),
+      (task) => task.evidence.length > 0 && ["accepted", "running"].includes(task.state),
+    );
+    const stopped = await runtime.stopTask(accepted.id);
+    const priorEvidence = stopped.evidence.map((evidence) => ({
+      id: evidence.id,
+      controlVersion: evidence.payload.controlVersion,
+      contractVersion: evidence.payload.contractVersion,
+    }));
+    assert.ok(priorEvidence.length > 0);
+    assert.ok(priorEvidence.every(({ controlVersion, contractVersion }) =>
+      controlVersion === 1 && contractVersion === 1));
+    runtime.close();
+    runtime = new RuntimeStore(options);
+    const reopened = runtime.getTask(accepted.id);
+    assert.equal(reopened.controlVersion, 2);
+    assert.equal(reopened.contractVersion, 1);
+    assert.equal(reopened.attempts[0].controlVersion, 1);
+    assert.equal(reopened.attempts[0].contractVersion, 1);
+    assert.equal(reopened.attempts[0].attemptRuns[0].controlVersion, 1);
+    assert.equal(reopened.attempts[0].attemptRuns[0].contractVersion, 1);
+    assert.deepEqual(
+      reopened.evidence.map((evidence) => ({
+        id: evidence.id,
+        controlVersion: evidence.payload.controlVersion,
+        contractVersion: evidence.payload.contractVersion,
+      })),
+      priorEvidence,
+    );
+  } finally {
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("restart preserves captured versions and Evidence after correction advances Task control and contract", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-control-correction-restart-"));
+  const source = await repository(parent);
+  const options = {
+    dbPath: join(parent, "runtime.sqlite"),
+    piCommand: await versionCommand(parent),
+    worktreeRoot: join(parent, "worktrees"),
+    workerFactory: async () => hangingWorker(),
+  };
+  let runtime = new RuntimeStore(options);
+  try {
+    const accepted = await runtime.createTask(taskOptions(source));
+    const before = runtime.getTask(accepted.id);
+    const oldAttempt = before.attempts[0];
+    const evidenceId = seedEvidence(runtime, accepted.id, oldAttempt.id, {
+      controlVersion: 1,
+      contractVersion: 1,
+      note: "historical control evidence",
+    });
+    const corrected = await runtime.correctTask({
+      id: accepted.id,
+      objective: "corrected objective",
+    });
+    assert.equal(corrected.controlVersion, 2);
+    assert.equal(corrected.contractVersion, 2);
+    runtime.close();
+    runtime = new RuntimeStore(options);
+    const reopened = runtime.getTask(accepted.id);
+    const historicalAttempt = reopened.attempts.find(({ id }) => id === oldAttempt.id);
+    const historicalEvidence = reopened.evidence.find(({ id }) => id === evidenceId);
+    assert.equal(reopened.controlVersion, 2);
+    assert.equal(reopened.contractVersion, 2);
+    assert.equal(historicalAttempt.controlVersion, 1);
+    assert.equal(historicalAttempt.contractVersion, 1);
+    assert.equal(historicalAttempt.attemptRuns[0].controlVersion, 1);
+    assert.equal(historicalAttempt.attemptRuns[0].contractVersion, 1);
+    assert.equal(historicalAttempt.state, "superseded");
+    assert.deepEqual(historicalEvidence.payload, {
+      controlVersion: 1,
+      contractVersion: 1,
+      note: "historical control evidence",
+    });
+    const currentAttempt = reopened.attempts.find(({ id }) => id === reopened.latestAttemptId);
+    assert.equal(currentAttempt.controlVersion, 2);
+    assert.equal(currentAttempt.contractVersion, 2);
+  } finally {
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("cancel after continuation acceptance retires the exact Attempt and rejects late settlement", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-control-cancel-accepted-"));
+  const source = await repository(parent);
+  let emit;
+  let resolvePrompt;
+  let promptCalls = 0;
+  const runtime = new RuntimeStore({
+    dbPath: join(parent, "runtime.sqlite"),
+    piCommand: await versionCommand(parent),
+    worktreeRoot: join(parent, "worktrees"),
+    workerFactory: async ({ onEvent }) => {
+      emit = onEvent;
+      onEvent({
+        type: "message_end",
+        message: { role: "assistant", content: "initial", stopReason: "stop" },
+      });
+      onEvent({ type: "agent_settled" });
+      return {
+        callbacksAttached: true,
+        executionSnapshot: { sessionId: "session-1", capability: "fixed" },
+        prompt() {
+          promptCalls += 1;
+          return new Promise((resolvePromptResult) => {
+            resolvePrompt = () => resolvePromptResult({ accepted: true });
+          });
+        },
+        close() {},
+      };
+    },
+  });
+  try {
+    const started = await runtime.createTask(taskOptions(source));
+    await eventually(
+      () => runtime.getTask(started.id),
+      (task) => task.attempts[0].attemptRuns[0].state === "settled",
+    );
+    const continuation = runtime.continueAttempt({
+      id: started.id,
+      prompt: "accepted continuation",
+    });
+    await eventually(() => promptCalls, (calls) => calls === 1);
+    resolvePrompt();
+    await continuation;
+    assert.equal(runtime.getTask(started.id).attempts[0].attemptRuns[1].state, "accepted");
+
+    const stopped = await runtime.stopTask(started.id);
+    emit({ type: "agent_start" });
+    emit({
+      type: "message_end",
+      message: { role: "assistant", content: "late result", stopReason: "stop" },
+    });
+    emit({ type: "agent_settled" });
+    assert.equal(stopped.state, "stopped");
+    assert.equal(stopped.attempts[0].state, "stopped");
+    assert.equal(stopped.attempts[0].attemptRuns[1].state, "aborted");
+    assert.equal(runtime.getTask(started.id).state, "stopped");
+  } finally {
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("correction after an accepted old result fences that result from the new contract", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-control-correction-accepted-"));
+  const source = await repository(parent);
+  let oldEmit;
+  let resolvePrompt;
+  let workerCount = 0;
+  const runtime = new RuntimeStore({
+    dbPath: join(parent, "runtime.sqlite"),
+    piCommand: await versionCommand(parent),
+    worktreeRoot: join(parent, "worktrees"),
+    workerFactory: async ({ onEvent }) => {
+      workerCount += 1;
+      if (workerCount === 1) {
+        oldEmit = onEvent;
+        onEvent({
+          type: "message_end",
+          message: { role: "assistant", content: "old result", stopReason: "stop" },
+        });
+        onEvent({ type: "agent_settled" });
+      }
+      return {
+        callbacksAttached: true,
+        executionSnapshot: { sessionId: `session-${workerCount}`, capability: "fixed" },
+        prompt() {
+          if (workerCount !== 1) return new Promise(() => {});
+          return new Promise((resolvePromptResult) => {
+            resolvePrompt = () => resolvePromptResult({ accepted: true });
+          });
+        },
+        close() {},
+      };
+    },
+  });
+  try {
+    const started = await runtime.createTask(taskOptions(source));
+    await eventually(
+      () => runtime.getTask(started.id),
+      (task) => task.attempts[0].attemptRuns[0].state === "settled",
+    );
+    const continuation = runtime.continueAttempt({ id: started.id, prompt: "old follow-up" });
+    resolvePrompt();
+    await continuation;
+    oldEmit({ type: "agent_start" });
+    oldEmit({
+      type: "message_end",
+      message: { role: "assistant", content: "accepted old result", stopReason: "stop" },
+    });
+    oldEmit({ type: "agent_settled" });
+    await eventually(
+      () => runtime.getTask(started.id),
+      (task) => task.attempts[0].attemptRuns[1].state === "settled",
+    );
+
+    const corrected = await runtime.correctTask({
+      id: started.id,
+      objective: "new contract objective",
+    });
+    assert.equal(corrected.goal, "new contract objective");
+    assert.equal(corrected.controlVersion, 2);
+    assert.equal(corrected.contractVersion, 2);
+    oldEmit({ type: "agent_start" });
+    oldEmit({
+      type: "message_end",
+      message: { role: "assistant", content: "late old completion", stopReason: "stop" },
+    });
+    oldEmit({ type: "agent_settled" });
+    const current = runtime.getTask(started.id);
+    assert.equal(current.state, "running");
+    assert.equal(current.attempts[0].state, "superseded");
+    assert.equal(current.attempts[0].attemptRuns[1].settledOutcome, "accepted old result");
+    assert.equal(current.attempts[1].controlVersion, 2);
+    assert.equal(current.attempts[1].contractVersion, 2);
   } finally {
     runtime.close();
     await rm(parent, { recursive: true, force: true });
