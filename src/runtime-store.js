@@ -125,8 +125,81 @@ const RESTART_DETAIL =
 const ORPHAN_DETAIL =
   "The prior Fresh Executor could not be safely identified or terminated. The Task is blocked and its worktree was retained.";
 const DAEMON_SHUTDOWN_REASON = "daemon-shutdown";
+export const DEFAULT_BUDGET = {
+  maxTotalAttempts: 7,
+  maxCodeProducingAttempts: 4,
+  maxReviewerAttempts: 3,
+  maxStartupFailures: 2,
+  maxPiRunsPerAttempt: 4,
+  maxPiTurnsPerAttempt: 20,
+  maxActiveAttemptDurationMs: 60 * 60 * 1000,
+  maxCiRepairCycles: 2,
+  maxRemotePublications: 3,
+  maxSameFailureFingerprint: 2,
+  maxNoProgressSupervisorIterations: 2,
+  maxModelOrThinkingEscalations: 1,
+  ciCheckAppearanceGraceMs: 10 * 60 * 1000,
+  ciWaitDeadlineMs: 24 * 60 * 60 * 1000,
+  totalCommitmentWallClockDeadlineMs: 72 * 60 * 60 * 1000,
+};
+
+export function normalizeBudget(rawBudget) {
+  if (rawBudget == null) return { ...DEFAULT_BUDGET };
+  const budget = typeof rawBudget === "string" ? parsed(rawBudget, {}) : rawBudget;
+  if (typeof budget !== "object" || budget === null || Array.isArray(budget)) {
+    throw new Error("Task budget must be an object.");
+  }
+  assertNoRemoteCredentials(budget, "budget");
+  const normalized = { ...DEFAULT_BUDGET };
+  for (const [key, value] of Object.entries(budget)) {
+    if (Object.prototype.hasOwnProperty.call(DEFAULT_BUDGET, key)) {
+      if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+        throw new Error(`Task budget property '${key}' must be a non-negative number.`);
+      }
+      normalized[key] = Math.floor(value);
+    }
+  }
+  return normalized;
+}
+
+export function localGateFailureFingerprint({ candidateSha, criterion, exitCategory, exitCode, stderr, error }) {
+  const stderrSnippet = bounded(
+    typeof stderr === "string" && stderr ? stderr : typeof error === "string" ? error : "",
+    500,
+  );
+  return digest(
+    JSON.stringify({
+      kind: "local_gate_failure",
+      candidateSha: candidateSha ?? "",
+      criterion: criterion ?? "",
+      exitCategory: exitCategory ?? "",
+      exitCode: exitCode ?? null,
+      stderr: stderrSnippet,
+    }),
+  );
+}
+
+export function ciFailureFingerprint({ revisionSha, classification, failingChecks = [] }) {
+  const checks = Array.isArray(failingChecks)
+    ? failingChecks
+        .map((c) => ({
+          name: c.name ?? c.context ?? c.selector ?? "",
+          selector: c.selector ?? "",
+          conclusion: c.conclusion ?? c.normalizedState ?? c.state ?? "",
+          status: c.status ?? "",
+        }))
+        .sort((a, b) => (a.name || a.selector).localeCompare(b.name || b.selector))
+    : [];
+  return digest(
+    JSON.stringify({
+      kind: "ci_failure",
+      revisionSha: revisionSha ?? "",
+      classification: classification ?? "failure",
+      checks,
+    }),
+  );
+}
 const DEFAULT_AUTHORITY = { owner: "pi-sandd" };
-const DEFAULT_BUDGET = {};
 const DEFAULT_RETURN_ROUTE = { kind: "manager" };
 const TASK_SELECT = `SELECT id, source_repo_root AS sourceRepoRoot, base_commit AS baseCommit,
   task_branch AS taskBranch, task_worktree AS taskWorktree, goal, state,
@@ -592,10 +665,8 @@ function snapshotsEqual(left, right) {
 }
 
 function attemptRunLimit(task) {
-  const configured = Number(parsed(task?.budget, {})?.piRunsPerAttempt);
-  if (!Number.isInteger(configured) || configured <= 0)
-    return MAX_ATTEMPT_RUNS_PER_ATTEMPT;
-  return Math.min(configured, MAX_ATTEMPT_RUNS_PER_ATTEMPT);
+  const budget = normalizeBudget(task?.budget);
+  return budget.maxPiRunsPerAttempt ?? MAX_ATTEMPT_RUNS_PER_ATTEMPT;
 }
 
 function continuationAcknowledgementStatus(acknowledgement) {
@@ -1264,6 +1335,75 @@ export function buildTaskPacket({
   return packet;
 }
 
+export function buildRepairPrompt({
+  taskId,
+  attemptNumber,
+  goal,
+  taskBranch,
+  taskWorktree,
+  baseCommit,
+  candidateSha,
+  completionContract,
+  failingGate,
+  ciEvidence,
+  priorFailureDetail,
+  remainingBudget,
+}) {
+  const lines = [
+    "pi-sand Verification Repair Request",
+    `Task id: ${taskId}`,
+    `Attempt: ${attemptNumber}`,
+    `Goal: ${goal}`,
+    `Task branch: ${taskBranch}`,
+    `Task worktree: ${taskWorktree}`,
+    `Base commit: ${baseCommit}`,
+  ];
+  if (candidateSha) {
+    lines.push(`Candidate SHA: ${candidateSha}`);
+  }
+  if (completionContract) {
+    lines.push(
+      `Completion contract: ${typeof completionContract === "string" ? completionContract : JSON.stringify(completionContract)}`,
+    );
+  }
+  if (failingGate) {
+    lines.push(
+      `Failing local gate: ${failingGate.criterion ?? failingGate.id ?? ""}`,
+      `Exit category: ${failingGate.exitCategory ?? ""}`,
+      `Exit code: ${failingGate.exitCode ?? ""}`,
+    );
+    if (failingGate.stderr) {
+      lines.push(`Failure stderr snippet:\n${bounded(failingGate.stderr, 500)}`);
+    }
+    if (failingGate.error) {
+      lines.push(`Failure error:\n${bounded(failingGate.error, 500)}`);
+    }
+  }
+  if (ciEvidence) {
+    lines.push(
+      `Failing CI observation:\n${typeof ciEvidence === "string" ? ciEvidence : JSON.stringify(ciEvidence)}`,
+    );
+  }
+  if (priorFailureDetail) {
+    lines.push(`Prior failure detail: ${boundedDetail(priorFailureDetail)}`);
+  }
+  if (remainingBudget) {
+    lines.push(
+      `Remaining budget: ${typeof remainingBudget === "string" ? remainingBudget : JSON.stringify(remainingBudget)}`,
+    );
+  }
+  lines.push(
+    "Repair instructions:",
+    "- Work only in the task worktree identified above.",
+    "- Repair the codebase to resolve the failure described above and satisfy the completion contract.",
+    "- Do not clean or reset untracked changes unnecessarily.",
+  );
+  const prompt = lines.join("\n");
+  if (Buffer.byteLength(prompt, "utf8") > MAX_CONTINUATION_PROMPT_LENGTH)
+    throw new Error("Repair prompt exceeds its bounded size.");
+  return prompt;
+}
+
 function workerMetadata(worker) {
   const workerPid = Number(worker?.workerPid ?? worker?.pid);
   const workerPgid = Number(
@@ -1540,7 +1680,7 @@ export class RuntimeStore {
           COMMITMENT_CONTRACT_VERSION,
           COMMITMENT_CONTROL_VERSION,
           JSON.stringify(DEFAULT_AUTHORITY),
-          JSON.stringify(DEFAULT_BUDGET),
+          JSON.stringify({}),
           JSON.stringify(DEFAULT_RETURN_ROUTE),
           row.createdAt,
           row.finalBranchHead ?? null,
@@ -2560,7 +2700,12 @@ export class RuntimeStore {
         };
         throw new Error(reservationFailure.message);
       }
-      if (Number(taskRow.publicationCount) >= authority.maxPublications) {
+      const taskBudget = normalizeBudget(taskRow.budget);
+      const effectiveMaxPubs = Math.min(
+        Number(authority.maxPublications ?? DEFAULT_BUDGET.maxRemotePublications),
+        Number(taskBudget.maxRemotePublications ?? DEFAULT_BUDGET.maxRemotePublications),
+      );
+      if (Number(taskRow.publicationCount) >= effectiveMaxPubs) {
         reservationFailure = {
           code: "remote_budget_exhausted",
           detail: "Task-wide remote publication budget exhausted.",
@@ -2580,7 +2725,7 @@ export class RuntimeStore {
           taskId,
           capturedControlVersion,
           capturedContractVersion,
-          authority.maxPublications,
+          effectiveMaxPubs,
         );
       if (taskReservation.changes !== 1)
         throw new Error("Remote publication Task budget reservation was not recorded.");
@@ -3648,19 +3793,6 @@ export class RuntimeStore {
     const nowTime = nowOverride ? new Date(nowOverride).getTime() : Date.now();
     const nowIso = new Date(nowTime).toISOString();
 
-    if (nowTime >= new Date(subscription.deadlineAt).getTime()) {
-      this.db
-        .prepare(
-          "UPDATE wait_subscriptions SET status = 'timed_out', last_reconciled_at = ?, next_reconcile_at = NULL WHERE id = ?",
-        )
-        .run(nowIso, id);
-      return {
-        task: this.getTask(subscription.taskId),
-        waitSubscription: this.getWaitSubscription(id),
-        classification: "timed_out",
-      };
-    }
-
     const adapter = gitHubAdapter ?? gitHubClient ?? this.gitHubAdapter;
     let checkRuns = [];
     let commitStatuses = [];
@@ -3936,7 +4068,16 @@ export class RuntimeStore {
       }
     }
 
-    const classification = classifyOverallObservation(selectorResults);
+    let classification = classifyOverallObservation(selectorResults);
+
+    if (classification !== "success" && nowTime >= new Date(subscription.deadlineAt).getTime()) {
+      classification = "timed_out";
+      this.db
+        .prepare(
+          "UPDATE wait_subscriptions SET status = 'timed_out', last_reconciled_at = ?, next_reconcile_at = NULL WHERE id = ?",
+        )
+        .run(nowIso, id);
+    }
 
     let nextReconcileIso = null;
     if (classification === "pending") {
@@ -3953,13 +4094,15 @@ export class RuntimeStore {
       (options.trigger === true || options.autoTrigger === true) &&
       (classification === "success" ||
         classification === "failure" ||
-        classification === "ci_not_observable")
+        classification === "ci_not_observable" ||
+        classification === "timed_out")
     ) {
       return await this.#triggerWaitSubscription(
         id,
         {
           model: options.model,
           thinkingLevel: options.thinkingLevel,
+          timedOut: classification === "timed_out",
           now: nowOverride,
           skipSpawn: options.skipSpawn === true,
         },
@@ -4391,8 +4534,123 @@ export class RuntimeStore {
           throw new Error("Completed Task did not produce a Result delivery.");
         }
       } else {
-        // 7B. CI Failure or further model work required:
-        // Allocate exactly one continuation Attempt with cause = 'repair' and resume_wait_id = wait.id
+        // 7B. CI Failure, ci_not_observable, timed_out, etc.
+        const budget = normalizeBudget(taskRow.budget);
+        const authorityObj = parsed(taskRow.authority, {});
+        const maxPubs = authorityObj?.maxPublications ?? budget.maxRemotePublications;
+        const totalAttempts = this.#getTaskAttemptsCount(taskRow.id);
+        const codeAttempts = this.#getTaskCodeAttemptsCount(taskRow.id);
+        const ciRepairs = this.#getTaskCiRepairsCount(taskRow.id);
+        const pubCount = Number(taskRow.publicationCount ?? 0);
+        const nowTime = new Date(timestamp).getTime();
+        const wallClockElapsed = nowTime - new Date(taskRow.acceptedAt || taskRow.createdAt).getTime();
+
+        const fp = ciFailureFingerprint({
+          revisionSha: waitRow.revisionSha,
+          classification,
+          failingChecks: selectorResults,
+        });
+        const history = this.#getTaskCiFailureHistory(taskRow.id);
+        let consecutiveCount = 0;
+        for (let i = history.length - 1; i >= 0; i--) {
+          if (history[i].fingerprint === fp) consecutiveCount++;
+          else break;
+        }
+
+        let terminalReason = null;
+        let terminalDetail = null;
+
+        if (classification === "timed_out" || wallClockElapsed >= budget.totalCommitmentWallClockDeadlineMs) {
+          terminalReason = "external_timeout";
+          terminalDetail = classification === "timed_out"
+            ? `GitHub CI wait subscription deadline expired for revision ${waitRow.revisionSha}.`
+            : "Task total commitment wall-clock deadline expired.";
+        } else if (consecutiveCount >= budget.maxSameFailureFingerprint) {
+          terminalReason = "stalled";
+          terminalDetail = `Task CI repair stalled on repeated failure fingerprint for revision ${waitRow.revisionSha}.`;
+        } else if (ciRepairs >= budget.maxCiRepairCycles) {
+          terminalReason = "budget_exhausted";
+          terminalDetail = `Task CI repair cycle budget (${budget.maxCiRepairCycles}) exhausted.`;
+        } else if (pubCount >= maxPubs) {
+          terminalReason = "budget_exhausted";
+          terminalDetail = `Task remote publication budget (${maxPubs}) exhausted.`;
+        } else if (totalAttempts >= budget.maxTotalAttempts) {
+          terminalReason = "budget_exhausted";
+          terminalDetail = `Task total attempt budget (${budget.maxTotalAttempts}) exhausted.`;
+        } else if (codeAttempts >= budget.maxCodeProducingAttempts) {
+          terminalReason = "budget_exhausted";
+          terminalDetail = `Task code-producing attempt budget (${budget.maxCodeProducingAttempts}) exhausted.`;
+        }
+
+        if (terminalReason) {
+          this.db
+            .prepare(
+              `UPDATE tasks SET state = 'failed', updated_at = ?, final_result = NULL,
+              terminal_detail = ?, final_branch_head = ?, final_revision = ?,
+              terminal_reason = ? WHERE id = ? AND state IN ('waiting', 'running', 'accepted')
+              AND control_version = ? AND contract_version = ?`,
+            )
+            .run(
+              timestamp,
+              terminalDetail,
+              waitRow.revisionSha,
+              waitRow.revisionSha,
+              terminalReason,
+              taskRow.id,
+              taskRow.controlVersion,
+              taskRow.contractVersion,
+            );
+
+          this.db
+            .prepare(
+              `UPDATE attempts SET state = 'failed', finished_at = ?, worker_terminated = 1,
+              terminal_detail = ?, final_branch_head = ?
+              WHERE id = ? AND task_id = ? AND state = 'parked_wait'`,
+            )
+            .run(
+              timestamp,
+              terminalDetail,
+              waitRow.revisionSha,
+              waitRow.createdByAttemptId,
+              taskRow.id,
+            );
+
+          this.db
+            .prepare(
+              `UPDATE wait_subscriptions SET status = ?, trigger_evidence_id = ?,
+              last_reconciled_at = ?, next_reconcile_at = NULL WHERE id = ? AND status = 'active'`,
+            )
+            .run(
+              classification === "timed_out" ? "timed_out" : "triggered",
+              triggerEvidenceId,
+              timestamp,
+              id,
+            );
+
+          const resultId = this.#insertResultDelivery({
+            task: this.#taskRow(taskRow.id),
+            outcome: "failed",
+            finalResult: null,
+            terminalDetail,
+            terminalReason,
+            finalRevision: waitRow.revisionSha,
+            finalBranchHead: waitRow.revisionSha,
+            evidenceRefs: allEvidenceIds,
+          });
+          if (!resultId) {
+            throw new Error("Failed Task did not produce a Result delivery.");
+          }
+
+          this.db.exec("COMMIT");
+          return {
+            task: this.getTask(taskRow.id),
+            waitSubscription: this.getWaitSubscription(id),
+            classification,
+            continuationAttemptId: null,
+            triggered: true,
+          };
+        }
+
         const lastAttemptRow = this.db
           .prepare(
             "SELECT id, number, provider, model_id, thinking_level, applied_provider, applied_model_id, applied_thinking_level FROM attempts WHERE task_id = ? ORDER BY number DESC LIMIT 1",
@@ -4548,6 +4806,77 @@ export class RuntimeStore {
       continuationAttemptId: newAttemptId ?? null,
       triggered: true,
     };
+  }
+
+  #getTaskLocalGateFailureHistory(taskId) {
+    const rows = this.db
+      .prepare(
+        "SELECT payload FROM evidence WHERE task_id = ? AND kind = 'local_gate_result' ORDER BY observed_at ASC, id ASC",
+      )
+      .all(taskId);
+    return rows
+      .map((r) => parsed(r.payload, {}))
+      .filter((p) => p.exitCategory !== "zero" && (p.exitCode !== 0 || p.error))
+      .map((p) => ({
+        fingerprint: localGateFailureFingerprint(p),
+        candidateSha: p.candidateSha,
+      }));
+  }
+
+  #getTaskCiFailureHistory(taskId) {
+    const rows = this.db
+      .prepare(
+        "SELECT payload FROM evidence WHERE task_id = ? AND kind = 'wait_trigger' ORDER BY observed_at ASC, id ASC",
+      )
+      .all(taskId);
+    return rows
+      .map((r) => parsed(r.payload, {}))
+      .filter((p) => p.classification !== "success")
+      .map((p) => ({
+        fingerprint: ciFailureFingerprint({
+          revisionSha: p.revisionSha,
+          classification: p.classification,
+          failingChecks: p.selectorResults,
+        }),
+        revisionSha: p.revisionSha,
+      }));
+  }
+
+  #getTaskAttemptsCount(taskId) {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS count FROM attempts WHERE task_id = ?")
+      .get(taskId);
+    return Number(row?.count ?? 0);
+  }
+
+  #getTaskCodeAttemptsCount(taskId) {
+    const row = this.db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM attempts WHERE task_id = ? AND (cause IS NULL OR cause IN ('initial', 'continuation', 'repair', 'retry'))",
+      )
+      .get(taskId);
+    return Number(row?.count ?? 0);
+  }
+
+  #getTaskCiRepairsCount(taskId) {
+    const row = this.db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM attempts WHERE task_id = ? AND cause = 'repair' AND resume_wait_id IS NOT NULL",
+      )
+      .get(taskId);
+    return Number(row?.count ?? 0);
+  }
+
+  #getTaskStartupFailuresCount(taskId) {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(DISTINCT a.id) AS count FROM attempts a
+         LEFT JOIN attempt_runs r ON r.attempt_id = a.id AND r.sequence = 1
+         WHERE a.task_id = ? AND a.state IN ('failed', 'orphaned')
+         AND (r.state IN ('pending', 'aborted') OR a.worker_start_identity IS NULL)`,
+      )
+      .get(taskId);
+    return Number(row?.count ?? 0);
   }
 
   async processWaitObservation(subscriptionIdOrOptions, options = {}) {
@@ -4938,7 +5267,8 @@ export class RuntimeStore {
       objective: cleanGoal,
     });
     const storedAuthority = serialized(requestedAuthority, DEFAULT_AUTHORITY);
-    const storedBudget = serialized(budget, DEFAULT_BUDGET);
+    if (budget != null) normalizeBudget(budget);
+    const storedBudget = serialized(budget, {});
     const storedReturnRoute = serialized(returnRoute, DEFAULT_RETURN_ROUTE);
     let packet;
     try {
@@ -5605,8 +5935,7 @@ export class RuntimeStore {
       const result = this.db
         .prepare(`UPDATE tasks SET final_revision = ?, updated_at = ?
           WHERE id = ? AND latest_attempt_id = ? AND state IN ('accepted', 'running')
-          AND control_version = ? AND contract_version = ?
-          AND (final_revision IS NULL OR final_revision = ?)`)
+          AND control_version = ? AND contract_version = ?`)
         .run(
           candidateSha,
           timestamp,
@@ -5614,7 +5943,6 @@ export class RuntimeStore {
           active.attemptId,
           active.controlVersion,
           active.contractVersion,
-          candidateSha,
         );
       if (result.changes !== 1)
         throw new Error("Task completion versions are no longer current.");
@@ -6116,22 +6444,177 @@ export class RuntimeStore {
           const gateRetired =
             gateResult.processTerminated === true ||
             this.#cancelLocalGate(active);
+          if (gateResult.processTerminated !== true || !gateRetired) {
+            const retired = await this.retireWorker(
+              active.worker,
+              active.workerMetadata,
+            );
+            if (this.active !== active || active.stopRequested) return;
+            this.#verificationFailure(active, {
+              state: "blocked",
+              reason: "gate_termination_ambiguous",
+              detail: "Required local gate failed and its process could not be safely retired.",
+              observedCandidateSha,
+              recordedCandidateSha,
+              finalBranchHead:
+                gateResult.postCandidateSha ?? recordedCandidateSha,
+              workerTerminated: retired,
+            });
+            return;
+          }
+
+          // Evaluate failure fingerprint against budget
+          const budget = normalizeBudget(task.budget);
+          const fp = localGateFailureFingerprint({
+            candidateSha: recordedCandidateSha,
+            criterion: gateResult.criterion,
+            exitCategory: gateResult.exitCategory,
+            exitCode: gateResult.exitCode,
+            stderr: gateResult.stderr,
+            error: gateResult.error,
+          });
+          const history = this.#getTaskLocalGateFailureHistory(task.id);
+          let consecutiveCount = 0;
+          for (let i = history.length - 1; i >= 0; i--) {
+            if (history[i].fingerprint === fp) consecutiveCount++;
+            else break;
+          }
+          let noProgressIterations = 0;
+          for (let i = history.length - 1; i >= 0; i--) {
+            if (history[i].candidateSha === recordedCandidateSha) noProgressIterations++;
+            else break;
+          }
+
+          const nowTime = Date.now();
+          const acceptedTime = new Date(task.acceptedAt || task.createdAt).getTime();
+          const wallClockDuration = nowTime - acceptedTime;
+
+          if (wallClockDuration >= budget.totalCommitmentWallClockDeadlineMs) {
+            const retired = await this.retireWorker(active.worker, active.workerMetadata);
+            if (this.active !== active || active.stopRequested) return;
+            this.#verificationFailure(active, {
+              reason: "external_timeout",
+              detail: "Task total commitment wall-clock deadline expired.",
+              observedCandidateSha,
+              recordedCandidateSha,
+              finalBranchHead: gateResult.postCandidateSha ?? recordedCandidateSha,
+              workerTerminated: retired,
+            });
+            return;
+          }
+
+          if (
+            consecutiveCount >= budget.maxSameFailureFingerprint ||
+            noProgressIterations >= budget.maxNoProgressSupervisorIterations
+          ) {
+            const retired = await this.retireWorker(active.worker, active.workerMetadata);
+            if (this.active !== active || active.stopRequested) return;
+            this.#verificationFailure(active, {
+              reason: "stalled",
+              detail: `Task local repair stalled on repeated failure fingerprint (${gateResult.criterion}).`,
+              observedCandidateSha,
+              recordedCandidateSha,
+              finalBranchHead: gateResult.postCandidateSha ?? recordedCandidateSha,
+              workerTerminated: retired,
+            });
+            return;
+          }
+
+          // Check if current worker is healthy & eligible for same-attempt re-prompt (#53)
+          let canRepairSameAttempt = false;
+          try {
+            if (
+              active.worker &&
+              typeof active.worker.prompt === "function" &&
+              active.runSequence < budget.maxPiRunsPerAttempt &&
+              !active.stopRequested &&
+              active.rpcCoherent &&
+              !active.promptAmbiguous &&
+              typeof active.sessionId === "string" &&
+              active.sessionId.length > 0 &&
+              snapshotsEqual(active.executionSnapshot, active.worker.executionSnapshot) &&
+              (!active.workerMetadata || (
+                processGroupStatus(active.workerMetadata.workerPgid) === "alive" &&
+                recordedWorkerIsOwned(active.workerMetadata, this.bootId)
+              ))
+            ) {
+              canRepairSameAttempt = true;
+            }
+          } catch {
+            canRepairSameAttempt = false;
+          }
+
+          if (canRepairSameAttempt) {
+            const attemptsCount = this.#getTaskAttemptsCount(task.id);
+            const ciRepairsCount = this.#getTaskCiRepairsCount(task.id);
+            const authorityObj = parsed(task.authority, {});
+            const maxPubs = authorityObj?.maxPublications ?? budget.maxRemotePublications;
+            const remainingBudget = {
+              remainingRunsInAttempt: Math.max(0, budget.maxPiRunsPerAttempt - (active.runSequence + 1)),
+              remainingAttempts: Math.max(0, budget.maxTotalAttempts - attemptsCount),
+              remainingCiRepairCycles: Math.max(0, budget.maxCiRepairCycles - ciRepairsCount),
+              remainingPublications: Math.max(0, maxPubs - (task.publicationCount ?? 0)),
+            };
+
+            const repairPrompt = buildRepairPrompt({
+              taskId: task.id,
+              attemptNumber: active.attemptId,
+              goal: task.goal,
+              taskBranch: task.taskBranch,
+              taskWorktree: task.taskWorktree,
+              baseCommit: task.baseCommit,
+              candidateSha: recordedCandidateSha,
+              completionContract: parsed(task.completionContract),
+              failingGate: gateResult,
+              priorFailureDetail: `Local gate '${gateResult.criterion}' failed (${gateResult.exitCategory}, exit code ${gateResult.exitCode}).`,
+              remainingBudget,
+            });
+
+            const nextSequence = active.runSequence + 1;
+            this.#allocateContinuationRun(active, repairPrompt, nextSequence, "local_repair");
+            let acknowledgement;
+            try {
+              acknowledgement = await active.worker.prompt(repairPrompt);
+            } catch (error) {
+              if (error?.code === "PROMPT_REJECTED") {
+                this.#abortContinuationRun(active, error.message);
+              } else {
+                await this.#handleAmbiguousContinuation(active, error);
+              }
+              return;
+            }
+
+            const ackStatus = continuationAcknowledgementStatus(acknowledgement);
+            if (ackStatus === "accepted") {
+              if (this.#acceptContinuationRun(active, nextSequence)) {
+                const pending = active.pendingEvents;
+                active.pendingEvents = [];
+                for (const item of pending)
+                  this.handleWorkerEvent(active, item?.event ?? item, item?.metadata);
+                active.previousRun = null;
+                return;
+              }
+            } else if (ackStatus === "rejected") {
+              this.#abortContinuationRun(active, "Fresh Executor rejected the repair prompt.");
+            } else {
+              await this.#handleAmbiguousContinuation(
+                active,
+                new Error("Fresh Executor repair prompt acknowledgement was not explicit."),
+              );
+              return;
+            }
+          }
+
           const retired = await this.retireWorker(
             active.worker,
             active.workerMetadata,
           );
           if (this.active !== active || active.stopRequested) return;
-          if (!retired || !gateRetired || gateResult.processTerminated !== true) {
+          if (!retired) {
             this.#verificationFailure(active, {
               state: "blocked",
-              reason:
-                gateResult.processTerminated !== true
-                  ? "gate_termination_ambiguous"
-                  : "worker_retirement_ambiguous",
-              detail:
-                gateResult.processTerminated !== true
-                  ? "Required local gate failed and its process could not be safely retired."
-                  : "Required local gate failed and the Fresh Executor could not be safely retired.",
+              reason: "worker_retirement_ambiguous",
+              detail: "Required local gate failed and the Fresh Executor could not be safely retired.",
               observedCandidateSha,
               recordedCandidateSha,
               finalBranchHead:
@@ -6141,8 +6624,10 @@ export class RuntimeStore {
             return;
           }
           this.#verificationFailure(active, {
-            reason: "local_gate_failed",
-            detail: `Required local gate failed: ${gateResult.criterion} (${gateResult.exitCategory}).`,
+            reason: active.runSequence >= budget.maxPiRunsPerAttempt ? "budget_exhausted" : "local_gate_failed",
+            detail: active.runSequence >= budget.maxPiRunsPerAttempt
+              ? `Task attempt run budget exhausted (${active.runSequence} runs) after local gate failed.`
+              : `Required local gate failed: ${gateResult.criterion} (${gateResult.exitCategory}).`,
             observedCandidateSha,
             recordedCandidateSha,
             finalBranchHead:
@@ -6390,7 +6875,7 @@ export class RuntimeStore {
     return { task, current, nextSequence };
   }
 
-  #allocateContinuationRun(active, prompt, sequence) {
+  #allocateContinuationRun(active, prompt, sequence, kind = "continue") {
     const timestamp = now();
     this.db.exec("BEGIN");
     try {
@@ -6404,10 +6889,11 @@ export class RuntimeStore {
         .prepare(`INSERT INTO attempt_runs (
           attempt_id, sequence, kind, control_version, contract_version,
           prompt_digest, state, evidence_refs, started_at
-        ) VALUES (?, ?, 'continue', ?, ?, ?, 'pending', '[]', ?)`)
+        ) VALUES (?, ?, ?, ?, ?, ?, 'pending', '[]', ?)`)
         .run(
           active.attemptId,
           sequence,
+          kind,
           active.controlVersion,
           active.contractVersion,
           promptDigest(prompt),
