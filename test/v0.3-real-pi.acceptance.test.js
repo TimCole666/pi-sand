@@ -388,7 +388,7 @@ async function runAcceptance(t) {
     assert.equal(completed.attempts[0].provider, model.provider);
     assert.equal(completed.attempts[0].modelId, model.id);
     assert.equal(completed.attempts[0].thinkingLevel, thinkingLevel);
-    assert.equal(completed.attempts[0].terminalDetail, "Fresh Executor settled successfully.");
+    assert.equal(completed.attempts[0].terminalDetail, "Task completed after all required local gates passed.");
     assert.ok(completed.finalResult);
     assert.ok(completed.finalResult.length <= 4 * 1024);
     assert.equal(completed.finalBranchHead, completed.attempts[0].finalBranchHead);

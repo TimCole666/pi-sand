@@ -4538,6 +4538,19 @@ export class RuntimeStore {
       )
       .run(nowIso, nextReconcileIso, effectiveDeadlineIso, id);
 
+    // A public reconciliation may record a terminal provider observation, but
+    // it never receives the private trigger capability. Nudge the daemon-owned
+    // reactor to consume that durable observation instead of leaving a
+    // terminal wait parked until its ordinary polling interval. The reactor's
+    // exact-SHA/version/evidence fences and trigger CAS remain the only path
+    // that can allocate a continuation or complete the Task.
+    if (
+      capability !== WAIT_RECONCILE_CAPABILITY &&
+      ["success", "failure", "ci_not_observable"].includes(classification)
+    ) {
+      this.#wakeWaitReactor();
+    }
+
     return {
       task: this.getTask(subscription.taskId),
       waitSubscription: this.getWaitSubscription(id),
@@ -5634,6 +5647,17 @@ export class RuntimeStore {
         ? { ...subscriptionIdOrOptions, ...options }
         : options;
     return this.reconcileWaitSubscription(id, opts);
+  }
+
+  #wakeWaitReactor() {
+    if (!this.waitReactorEnabled || this.closed || !this.db) return;
+    if (this.waitReactorRunning) {
+      this.waitReactorRequested = true;
+      return;
+    }
+    if (this.waitReactorTimer) this.waitTimer.clearTimeout(this.waitReactorTimer);
+    this.waitReactorTimer = null;
+    void this.#runWaitReactor();
   }
 
   #scheduleWaitReactor() {
