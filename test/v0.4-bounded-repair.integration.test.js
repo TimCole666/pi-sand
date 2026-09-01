@@ -29,6 +29,15 @@ async function eventually(read, predicate, timeoutMs = 2_000) {
   throw new Error("timed out waiting for condition");
 }
 
+async function eventuallyImmediate(read, predicate, attempts = 100) {
+  for (let index = 0; index < attempts; index += 1) {
+    const value = await read();
+    if (predicate(value)) return value;
+    await new Promise((resolveNext) => setImmediate(resolveNext));
+  }
+  throw new Error("timed out waiting for condition without a timer sleep");
+}
+
 async function repository(parent) {
   const source = join(parent, "source");
   const remote = join(parent, "fixture", "repository.git");
@@ -148,6 +157,8 @@ async function fixture({
   gitHubAdapter,
   completionContract,
   budget,
+  attemptClock,
+  attemptTimer,
 } = {}) {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-bounded-repair-"));
   const { source, remote, base } = await repository(parent);
@@ -172,6 +183,8 @@ async function fixture({
     workerRetireTimeoutMs: workerRetireTimeoutMs ?? 50,
     remoteTransport: transport,
     gitHubAdapter: fakeGitHub,
+    attemptClock,
+    attemptTimer,
   });
   const task = await runtime.createTask({
     cwd: source,
@@ -297,9 +310,78 @@ test("1. local gate fail -> same Attempt repair run -> gate pass -> completion",
 });
 
 // -----------------------------------------------------------------------------
-// Scenario 2: local repair hits same fingerprint twice/no progress → stops with stalled/failed
+// Scenario 2: acknowledged same-turn repair events cross the finalization boundary
 // -----------------------------------------------------------------------------
-test("2. local repair hits same fingerprint twice/no progress -> stops with stalled/failed instead of infinite re-prompt", async () => {
+test("2. same-turn repair events are buffered after acknowledgement and stale Run1 output is ignored", async () => {
+  let emitEvent = null;
+  let promptCalls = 0;
+  const workerFactory = async ({ cwd, onEvent }) => {
+    emitEvent = onEvent;
+    await writeFile(join(cwd, "candidate.txt"), "initial\n");
+    onEvent({ type: "agent_start" });
+    onEvent({
+      type: "message_end",
+      message: { role: "assistant", content: "Run1", stopReason: "stop" },
+    });
+    onEvent({ type: "agent_settled" });
+    return {
+      callbacksAttached: true,
+      executionSnapshot: { sessionId: "same-turn-session" },
+      sessionId: "same-turn-session",
+      prompt() {
+        promptCalls += 1;
+        return Promise.resolve().then(async () => {
+          await writeFile(join(cwd, "pass.txt"), "fixed\n");
+          // These events are late Run1 output. The real Fresh Executor marks
+          // them as pre-acknowledgement; the fake also supplies a stale
+          // agent_start to prove it cannot consume a fresh Pi turn.
+          emitEvent({ type: "agent_start" }, { promptAcknowledged: false });
+          emitEvent({
+            type: "message_end",
+            message: { role: "assistant", content: "stale Run1", stopReason: "stop" },
+          });
+          emitEvent({ type: "agent_settled" });
+          // The fresh run is emitted in the same turn as the acknowledgement.
+          emitEvent({ type: "agent_start" });
+          emitEvent({
+            type: "message_end",
+            message: { role: "assistant", content: "Run2", stopReason: "stop" },
+          });
+          emitEvent({ type: "agent_settled" });
+          return { accepted: true };
+        });
+      },
+      close() {},
+    };
+  };
+  const value = await fixture({
+    workerFactory,
+    completionContract: {
+      objective: "same-turn repair",
+      localGates: [{
+        id: "pass-after-repair",
+        command: [process.execPath, "-e", "if (!require('node:fs').existsSync('pass.txt')) process.exit(1)"],
+      }],
+    },
+  });
+  try {
+    const completed = await eventually(
+      () => value.runtime.getTask(value.task.id),
+      (task) => task.state === "completed",
+    );
+    assert.equal(promptCalls, 1);
+    assert.equal(completed.finalResult, "Run2");
+    assert.equal(completed.attempts[0].attemptRuns.length, 2);
+    assert.equal(completed.attempts[0].piTurns, 2);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Scenario 3: local repair hits same fingerprint twice/no progress → stops with stalled/failed
+// -----------------------------------------------------------------------------
+test("3. local repair hits same fingerprint twice/no progress -> stops with stalled/failed instead of infinite re-prompt", async () => {
   let promptCalls = 0;
   let emitEvent = null;
 
@@ -375,9 +457,9 @@ test("2. local repair hits same fingerprint twice/no progress -> stops with stal
 });
 
 // -----------------------------------------------------------------------------
-// Scenario 3: CI R fails → fresh repair Attempt → R2 → fast-forward publish → exact R2 green → completion
+// Scenario 4: CI R fails → fresh repair Attempt → R2 → fast-forward publish → exact R2 green → completion
 // -----------------------------------------------------------------------------
-test("3. CI R fails -> fresh repair Attempt -> R2 -> fast-forward publish -> exact R2 green -> completion", async () => {
+test("4. CI R fails -> fresh repair Attempt -> R2 -> fast-forward publish -> exact R2 green -> completion", async () => {
   let attemptSpawns = [];
   const workerFactory = async ({ onEvent, taskPrompt }) => {
     attemptSpawns.push(taskPrompt);
@@ -478,9 +560,9 @@ test("3. CI R fails -> fresh repair Attempt -> R2 -> fast-forward publish -> exa
 });
 
 // -----------------------------------------------------------------------------
-// Scenario 4: R1 fail → R2 fail → R3 fail reaches CI repair/publication budget and no R4 is created
+// Scenario 5: R1 fail → R2 fail → R3 fail reaches CI repair/publication budget and no R4 is created
 // -----------------------------------------------------------------------------
-test("4. R1 fail -> R2 fail -> R3 fail reaches CI repair/publication budget and no R4 is created", async () => {
+test("5. R1 fail -> R2 fail -> R3 fail reaches CI repair/publication budget and no R4 is created", async () => {
   const workerFactory = async ({ onEvent }) => {
     onEvent({
       type: "message_end",
@@ -567,9 +649,9 @@ test("4. R1 fail -> R2 fail -> R3 fail reaches CI repair/publication budget and 
 });
 
 // -----------------------------------------------------------------------------
-// Scenario 5: startup failures consume startup/total Attempt budget but not CI repair cycle
+// Scenario 6: startup failures consume startup/total Attempt budget but not CI repair cycle
 // -----------------------------------------------------------------------------
-test("5. startup failures consume startup/total Attempt budget but not CI repair cycle", async () => {
+test("6. startup failures consume startup/total Attempt budget but not CI repair cycle", async () => {
   let spawnCount = 0;
   const workerFactory = async () => {
     spawnCount += 1;
@@ -629,9 +711,9 @@ test("5. startup failures consume startup/total Attempt budget but not CI repair
 });
 
 // -----------------------------------------------------------------------------
-// Scenario 6: daemon restart preserves budget counters/fingerprints
+// Scenario 7: daemon restart preserves budget counters/fingerprints
 // -----------------------------------------------------------------------------
-test("6. daemon restart preserves budget counters/fingerprints", async () => {
+test("7. daemon restart preserves budget counters/fingerprints", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-restart-budget-"));
   const { source } = await repository(parent);
   const dbPath = join(parent, "runtime.sqlite");
@@ -741,9 +823,9 @@ test("6. daemon restart preserves budget counters/fingerprints", async () => {
 });
 
 // -----------------------------------------------------------------------------
-// Scenario 7: wall-clock/CI deadline expiry performs final reconciliation first (if green offline, completes)
+// Scenario 8: wall-clock/CI deadline expiry performs final reconciliation first (if green offline, completes)
 // -----------------------------------------------------------------------------
-test("7. wall-clock/CI deadline expiry performs final reconciliation first (if green offline, completes)", async () => {
+test("8. wall-clock/CI deadline expiry performs final reconciliation first (if green offline, completes)", async () => {
   const value = await fixture({
     completionContract: {
       objective: "pass required CI checks",
@@ -807,9 +889,9 @@ test("7. wall-clock/CI deadline expiry performs final reconciliation first (if g
 });
 
 // -----------------------------------------------------------------------------
-// Scenario 8: unsafe same-Attempt context gets a bounded fresh local repair
+// Scenario 9: unsafe same-Attempt context gets a bounded fresh local repair
 // -----------------------------------------------------------------------------
-test("8. unsafe same-Attempt context allocates one fresh local repair Attempt", async () => {
+test("9. unsafe same-Attempt context allocates one fresh local repair Attempt", async () => {
   let workerCount = 0;
   const workerFactory = async ({ cwd, onEvent }) => {
     workerCount += 1;
@@ -856,9 +938,9 @@ test("8. unsafe same-Attempt context allocates one fresh local repair Attempt", 
 });
 
 // -----------------------------------------------------------------------------
-// Scenario 9: expired CI wait fails only after the final exact reconciliation
+// Scenario 10: expired CI wait fails only after the final exact reconciliation
 // -----------------------------------------------------------------------------
-test("9. expired CI wait produces one durable external-timeout Result after final reconciliation", async () => {
+test("10. expired CI wait produces one durable external-timeout Result after final reconciliation", async () => {
   const value = await fixture({
     completionContract: {
       objective: "observe required CI",
@@ -904,11 +986,11 @@ test("9. expired CI wait produces one durable external-timeout Result after fina
 });
 
 // -----------------------------------------------------------------------------
-// Scenario 10: worker/model cannot mutate/increase its own budget
+// Scenario 11: worker/model cannot mutate/increase its own budget
 // -----------------------------------------------------------------------------
-test("10. worker/model cannot mutate/increase its own budget", async () => {
+test("11. worker/model cannot mutate/increase its own budget", async () => {
   const initialBudget = {
-    maxTotalAttempts: 2,
+    maxTotalAttempts: 99,
     maxCodeProducingAttempts: 2,
     maxRemotePublications: 1,
     maxPiRunsPerAttempt: 2,
@@ -922,7 +1004,7 @@ test("10. worker/model cannot mutate/increase its own budget", async () => {
     assert.equal(normalizeBudget({ maxTotalAttempts: 99 }).maxTotalAttempts, DEFAULT_BUDGET.maxTotalAttempts);
     const task = value.runtime.getTask(value.task.id);
     const storedBudget = normalizeBudget(task.budget);
-    assert.equal(storedBudget.maxTotalAttempts, 2);
+    assert.equal(storedBudget.maxTotalAttempts, DEFAULT_BUDGET.maxTotalAttempts);
     assert.equal(storedBudget.maxRemotePublications, 1);
     assert.equal(storedBudget.maxPiRunsPerAttempt, 2);
 
@@ -931,7 +1013,7 @@ test("10. worker/model cannot mutate/increase its own budget", async () => {
       .prepare("SELECT budget FROM tasks WHERE id = ?")
       .get(value.task.id).budget;
     const parsedRaw = JSON.parse(rawBudget);
-    assert.equal(parsedRaw.maxTotalAttempts, 2);
+    assert.equal(parsedRaw.maxTotalAttempts, DEFAULT_BUDGET.maxTotalAttempts);
     assert.equal(parsedRaw.maxRemotePublications, 1);
 
     // Publish candidate 1 (allowed by budget = 1)
@@ -944,6 +1026,212 @@ test("10. worker/model cannot mutate/increase its own budget", async () => {
       value.runtime.publishTask({ id: value.task.id, candidateSha: r2 }),
       /Remote publication budget exhausted/i,
     );
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Scenario 12: unsafe local repair without a reusable session gets a fresh Attempt
+// -----------------------------------------------------------------------------
+test("12. local repair without a session allocates a fresh Attempt", async () => {
+  let workerCount = 0;
+  const value = await fixture({
+    completionContract: {
+      objective: "fresh repair without a session",
+      localGates: [{
+        id: "pass-after-fresh-repair",
+        command: [
+          process.execPath,
+          "-e",
+          "if (!require('node:fs').existsSync('pass.txt')) process.exit(1)",
+        ],
+      }],
+    },
+    workerFactory: async ({ cwd, onEvent }) => {
+      workerCount += 1;
+      if (workerCount === 2) await writeFile(join(cwd, "pass.txt"), "fixed\\n");
+      onEvent({
+        type: "message_end",
+        message: { role: "assistant", content: `run ${workerCount}`, stopReason: "stop" },
+      });
+      onEvent({ type: "agent_settled" });
+      return { callbacksAttached: true, close() {} };
+    },
+  });
+  try {
+    const completed = await eventually(
+      () => value.runtime.getTask(value.task.id),
+      (task) => task.state === "completed",
+      5_000,
+    );
+    assert.equal(workerCount, 2);
+    assert.equal(completed.attempts.length, 2);
+    assert.equal(completed.attempts[0].state, "failed");
+    assert.equal(completed.attempts[1].state, "completed");
+    assert.equal(completed.terminalReason, "verified_local");
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Scenario 13: maxPiTurnsPerAttempt is durable and produces a bounded Result
+// -----------------------------------------------------------------------------
+test("13. per-Attempt Pi turn budget terminates a repeated run", async () => {
+  let emitEvent = null;
+  const value = await fixture({
+    budget: { maxPiTurnsPerAttempt: 1 },
+    completionContract: {
+      objective: "turn budget",
+      localGates: [{ id: "always-fail", command: [process.execPath, "-e", "process.exit(1)"] }],
+    },
+    workerFactory: async ({ onEvent }) => {
+      emitEvent = onEvent;
+      onEvent({ type: "agent_start" });
+      onEvent({ type: "message_end", message: { role: "assistant", content: "first", stopReason: "stop" } });
+      onEvent({ type: "agent_settled" });
+      return {
+        callbacksAttached: true,
+        executionSnapshot: { sessionId: "turn-budget-session" },
+        sessionId: "turn-budget-session",
+        prompt: async () => {
+          emitEvent({ type: "agent_start" });
+          emitEvent({ type: "message_end", message: { role: "assistant", content: "second", stopReason: "stop" } });
+          emitEvent({ type: "agent_settled" });
+          return { accepted: true };
+        },
+        close() {},
+      };
+    },
+  });
+  try {
+    const failed = await eventuallyImmediate(
+      () => value.runtime.getTask(value.task.id),
+      (task) => task.state === "failed",
+    );
+    assert.equal(failed.terminalReason, "budget_exhausted");
+    assert.equal(failed.attempts[0].piTurns, 1);
+    assert.equal(value.runtime.db.prepare("SELECT COUNT(*) AS count FROM result_deliveries WHERE task_id = ?").get(value.task.id).count, 1);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Scenario 14: retry allocation fences total, startup, code, and escalation budgets
+// -----------------------------------------------------------------------------
+test("14. retryTask fences every fresh-Attempt budget before allocation", async () => {
+  const cases = [
+    ["total", { maxTotalAttempts: 1 }, "total attempt budget"],
+    ["startup", { maxStartupFailures: 1 }, "startup failure budget"],
+  ];
+  for (const [, budget, pattern] of cases) {
+    const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-retry-budget-"));
+    const { source } = await repository(parent);
+    const runtime = new RuntimeStore({
+      dbPath: join(parent, "runtime.sqlite"),
+      piCommand: await versionCommand(parent),
+      workerFactory: async () => { throw new Error("startup failure"); },
+      worktreeRoot: join(parent, "worktrees"),
+    });
+    try {
+      await assert.rejects(runtime.createTask({
+        cwd: source,
+        goal: `retry ${pattern}`,
+        trusted: true,
+        model: { provider: "anthropic", id: "model" },
+        thinkingLevel: "low",
+        budget,
+      }));
+      const task = runtime.listTasks()[0];
+      await assert.rejects(runtime.retryTask({
+        id: task.id,
+        trusted: true,
+        model: { provider: "anthropic", id: "model" },
+        thinkingLevel: "low",
+      }), new RegExp(pattern, "i"));
+      assert.equal(runtime.getTask(task.id).attempts.length, 1);
+    } finally {
+      runtime.close();
+      await rm(parent, { recursive: true, force: true });
+    }
+  }
+
+  const value = await fixture({
+    budget: { maxCodeProducingAttempts: 1, maxModelOrThinkingEscalations: 0 },
+    completionContract: {
+      objective: "code and escalation budgets",
+      localGates: [{ id: "fail", command: [process.execPath, "-e", "process.exit(1)"] }],
+    },
+  });
+  try {
+    const failed = await eventuallyImmediate(
+      () => value.runtime.getTask(value.task.id),
+      (task) => task.state === "failed",
+    );
+    assert.equal(failed.attempts.length, 1);
+    await assert.rejects(value.runtime.retryTask({
+      id: value.task.id,
+      trusted: true,
+      model: { provider: "other", id: "other-model" },
+      thinkingLevel: "high",
+    }), /code-producing attempt budget/i);
+  } finally {
+    await closeFixture(value);
+  }
+
+  const escalation = await fixture({
+    budget: { maxCodeProducingAttempts: 3, maxModelOrThinkingEscalations: 0 },
+    completionContract: {
+      objective: "escalation budget",
+      localGates: [{ id: "fail", command: [process.execPath, "-e", "process.exit(1)"] }],
+    },
+  });
+  try {
+    await eventually(
+      () => escalation.runtime.getTask(escalation.task.id),
+      (task) => task.state === "failed",
+    );
+    await assert.rejects(escalation.runtime.retryTask({
+      id: escalation.task.id,
+      trusted: true,
+      model: { provider: "other", id: "other-model" },
+      thinkingLevel: "high",
+    }), /model\/thinking escalation budget/i);
+  } finally {
+    await closeFixture(escalation);
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Scenario 15: a worker that never settles is terminated by the injected watchdog
+// -----------------------------------------------------------------------------
+test("15. active Attempt watchdog durably fails a never-settling worker", async () => {
+  let watchdogCallback = null;
+  const timer = {
+    setTimeout(callback) {
+      watchdogCallback = callback;
+      return { unref() {} };
+    },
+    clearTimeout() {},
+  };
+  const value = await fixture({
+    attemptTimer: timer,
+    attemptClock: () => Date.now(),
+    budget: { maxActiveAttemptDurationMs: 0 },
+    workerFactory: async () => ({ callbacksAttached: true, close() {} }),
+  });
+  try {
+    assert.equal(typeof watchdogCallback, "function");
+    watchdogCallback();
+    const failed = await eventuallyImmediate(
+      () => value.runtime.getTask(value.task.id),
+      (task) => task.state === "failed",
+    );
+    assert.equal(failed.terminalReason, "external_timeout");
+    assert.equal(failed.attempts[0].workerTerminated, true);
+    assert.equal(value.runtime.db.prepare("SELECT COUNT(*) AS count FROM result_deliveries WHERE task_id = ?").get(value.task.id).count, 1);
   } finally {
     await closeFixture(value);
   }

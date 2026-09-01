@@ -218,7 +218,7 @@ const ATTEMPT_SELECT = `SELECT id, task_id AS taskId, number, applied_provider A
   gate_pid AS gatePid, gate_pgid AS gatePgid, gate_start_identity AS gateStartIdentity,
   gate_boot_id AS gateBootId, gate_state AS gateState, gate_terminated AS gateTerminated,
   final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead,
-  shutdown_reason AS shutdownReason, resume_wait_id AS resumeWaitId, cause
+  pi_turn_count AS piTurns, shutdown_reason AS shutdownReason, resume_wait_id AS resumeWaitId, cause
   FROM attempts`;
 const ATTEMPT_RUN_SELECT = `SELECT attempt_id AS attemptId, sequence, kind,
   control_version AS controlVersion, contract_version AS contractVersion,
@@ -935,6 +935,7 @@ function attemptSnapshot(row, attemptRuns = []) {
     workerTerminated: row.workerTerminated === 1,
     workerStartIdentity: row.workerStartIdentity ?? null,
     workerBootId: row.workerBootId ?? null,
+    piTurns: Number(row.piTurns ?? 0),
     gatePid: row.gatePid ?? null,
     gatePgid: row.gatePgid ?? null,
     gateStartIdentity: row.gateStartIdentity ?? null,
@@ -1449,6 +1450,8 @@ export class RuntimeStore {
     waitClock = () => Date.now(),
     waitTimer = globalThis,
     waitObserver,
+    attemptClock = () => Date.now(),
+    attemptTimer = globalThis,
   } = {}) {
     this.dbPath = dbPath;
     this.piCommand = piCommand;
@@ -1485,6 +1488,13 @@ export class RuntimeStore {
     )
       throw new Error("Wait reactor timer must provide setTimeout and clearTimeout.");
     this.waitObserver = waitObserver ?? null;
+    this.attemptClock = typeof attemptClock === "function" ? attemptClock : () => Date.now();
+    this.attemptTimer = attemptTimer ?? globalThis;
+    if (
+      typeof this.attemptTimer.setTimeout !== "function" ||
+      typeof this.attemptTimer.clearTimeout !== "function"
+    )
+      throw new Error("Attempt watchdog timer must provide setTimeout and clearTimeout.");
     this.waitReactorEnabled = false;
     this.waitReactorTimer = null;
     this.waitReactorRunning = false;
@@ -1524,6 +1534,10 @@ export class RuntimeStore {
     if (!attemptColumns.has("worker_terminated"))
       this.db.exec(
         "ALTER TABLE attempts ADD COLUMN worker_terminated INTEGER NOT NULL DEFAULT 1",
+      );
+    if (!attemptColumns.has("pi_turn_count"))
+      this.db.exec(
+        "ALTER TABLE attempts ADD COLUMN pi_turn_count INTEGER NOT NULL DEFAULT 0",
       );
     for (const [name, type] of [
       ["gate_pid", "INTEGER"],
@@ -1571,6 +1585,7 @@ export class RuntimeStore {
             started_at TEXT NOT NULL, finished_at TEXT, worker_pid INTEGER, worker_pgid INTEGER,
             worker_start_identity TEXT, worker_boot_id TEXT,
             worker_terminated INTEGER NOT NULL DEFAULT 1,
+            pi_turn_count INTEGER NOT NULL DEFAULT 0,
             gate_pid INTEGER, gate_pgid INTEGER, gate_start_identity TEXT, gate_boot_id TEXT,
             gate_state TEXT NOT NULL DEFAULT 'none' CHECK(gate_state IN ('none', 'running', 'terminated', 'ambiguous')),
             gate_terminated INTEGER NOT NULL DEFAULT 1,
@@ -1583,12 +1598,12 @@ export class RuntimeStore {
           INSERT INTO attempts (id, task_id, number, provider, model_id, thinking_level, state, started_at,
             finished_at, worker_pid, worker_pgid, worker_start_identity, worker_boot_id, worker_terminated,
             gate_pid, gate_pgid, gate_start_identity, gate_boot_id, gate_state, gate_terminated,
-            final_result, terminal_detail, final_branch_head, shutdown_reason, applied_provider,
+            final_result, terminal_detail, final_branch_head, shutdown_reason, pi_turn_count, applied_provider,
             applied_model_id, applied_thinking_level)
           SELECT id, task_id, number, provider, model_id, thinking_level, state, started_at,
             finished_at, worker_pid, worker_pgid, worker_start_identity, worker_boot_id, worker_terminated,
             gate_pid, gate_pgid, gate_start_identity, gate_boot_id, gate_state, gate_terminated,
-            final_result, terminal_detail, final_branch_head, shutdown_reason, applied_provider,
+            final_result, terminal_detail, final_branch_head, shutdown_reason, 0, applied_provider,
             applied_model_id, applied_thinking_level
           FROM attempts_legacy;
           DROP TABLE attempts_legacy;
@@ -1886,6 +1901,7 @@ export class RuntimeStore {
           started_at TEXT NOT NULL, finished_at TEXT, worker_pid INTEGER, worker_pgid INTEGER,
           worker_start_identity TEXT, worker_boot_id TEXT,
           worker_terminated INTEGER NOT NULL DEFAULT 1,
+          pi_turn_count INTEGER NOT NULL DEFAULT 0,
           gate_pid INTEGER, gate_pgid INTEGER, gate_start_identity TEXT, gate_boot_id TEXT,
           gate_state TEXT NOT NULL DEFAULT 'none' CHECK(gate_state IN ('none', 'running', 'terminated', 'ambiguous')),
           gate_terminated INTEGER NOT NULL DEFAULT 1,
@@ -3677,6 +3693,7 @@ export class RuntimeStore {
     }
 
     if (this.active?.attemptId === latestAttemptId) {
+      this.#clearAttemptWatchdog(this.active);
       this.active = null;
     }
 
@@ -4552,6 +4569,7 @@ export class RuntimeStore {
         const maxPubs = authorityObj?.maxPublications ?? budget.maxRemotePublications;
         const totalAttempts = this.#getTaskAttemptsCount(taskRow.id);
         const codeAttempts = this.#getTaskCodeAttemptsCount(taskRow.id);
+        const startupFailures = this.#getTaskStartupFailuresCount(taskRow.id);
         const ciRepairs = this.#getTaskCiRepairsCount(taskRow.id);
         const pubCount = Number(taskRow.publicationCount ?? 0);
         const nowTime = new Date(timestamp).getTime();
@@ -4592,6 +4610,9 @@ export class RuntimeStore {
         } else if (codeAttempts >= budget.maxCodeProducingAttempts) {
           terminalReason = "budget_exhausted";
           terminalDetail = `Task code-producing attempt budget (${budget.maxCodeProducingAttempts}) exhausted.`;
+        } else if (startupFailures >= budget.maxStartupFailures) {
+          terminalReason = "budget_exhausted";
+          terminalDetail = `Task startup failure budget (${budget.maxStartupFailures}) exhausted.`;
         }
 
         if (terminalReason) {
@@ -4670,6 +4691,26 @@ export class RuntimeStore {
           .get(taskRow.id);
 
         const nextNumber = Number(lastAttemptRow?.number ?? 1) + 1;
+        effectiveModel = model ?? {
+          provider:
+            lastAttemptRow?.applied_provider ??
+            lastAttemptRow?.provider ??
+            "anthropic",
+          id:
+            lastAttemptRow?.applied_model_id ??
+            lastAttemptRow?.model_id ??
+            "claude-3-5-sonnet",
+        };
+        effectiveThinkingLevel =
+          thinkingLevel ??
+          lastAttemptRow?.applied_thinking_level ??
+          lastAttemptRow?.thinking_level ??
+          "off";
+        this.#assertFreshAttemptBudget(
+          taskRow.id,
+          effectiveModel,
+          effectiveThinkingLevel,
+        );
         const freshAttemptId = randomUUID();
 
         repairDetail =
@@ -4854,6 +4895,27 @@ export class RuntimeStore {
       }));
   }
 
+  #consumePiTurn(active) {
+    const task = this.#taskRow(active.taskId);
+    if (!task) return false;
+    const budget = normalizeBudget(task.budget);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.db
+        .prepare(`UPDATE attempts SET pi_turn_count = pi_turn_count + 1
+          WHERE id = ? AND task_id = ? AND state = 'running'
+          AND pi_turn_count < ?`)
+        .run(active.attemptId, active.taskId, budget.maxPiTurnsPerAttempt);
+      this.db.exec("COMMIT");
+      return result.changes === 1;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+  }
+
   #getTaskAttemptsCount(taskId) {
     const row = this.db
       .prepare("SELECT COUNT(*) AS count FROM attempts WHERE task_id = ?")
@@ -4864,7 +4926,7 @@ export class RuntimeStore {
   #getTaskCodeAttemptsCount(taskId) {
     const row = this.db
       .prepare(
-        "SELECT COUNT(*) AS count FROM attempts WHERE task_id = ? AND (cause IS NULL OR cause IN ('initial', 'continuation', 'repair', 'retry'))",
+        "SELECT COUNT(*) AS count FROM attempts WHERE task_id = ? AND (applied_provider IS NOT NULL OR provider IS NOT NULL)",
       )
       .get(taskId);
     return Number(row?.count ?? 0);
@@ -4879,13 +4941,90 @@ export class RuntimeStore {
     return Number(row?.count ?? 0);
   }
 
+  #getTaskModelOrThinkingEscalationsCount(taskId) {
+    const rows = this.db
+      .prepare(`SELECT applied_provider AS provider, applied_model_id AS modelId,
+        applied_thinking_level AS thinkingLevel FROM attempts
+        WHERE task_id = ? AND applied_provider IS NOT NULL ORDER BY number, id`)
+      .all(taskId);
+    let previous = null;
+    let count = 0;
+    for (const row of rows) {
+      const current = {
+        provider: row.provider,
+        modelId: row.modelId,
+        thinkingLevel: row.thinkingLevel,
+      };
+      if (previous && JSON.stringify(previous) !== JSON.stringify(current)) count++;
+      previous = current;
+    }
+    return count;
+  }
+
+  #getTaskLastAppliedConfiguration(taskId) {
+    return this.db
+      .prepare(`SELECT applied_provider AS provider, applied_model_id AS modelId,
+        applied_thinking_level AS thinkingLevel FROM attempts
+        WHERE task_id = ? AND applied_provider IS NOT NULL ORDER BY number DESC, id DESC LIMIT 1`)
+      .get(taskId) ?? null;
+  }
+
+  #assertFreshAttemptBudget(taskId, model, thinkingLevel) {
+    const task = this.#taskRow(taskId);
+    const budget = normalizeBudget(task?.budget);
+    const attempts = this.#getTaskAttemptsCount(taskId);
+    const codeAttempts = this.#getTaskCodeAttemptsCount(taskId);
+    const startupFailures = this.#getTaskStartupFailuresCount(taskId);
+    if (attempts >= budget.maxTotalAttempts)
+      throw new Error(`Task total attempt budget (${budget.maxTotalAttempts}) exhausted.`);
+    if (codeAttempts >= budget.maxCodeProducingAttempts)
+      throw new Error(`Task code-producing attempt budget (${budget.maxCodeProducingAttempts}) exhausted.`);
+    if (startupFailures >= budget.maxStartupFailures)
+      throw new Error(`Task startup failure budget (${budget.maxStartupFailures}) exhausted.`);
+    const last = this.#getTaskLastAppliedConfiguration(taskId);
+    const escalates = last && (
+      last.provider !== model?.provider ||
+      last.modelId !== model?.id ||
+      last.thinkingLevel !== thinkingLevel
+    );
+    if (
+      escalates &&
+      this.#getTaskModelOrThinkingEscalationsCount(taskId) >=
+        budget.maxModelOrThinkingEscalations
+    )
+      throw new Error(
+        `Task model/thinking escalation budget (${budget.maxModelOrThinkingEscalations}) exhausted.`,
+      );
+  }
+
+  #failActiveForBudget(active, detail, terminalReason = "budget_exhausted") {
+    if (active.budgetFailurePromise) return active.budgetFailurePromise;
+    active.budgetFailurePromise = (async () => {
+      let retired = false;
+      try {
+        retired = await this.retireWorker(active.worker, active.workerMetadata);
+      } catch {}
+      if (this.active !== active || active.stopRequested) return;
+      await this.settle(active, {
+        success: false,
+        result: active.finalAssistant?.result ?? null,
+        detail,
+        terminalReason,
+        checkpoint: false,
+      });
+      if (!retired && this.active === active) {
+        this.markBlocked(active.taskId, active.attemptId, detail);
+      }
+    })();
+    return active.budgetFailurePromise;
+  }
+
   #getTaskStartupFailuresCount(taskId) {
     const row = this.db
       .prepare(
-        `SELECT COUNT(DISTINCT a.id) AS count FROM attempts a
-         LEFT JOIN attempt_runs r ON r.attempt_id = a.id AND r.sequence = 1
+        `SELECT COUNT(*) AS count FROM attempts a
          WHERE a.task_id = ? AND a.state IN ('failed', 'orphaned')
-         AND (r.state IN ('pending', 'aborted') OR a.worker_start_identity IS NULL)`,
+         AND a.provider IS NULL`,
       )
       .get(taskId);
     return Number(row?.count ?? 0);
@@ -5279,8 +5418,8 @@ export class RuntimeStore {
       objective: cleanGoal,
     });
     const storedAuthority = serialized(requestedAuthority, DEFAULT_AUTHORITY);
-    if (budget != null) normalizeBudget(budget);
-    const storedBudget = serialized(budget, {});
+    const normalizedBudget = budget == null ? {} : normalizeBudget(budget);
+    const storedBudget = serialized(normalizedBudget, {});
     const storedReturnRoute = serialized(returnRoute, DEFAULT_RETURN_ROUTE);
     let packet;
     try {
@@ -5450,6 +5589,62 @@ export class RuntimeStore {
     }
   }
 
+  #clearAttemptWatchdog(active) {
+    if (active?.attemptWatchdogTimer == null) return;
+    this.attemptTimer.clearTimeout(active.attemptWatchdogTimer);
+    active.attemptWatchdogTimer = null;
+  }
+
+  #scheduleAttemptWatchdog(active) {
+    this.#clearAttemptWatchdog(active);
+    const task = this.#taskRow(active.taskId);
+    const attempt = this.db
+      .prepare("SELECT started_at AS startedAt FROM attempts WHERE id = ? AND task_id = ?")
+      .get(active.attemptId, active.taskId);
+    const startedAt = new Date(attempt?.startedAt ?? "").getTime();
+    const currentTime = new Date(this.attemptClock()).getTime();
+    const budget = normalizeBudget(task?.budget);
+    const deadline = startedAt + budget.maxActiveAttemptDurationMs;
+    const delay = Number.isFinite(startedAt) && Number.isFinite(currentTime)
+      ? Math.max(0, deadline - currentTime)
+      : 0;
+    active.attemptWatchdogTimer = this.attemptTimer.setTimeout(() => {
+      active.attemptWatchdogTimer = null;
+      void this.#runAttemptWatchdog(active);
+    }, delay);
+    active.attemptWatchdogTimer?.unref?.();
+  }
+
+  async #runAttemptWatchdog(active) {
+    if (this.active !== active || active.stopRequested || active.runSettled) return;
+    const task = this.#taskRow(active.taskId);
+    const attempt = this.db
+      .prepare("SELECT state, started_at AS startedAt FROM attempts WHERE id = ? AND task_id = ?")
+      .get(active.attemptId, active.taskId);
+    const currentTime = new Date(this.attemptClock()).getTime();
+    const startedAt = new Date(attempt?.startedAt ?? "").getTime();
+    const budget = normalizeBudget(task?.budget);
+    if (
+      !attempt ||
+      !task ||
+      !Number.isFinite(currentTime) ||
+      !Number.isFinite(startedAt) ||
+      currentTime - startedAt < budget.maxActiveAttemptDurationMs
+    ) {
+      this.#scheduleAttemptWatchdog(active);
+      return;
+    }
+    if (active.finalizing) {
+      active.attemptWatchdogDue = true;
+      return;
+    }
+    await this.#failActiveForBudget(
+      active,
+      "Task active Attempt duration expired.",
+      "external_timeout",
+    );
+  }
+
   async launchAttempt({
     task,
     attemptId,
@@ -5508,8 +5703,12 @@ export class RuntimeStore {
       workerMetadata: null,
       gateProcess: null,
       gateCancellation: null,
+      attemptWatchdogTimer: null,
+      attemptWatchdogDue: false,
+      budgetFailurePromise: null,
     };
     this.active = active;
+    this.#scheduleAttemptWatchdog(active);
     try {
       assertTaskWorktreeIdentity(task);
       const worker = await this.workerFactory({
@@ -5527,7 +5726,10 @@ export class RuntimeStore {
           active.workerMetadata = this.#recordAttemptWorker(attemptId, worker);
         },
       });
-      if (this.active !== active) return this.getTask(task.id);
+      if (this.active !== active) {
+        await this.retireWorker(worker, workerMetadata(worker));
+        return this.getTask(task.id);
+      }
       active.worker = worker;
       const workerSnapshot = worker?.executionSnapshot;
       active.executionSnapshot = workerSnapshot
@@ -5617,7 +5819,20 @@ export class RuntimeStore {
   }
 
   handleWorkerEvent(active, event, metadata = null) {
-    if (this.active !== active || active.finalizing || active.runSettled || active.promptAmbiguous) return;
+    if (this.active !== active || active.runSettled || active.promptAmbiguous) return;
+    if (active.budgetFailurePromise) return;
+    if (
+      active.runPromptInFlight &&
+      event?.type !== "session" &&
+      event?.type !== "executor_error"
+    ) {
+      // Buffer the complete in-flight stream. The acknowledgement is the
+      // durable boundary; the drain below discards late Run1 output until the
+      // first fresh agent_start, even when a test worker supplies no metadata.
+      active.pendingEvents.push({ event, metadata });
+      return;
+    }
+    if (active.finalizing) return;
     if (!active.worker) {
       active.pendingEvents.push({ event, metadata });
       return;
@@ -5680,10 +5895,23 @@ export class RuntimeStore {
       // Pi RPC has no request/run id on ordinary events. The first fresh
       // agent_start after an acknowledged continuation is the only supported
       // boundary; all other pre-boundary output is ignored fail-closed.
-      if (event?.type !== "agent_start") return;
+      if (
+        event?.type !== "agent_start" ||
+        metadata?.promptAcknowledged === false
+      )
+        return;
       active.awaitingAgentStart = false;
     }
-    if (event?.type === "agent_start") active.settled = false;
+    if (event?.type === "agent_start") {
+      if (!this.#consumePiTurn(active)) {
+        this.#failActiveForBudget(
+          active,
+          "Task per-Attempt Pi turn budget exhausted.",
+        );
+        return;
+      }
+      active.settled = false;
+    }
     const outcome = assistantOutcome(event);
     if (outcome) active.finalAssistant = outcome;
     if (event?.type === "agent_settled") active.settled = true;
@@ -5967,7 +6195,7 @@ export class RuntimeStore {
           kind: "git_identity",
           subject: candidateSha,
           payload: evidencePayload,
-          dedupeKey: `git_identity:${active.taskId}:${active.attemptId}:${active.runSequence}:${candidateSha}`,
+          dedupeKey: `git_identity:${active.taskId}:${candidateSha}`,
         }),
       );
       this.#linkEvidence(active, evidenceIds);
@@ -5985,9 +6213,11 @@ export class RuntimeStore {
     const budget = normalizeBudget(task.budget);
     const attemptsCount = this.#getTaskAttemptsCount(task.id);
     const codeAttemptsCount = this.#getTaskCodeAttemptsCount(task.id);
+    const startupFailuresCount = this.#getTaskStartupFailuresCount(task.id);
     if (
       attemptsCount >= budget.maxTotalAttempts ||
-      codeAttemptsCount >= budget.maxCodeProducingAttempts
+      codeAttemptsCount >= budget.maxCodeProducingAttempts ||
+      startupFailuresCount >= budget.maxStartupFailures
     )
       return false;
 
@@ -6026,6 +6256,10 @@ export class RuntimeStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const freshTask = this.#taskRow(task.id);
+      this.#assertFreshAttemptBudget(task.id, {
+        provider: active.provider,
+        id: active.modelId,
+      }, active.thinkingLevel);
       if (
         !freshTask ||
         freshTask.latestAttemptId !== active.attemptId ||
@@ -6087,7 +6321,10 @@ export class RuntimeStore {
       throw error;
     }
 
-    if (this.active === active) this.active = null;
+    if (this.active === active) {
+      this.#clearAttemptWatchdog(active);
+      this.active = null;
+    }
     await this.launchAttempt({
       task: {
         id: task.id,
@@ -6334,6 +6571,10 @@ export class RuntimeStore {
   #recordLocalGateEvidence(active, gateResult) {
     const payload = { ...gateResult };
     delete payload.passed;
+    const dedupeKey = `local_gate_result:${active.taskId}:${gateResult.candidateSha}:${gateResult.criterion}:${gateResult.resultDigest}`;
+    const existing = this.db
+      .prepare("SELECT id FROM evidence WHERE dedupe_key = ?")
+      .get(dedupeKey);
     const evidenceId = this.#appendEvidence({
       taskId: active.taskId,
       attemptId: active.attemptId,
@@ -6341,9 +6582,9 @@ export class RuntimeStore {
       kind: "local_gate_result",
       subject: gateResult.candidateSha,
       payload,
-      dedupeKey: `local_gate_result:${active.taskId}:${active.attemptId}:${active.runSequence}:${gateResult.candidateSha}:${gateResult.criterion}`,
+      dedupeKey,
     });
-    return evidenceId;
+    return { evidenceId, isNew: !existing };
   }
 
   #verificationFailure(
@@ -6359,6 +6600,7 @@ export class RuntimeStore {
       evidenceRefs = null,
     },
   ) {
+    this.#clearAttemptWatchdog(active);
     const timestamp = now();
     const finalResult = active.finalAssistant?.result ?? null;
     const revisionFence =
@@ -6506,7 +6748,10 @@ export class RuntimeStore {
       });
       if (!resultId) throw new Error("Completed Task did not produce a Result delivery.");
       this.db.exec("COMMIT");
-      if (this.active === active) this.active = null;
+      if (this.active === active) {
+        this.#clearAttemptWatchdog(active);
+        this.active = null;
+      }
       return true;
     } catch (error) {
       try {
@@ -6529,9 +6774,11 @@ export class RuntimeStore {
       const task = current.task;
       const budget = normalizeBudget(task.budget);
       const attemptStartedAt = new Date(current.attempt.startedAt).getTime();
+      const attemptNow = new Date(this.attemptClock()).getTime();
       if (
         Number.isFinite(attemptStartedAt) &&
-        Date.now() - attemptStartedAt >= budget.maxActiveAttemptDurationMs
+        Number.isFinite(attemptNow) &&
+        attemptNow - attemptStartedAt >= budget.maxActiveAttemptDurationMs
       ) {
         const retired = await this.retireWorker(active.worker, active.workerMetadata);
         if (this.active !== active || active.stopRequested) return;
@@ -6583,19 +6830,22 @@ export class RuntimeStore {
       recordedCandidateSha = candidate.identity.candidateSha;
       for (const gate of gates) {
         if (!this.#supervisorState(active) || active.stopRequested) return;
+        let gateEvidenceIsNew = false;
         const gateResult = await this.#runLocalGate(
           active,
           task,
           recordedCandidateSha,
           gate,
         );
+
         if (this.active !== active || !this.#supervisorState(active) || active.stopRequested)
           return;
         this.db.exec("BEGIN");
         try {
-          const evidenceId = this.#recordLocalGateEvidence(active, gateResult);
-          localGateEvidenceIds.push(evidenceId);
-          this.#linkEvidence(active, [evidenceId]);
+          const gateEvidence = this.#recordLocalGateEvidence(active, gateResult);
+          gateEvidenceIsNew = gateEvidence.isNew;
+          localGateEvidenceIds.push(gateEvidence.evidenceId);
+          this.#linkEvidence(active, [gateEvidence.evidenceId]);
           this.db.exec("COMMIT");
         } catch (error) {
           try {
@@ -6647,7 +6897,7 @@ export class RuntimeStore {
             else break;
           }
 
-          const nowTime = Date.now();
+          const nowTime = new Date(this.attemptClock()).getTime();
           const acceptedTime = new Date(task.acceptedAt || task.createdAt).getTime();
           const wallClockDuration = nowTime - acceptedTime;
 
@@ -6666,8 +6916,8 @@ export class RuntimeStore {
           }
 
           if (
-            consecutiveCount >= budget.maxSameFailureFingerprint ||
-            noProgressIterations >= budget.maxNoProgressSupervisorIterations
+            consecutiveCount + (gateEvidenceIsNew ? 0 : 1) >= budget.maxSameFailureFingerprint ||
+            noProgressIterations + (gateEvidenceIsNew ? 0 : 1) >= budget.maxNoProgressSupervisorIterations
           ) {
             const retired = await this.retireWorker(active.worker, active.workerMetadata);
             if (this.active !== active || active.stopRequested) return;
@@ -6749,6 +6999,11 @@ export class RuntimeStore {
             const ackStatus = continuationAcknowledgementStatus(acknowledgement);
             if (ackStatus === "accepted") {
               if (this.#acceptContinuationRun(active, nextSequence)) {
+                // The old supervisor owns finalization while the prompt is in
+                // flight. Release that boundary before draining events so a
+                // same-turn agent_start/message_end/agent_settled sequence can
+                // schedule the new run's settlement.
+                active.finalizing = false;
                 const pending = active.pendingEvents;
                 active.pendingEvents = [];
                 for (const item of pending)
@@ -6787,22 +7042,15 @@ export class RuntimeStore {
           }
           const attemptsCount = this.#getTaskAttemptsCount(task.id);
           const codeAttemptsCount = this.#getTaskCodeAttemptsCount(task.id);
+          const startupFailuresCount = this.#getTaskStartupFailuresCount(task.id);
           const freshRepairEligible =
-            typeof active.sessionId === "string" &&
-            active.sessionId.length > 0 &&
             !["working_tree_changed", "candidate_changed"].includes(
               gateResult.exitCategory,
             );
-          if (
-            !freshRepairEligible ||
-            attemptsCount >= budget.maxTotalAttempts ||
-            codeAttemptsCount >= budget.maxCodeProducingAttempts
-          ) {
+          if (!freshRepairEligible) {
             this.#verificationFailure(active, {
-              reason: "budget_exhausted",
-              detail: attemptsCount >= budget.maxTotalAttempts
-                ? `Task total attempt budget (${budget.maxTotalAttempts}) exhausted.`
-                : `Task code-producing attempt budget (${budget.maxCodeProducingAttempts}) exhausted.`,
+              reason: "local_gate_failed",
+              detail: `Required local gate failed: ${gateResult.criterion} (${gateResult.exitCategory}).`,
               observedCandidateSha,
               recordedCandidateSha,
               finalBranchHead:
@@ -6811,13 +7059,45 @@ export class RuntimeStore {
             });
             return;
           }
-          await this.#startFreshLocalRepair(
+          if (
+            attemptsCount >= budget.maxTotalAttempts ||
+            codeAttemptsCount >= budget.maxCodeProducingAttempts ||
+            startupFailuresCount >= budget.maxStartupFailures
+          ) {
+            let detail = `Task startup failure budget (${budget.maxStartupFailures}) exhausted.`;
+            if (attemptsCount >= budget.maxTotalAttempts)
+              detail = `Task total attempt budget (${budget.maxTotalAttempts}) exhausted.`;
+            else if (codeAttemptsCount >= budget.maxCodeProducingAttempts)
+              detail = `Task code-producing attempt budget (${budget.maxCodeProducingAttempts}) exhausted.`;
+            this.#verificationFailure(active, {
+              reason: "budget_exhausted",
+              detail,
+              observedCandidateSha,
+              recordedCandidateSha,
+              finalBranchHead:
+                gateResult.postCandidateSha ?? recordedCandidateSha,
+              workerTerminated: true,
+            });
+            return;
+          }
+          const freshRepairStarted = await this.#startFreshLocalRepair(
             active,
             task,
             gateResult,
             recordedCandidateSha,
             [...candidateEvidenceIds, ...localGateEvidenceIds],
           );
+          if (!freshRepairStarted) {
+            this.#verificationFailure(active, {
+              reason: "budget_exhausted",
+              detail: `Task fresh repair Attempt budget is exhausted.`,
+              observedCandidateSha,
+              recordedCandidateSha,
+              finalBranchHead:
+                gateResult.postCandidateSha ?? recordedCandidateSha,
+              workerTerminated: true,
+            });
+          }
           return;
         }
       }
@@ -6835,9 +7115,11 @@ export class RuntimeStore {
         throw new Error("Task worktree changed during local verification.");
 
       const acceptedAt = new Date(task.acceptedAt || task.createdAt).getTime();
+      const commitmentNow = new Date(this.attemptClock()).getTime();
       if (
         Number.isFinite(acceptedAt) &&
-        Date.now() - acceptedAt >= budget.totalCommitmentWallClockDeadlineMs
+        Number.isFinite(commitmentNow) &&
+        commitmentNow - acceptedAt >= budget.totalCommitmentWallClockDeadlineMs
       ) {
         const retired = await this.retireWorker(active.worker, active.workerMetadata);
         if (this.active !== active || active.stopRequested) return;
@@ -6920,7 +7202,15 @@ export class RuntimeStore {
         }
       }
     } finally {
+      const watchdogDue = active.attemptWatchdogDue;
+      active.attemptWatchdogDue = false;
       active.finalizing = false;
+      if (watchdogDue && this.active === active && !active.stopRequested)
+        void this.#failActiveForBudget(
+          active,
+          "Task active Attempt duration expired.",
+          "external_timeout",
+        );
     }
   }
 
@@ -7267,6 +7557,7 @@ export class RuntimeStore {
         } catch {}
         throw transactionError;
       }
+      this.#clearAttemptWatchdog(active);
       this.active = null;
     })();
     try {
@@ -7346,6 +7637,7 @@ export class RuntimeStore {
       await this.#handleAmbiguousContinuation(active, stale);
       throw stale;
     }
+    active.finalizing = false;
     const pending = active.pendingEvents;
     active.pendingEvents = [];
     for (const item of pending)
@@ -7418,9 +7710,13 @@ export class RuntimeStore {
     return git(worktree, ["rev-parse", "HEAD"]);
   }
 
-  async settle(active, { success, result, detail, checkpoint }) {
+  async settle(
+    active,
+    { success, result, detail, checkpoint, terminalReason = null },
+  ) {
     if (this.active !== active || active.finalizing) return;
     active.finalizing = true;
+    this.#clearAttemptWatchdog(active);
     const task = this.getTask(active.taskId);
     if (!task) return;
     const finalResult =
@@ -7482,7 +7778,7 @@ export class RuntimeStore {
           finalDetail,
           finalBranchHead,
           finalBranchHead,
-          finalDetail,
+          terminalReason ?? finalDetail,
           active.taskId,
         );
       this.db
@@ -7518,7 +7814,7 @@ export class RuntimeStore {
           outcome,
           finalResult,
           terminalDetail: finalDetail,
-          terminalReason: finalDetail,
+          terminalReason: terminalReason ?? finalDetail,
           finalRevision: finalBranchHead,
           finalBranchHead,
         });
@@ -7719,6 +8015,7 @@ export class RuntimeStore {
         );
       }
     }
+    this.#assertFreshAttemptBudget(task.id, model, thinkingLevel);
     const compatibility = checkFreshExecutorCompatibility({
       command: this.piCommand,
       cwd: task.taskWorktree,
@@ -7752,7 +8049,8 @@ export class RuntimeStore {
     });
     const timestamp = now();
     try {
-      this.db.exec("BEGIN");
+      this.db.exec("BEGIN IMMEDIATE");
+      this.#assertFreshAttemptBudget(task.id, model, thinkingLevel);
       this.db
         .prepare(
           "INSERT INTO attempts (id, task_id, number, provider, model_id, thinking_level, state, started_at, worker_terminated, cause) VALUES (?, ?, ?, NULL, NULL, NULL, 'starting', ?, 0, 'retry')",
@@ -7806,6 +8104,7 @@ export class RuntimeStore {
     const active = this.active;
     if (active) {
       active.stopRequested = true;
+      this.#clearAttemptWatchdog(active);
       let gateStopped = this.#cancelLocalGate(active);
       const attempt = this.db
         .prepare(`${ATTEMPT_SELECT} WHERE id = ?`)
@@ -7839,6 +8138,7 @@ export class RuntimeStore {
     try {
       if (active) {
         active.stopRequested = true;
+        this.#clearAttemptWatchdog(active);
         this.#cancelLocalGate(active);
       }
       // A direct release is also a durable ownership boundary. Reconcile any
