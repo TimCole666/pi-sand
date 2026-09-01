@@ -74,7 +74,7 @@ $XDG_RUNTIME_DIR/pi-sand/pi-sand.sock
 
 When `XDG_RUNTIME_DIR` is unavailable, pi-sand uses an owner-specific temporary runtime directory containing the numeric user id. The runtime directory is mode `0700` and the socket is mode `0600`; the runtime database is separate from historical v0.1 Agent/Turn SQLite and is owner-only. IPC is newline-delimited JSON with request ids and protocol version `2`, not HTTP/TCP.
 
-The public runtime method set is exactly `runtime.status`, `task.create`, `task.list`, `task.get`, `task.stop`, `task.retry`, `result.claim`, and `result.ack`. Result delivery uses a durable expiring claim and at-least-once render-before-ack presentation. Mutating requests are not automatically replayed after an ambiguous disconnect. The client reports that the outcome is unknown and directs the user to inspect durable state before trying again. Protocol mismatches fail clearly rather than silently downgrading.
+The public runtime method set is exactly `runtime.status`, `task.create`, `task.list`, `task.get`, `task.stop`, `task.correct`, `task.retry`, `result.claim`, and `result.ack`. `task.correct` is an explicit bounded runtime mutation for replacing the objective/completion contract; it is not a natural-language router or approval system. Result delivery uses a durable expiring claim and at-least-once render-before-ack presentation. Mutating requests are not automatically replayed after an ambiguous disconnect. The client reports that the outcome is unknown and directs the user to inspect durable state before trying again. Protocol mismatches fail clearly rather than silently downgrading.
 
 In the foreground Manager, the Extension commands are:
 

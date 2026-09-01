@@ -20,6 +20,7 @@ export const MUTATION_OUTCOME_UNKNOWN_ERROR =
 const MUTATING_METHODS = new Set([
   "task.create",
   "task.stop",
+  "task.correct",
   "task.retry",
   "result.claim",
   "result.ack",
@@ -117,6 +118,13 @@ export class RuntimeClient {
     const result = await this.request("task.stop", { id });
     if (!result?.task)
       throw new Error("The runtime returned an invalid stopped Task.");
+    return result.task;
+  }
+
+  async correctTask(params) {
+    const result = await this.request("task.correct", params);
+    if (!result?.task)
+      throw new Error("The runtime returned an invalid corrected Task.");
     return result.task;
   }
 

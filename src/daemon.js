@@ -73,6 +73,8 @@ async function handleRequest(request, store) {
       return { task: await store.createTask(params) };
     case "task.stop":
       return { task: await store.stopTask(params.id) };
+    case "task.correct":
+      return { task: await store.correctTask(params) };
     case "task.retry":
       return { task: await store.retryTask(params) };
     case "task.wait":

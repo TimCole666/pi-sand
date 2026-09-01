@@ -212,7 +212,8 @@ const TASK_SELECT = `SELECT id, source_repo_root AS sourceRepoRoot, base_commit 
   terminal_reason AS terminalReason, publication_count AS publicationCount
   FROM tasks`;
 const ATTEMPT_SELECT = `SELECT id, task_id AS taskId, number, applied_provider AS provider, applied_model_id AS modelId,
-  applied_thinking_level AS thinkingLevel, state, started_at AS startedAt, finished_at AS finishedAt,
+  applied_thinking_level AS thinkingLevel, control_version AS controlVersion,
+  contract_version AS contractVersion, state, started_at AS startedAt, finished_at AS finishedAt,
   worker_pid AS workerPid, worker_pgid AS workerPgid, worker_terminated AS workerTerminated,
   worker_start_identity AS workerStartIdentity, worker_boot_id AS workerBootId,
   gate_pid AS gatePid, gate_pgid AS gatePgid, gate_start_identity AS gateStartIdentity,
@@ -938,6 +939,8 @@ function attemptSnapshot(row, attemptRuns = []) {
     provider: row.provider,
     modelId: row.modelId,
     thinkingLevel: row.thinkingLevel,
+    controlVersion: Number(row.controlVersion ?? 1),
+    contractVersion: Number(row.contractVersion ?? 1),
     state: row.state,
     startedAt: row.startedAt,
     finishedAt: row.finishedAt ?? null,
@@ -1460,6 +1463,8 @@ export class RuntimeStore {
     resultClock = () => Date.now(),
     remoteTransport,
     beforeRemotePush,
+    beforeContinuationPrompt,
+    beforeAttemptLaunch,
     gitHubAdapter,
     gitHubClient,
     waitClock = () => Date.now(),
@@ -1494,6 +1499,8 @@ export class RuntimeStore {
     )
       throw new Error("Remote publication transport must provide readRef and push.");
     this.beforeRemotePush = beforeRemotePush;
+    this.beforeContinuationPrompt = beforeContinuationPrompt;
+    this.beforeAttemptLaunch = beforeAttemptLaunch;
     this.gitHubAdapter = gitHubAdapter ?? gitHubClient ?? defaultGitHubAdapter;
     this.waitClock = typeof waitClock === "function" ? waitClock : () => Date.now();
     this.waitTimer = waitTimer ?? globalThis;
@@ -1606,6 +1613,7 @@ export class RuntimeStore {
             gate_terminated INTEGER NOT NULL DEFAULT 1,
             final_result TEXT, terminal_detail TEXT, final_branch_head TEXT, shutdown_reason TEXT,
             applied_provider TEXT, applied_model_id TEXT, applied_thinking_level TEXT,
+            control_version INTEGER NOT NULL DEFAULT 1, contract_version INTEGER NOT NULL DEFAULT 1,
             resume_wait_id TEXT UNIQUE REFERENCES wait_subscriptions(id),
             cause TEXT CHECK(cause IN ('initial', 'continuation', 'repair', 'review', 'retry')),
             UNIQUE(task_id, number)
@@ -1614,12 +1622,12 @@ export class RuntimeStore {
             finished_at, worker_pid, worker_pgid, worker_start_identity, worker_boot_id, worker_terminated,
             gate_pid, gate_pgid, gate_start_identity, gate_boot_id, gate_state, gate_terminated,
             final_result, terminal_detail, final_branch_head, shutdown_reason, pi_turn_count, applied_provider,
-            applied_model_id, applied_thinking_level)
+            applied_model_id, applied_thinking_level, control_version, contract_version)
           SELECT id, task_id, number, provider, model_id, thinking_level, state, started_at,
             finished_at, worker_pid, worker_pgid, worker_start_identity, worker_boot_id, worker_terminated,
             gate_pid, gate_pgid, gate_start_identity, gate_boot_id, gate_state, gate_terminated,
             final_result, terminal_detail, final_branch_head, shutdown_reason, 0, applied_provider,
-            applied_model_id, applied_thinking_level
+            applied_model_id, applied_thinking_level, 1, 1
           FROM attempts_legacy;
           DROP TABLE attempts_legacy;
           CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id, number);
@@ -1654,6 +1662,22 @@ export class RuntimeStore {
     this.db.exec(
       "CREATE UNIQUE INDEX IF NOT EXISTS attempts_resume_wait ON attempts(resume_wait_id)",
     );
+    const refreshedColumns = new Set(
+      this.db
+        .prepare("PRAGMA table_info(attempts)")
+        .all()
+        .map((column) => column.name),
+    );
+    for (const [name, type] of [
+      ["control_version", "INTEGER NOT NULL DEFAULT 1"],
+      ["contract_version", "INTEGER NOT NULL DEFAULT 1"],
+    ]) {
+      if (!refreshedColumns.has(name))
+        this.db.exec(`ALTER TABLE attempts ADD COLUMN ${name} ${type}`);
+    }
+    this.db.exec(`UPDATE attempts SET
+      control_version = COALESCE((SELECT t.control_version FROM tasks AS t WHERE t.id = attempts.task_id), 1),
+      contract_version = COALESCE((SELECT t.contract_version FROM tasks AS t WHERE t.id = attempts.task_id), 1)`);
   }
 
   ensureCommitmentColumns() {
@@ -1922,6 +1946,7 @@ export class RuntimeStore {
           gate_terminated INTEGER NOT NULL DEFAULT 1,
           final_result TEXT, terminal_detail TEXT, final_branch_head TEXT, shutdown_reason TEXT,
           applied_provider TEXT, applied_model_id TEXT, applied_thinking_level TEXT,
+          control_version INTEGER NOT NULL DEFAULT 1, contract_version INTEGER NOT NULL DEFAULT 1,
           resume_wait_id TEXT UNIQUE REFERENCES wait_subscriptions(id),
           cause TEXT CHECK(cause IN ('initial', 'continuation', 'repair', 'review', 'retry')),
           UNIQUE(task_id, number)
@@ -2528,8 +2553,9 @@ export class RuntimeStore {
     const latestConfirmed = this.db
       .prepare(`${REMOTE_EFFECT_SELECT}
         WHERE task_id = ? AND ref = ? AND state = 'confirmed'
+          AND control_version = ? AND contract_version = ?
         ORDER BY confirmed_at DESC, created_at DESC, id DESC LIMIT 1`)
-      .get(taskId, ref);
+      .get(taskId, ref, capturedControlVersion, capturedContractVersion);
     const priorEffect = this.db
       .prepare(`${REMOTE_EFFECT_SELECT}
         WHERE task_id = ? AND ref = ? AND new_oid = ?
@@ -2794,6 +2820,32 @@ export class RuntimeStore {
         effect?.id,
         reservationFailure.code,
         reservationFailure.message,
+      );
+    }
+    // The reservation transaction is not the transmission boundary. Re-read
+    // the Task and effect immediately before handing bytes to the transport so
+    // a committed cancel/correction can refuse a prepared effect.
+    const transmitTask = this.#taskRow(taskId);
+    const transmitEffect = this.#remoteEffectRow(effect.id);
+    if (
+      !transmitTask ||
+      !REMOTE_PUBLICATION_TASK_STATES.has(transmitTask.state) ||
+      Number(transmitTask.controlVersion) !== capturedControlVersion ||
+      Number(transmitTask.contractVersion) !== capturedContractVersion ||
+      !transmitEffect ||
+      !["prepared", "transmitted_unknown"].includes(transmitEffect.state) ||
+      Number(transmitEffect.controlVersion) !== capturedControlVersion ||
+      Number(transmitEffect.contractVersion) !== capturedContractVersion
+    ) {
+      if (transmitEffect?.state === "prepared")
+        this.#updateRemoteEffect(transmitEffect.id, "failed", {
+          detail: "Prepared remote publication was superseded before transmission.",
+          transmitted: false,
+        });
+      throw this.#remotePublicationFailure(
+        effect.id,
+        "stale_remote_publication",
+        "Task control or contract changed before remote publication.",
       );
     }
     try {
@@ -4028,6 +4080,8 @@ export class RuntimeStore {
               waitSubscriptionId: subscription.id,
               taskId: subscription.taskId,
               generation: subscription.generation,
+              controlVersion: subscription.controlVersion,
+              contractVersion: subscription.contractVersion,
               repository: subscription.repositoryId,
               sha: subscription.revisionSha,
               selector,
@@ -4115,6 +4169,8 @@ export class RuntimeStore {
               waitSubscriptionId: subscription.id,
               taskId: subscription.taskId,
               generation: subscription.generation,
+              controlVersion: subscription.controlVersion,
+              contractVersion: subscription.contractVersion,
               repository: subscription.repositoryId,
               sha: subscription.revisionSha,
               selector,
@@ -4307,6 +4363,11 @@ export class RuntimeStore {
         Number(payload?.generation) !== Number(waitRow.generation) ||
         payload?.repository !== waitRow.repositoryId ||
         payload?.sha !== waitRow.revisionSha ||
+        (isProviderObservation &&
+          (payload?.controlVersion == null ||
+            Number(payload.controlVersion) !== Number(waitRow.controlVersion) ||
+            payload?.contractVersion == null ||
+            Number(payload.contractVersion) !== Number(waitRow.contractVersion))) ||
         !requiredChecks.includes(selector) ||
         (isControlObservation &&
           (payload?.controlVersion == null ||
@@ -4878,13 +4939,15 @@ export class RuntimeStore {
           .prepare(
             `INSERT INTO attempts (
               id, task_id, number, provider, model_id, thinking_level,
-              state, started_at, worker_terminated, resume_wait_id, cause
-            ) VALUES (?, ?, ?, NULL, NULL, NULL, 'starting', ?, 0, ?, 'repair')`,
+              control_version, contract_version, state, started_at, worker_terminated, resume_wait_id, cause
+            ) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?, 'starting', ?, 0, ?, 'repair')`,
           )
           .run(
             freshAttemptId,
             taskRow.id,
             nextNumber,
+            taskRow.controlVersion,
+            taskRow.contractVersion,
             timestamp,
             waitRow.id,
           );
@@ -5652,9 +5715,16 @@ export class RuntimeStore {
           timestamp,
         );
       this.db
-        .prepare(`INSERT INTO attempts (id, task_id, number, provider, model_id, thinking_level, state, started_at, worker_terminated, cause)
-        VALUES (?, ?, 1, NULL, NULL, NULL, 'starting', ?, 0, 'initial')`)
-        .run(attemptId, taskId, timestamp);
+        .prepare(`INSERT INTO attempts (id, task_id, number, provider, model_id, thinking_level,
+          control_version, contract_version, state, started_at, worker_terminated, cause)
+        VALUES (?, ?, 1, NULL, NULL, NULL, ?, ?, 'starting', ?, 0, 'initial')`)
+        .run(
+          attemptId,
+          taskId,
+          COMMITMENT_CONTROL_VERSION,
+          COMMITMENT_CONTRACT_VERSION,
+          timestamp,
+        );
       this.db
         .prepare(`INSERT INTO attempt_runs (
           attempt_id, sequence, kind, control_version, contract_version,
@@ -5722,7 +5792,7 @@ export class RuntimeStore {
     const timestamp = now();
     this.db.exec("BEGIN");
     try {
-      this.db
+      const taskUpdate = this.db
         .prepare(`UPDATE tasks SET state = 'running', updated_at = ?
           WHERE id = ? AND latest_attempt_id = ? AND state IN ('accepted', 'running')
           AND contract_version = ? AND control_version = ?`)
@@ -5733,10 +5803,13 @@ export class RuntimeStore {
           active.contractVersion,
           active.controlVersion,
         );
-      this.db
+      if (taskUpdate.changes !== 1)
+        throw new Error("Fresh Executor Attempt is stale before prompt acceptance.");
+      const attemptUpdate = this.db
         .prepare(`UPDATE attempts SET state = 'running', provider = ?, model_id = ?,
           thinking_level = ?, applied_provider = ?, applied_model_id = ?,
           applied_thinking_level = ?, worker_pid = ?, worker_pgid = ?,
+          control_version = ?, contract_version = ?,
           worker_start_identity = ?, worker_boot_id = ?
           WHERE id = ? AND state = 'starting'`)
         .run(
@@ -5748,11 +5821,13 @@ export class RuntimeStore {
           thinkingLevel,
           workerPid,
           workerPgid,
+          active.controlVersion,
+          active.contractVersion,
           active.workerMetadata?.workerStartIdentity ?? null,
           this.bootId ?? active.workerMetadata?.workerBootId ?? null,
           active.attemptId,
         );
-      this.db
+      const runUpdate = this.db
         .prepare(`UPDATE attempt_runs SET state = 'accepted'
           WHERE attempt_id = ? AND sequence = ? AND state = 'pending'
           AND control_version = ? AND contract_version = ?`)
@@ -5762,6 +5837,8 @@ export class RuntimeStore {
           active.controlVersion,
           active.contractVersion,
         );
+      if (runUpdate.changes !== 1)
+        throw new Error("Fresh Executor prompt run is stale before prompt acceptance.");
       this.db.exec("COMMIT");
       active.runAccepted = true;
     } catch (error) {
@@ -5834,6 +5911,24 @@ export class RuntimeStore {
     );
   }
 
+  #assertAttemptLaunchCurrent(task, attemptId, controlVersion, contractVersion) {
+    const row = this.db
+      .prepare(`SELECT 1 AS eligible FROM tasks AS t
+        JOIN attempts AS a ON a.task_id = t.id AND a.id = t.latest_attempt_id
+        WHERE t.id = ? AND a.id = ? AND t.state IN ('accepted', 'running')
+          AND a.state = 'starting' AND t.control_version = ? AND t.contract_version = ?
+          AND a.control_version = ? AND a.contract_version = ?`)
+      .get(
+        task.id,
+        attemptId,
+        controlVersion,
+        contractVersion,
+        controlVersion,
+        contractVersion,
+      );
+    if (!row) throw new Error("Fresh Executor Attempt is stale before launch.");
+  }
+
   async launchAttempt({
     task,
     attemptId,
@@ -5899,6 +5994,20 @@ export class RuntimeStore {
     this.active = active;
     this.#scheduleAttemptWatchdog(active);
     try {
+      this.#assertAttemptLaunchCurrent(
+        task,
+        attemptId,
+        active.controlVersion,
+        active.contractVersion,
+      );
+      if (typeof this.beforeAttemptLaunch === "function")
+        await this.beforeAttemptLaunch({ task: this.getTask(task.id), attemptId });
+      this.#assertAttemptLaunchCurrent(
+        task,
+        attemptId,
+        active.controlVersion,
+        active.contractVersion,
+      );
       assertTaskWorktreeIdentity(task);
       const worker = await this.workerFactory({
         cwd: task.taskWorktree,
@@ -6250,6 +6359,8 @@ export class RuntimeStore {
     if (
       !attempt ||
       attempt.state !== "running" ||
+      Number(attempt.controlVersion) !== Number(active.controlVersion) ||
+      Number(attempt.contractVersion) !== Number(active.contractVersion) ||
       !run ||
       run.state !== "settled" ||
       run.controlVersion !== active.controlVersion ||
@@ -6357,6 +6468,8 @@ export class RuntimeStore {
     const timestamp = now();
     const evidencePayload = {
       ...identity,
+      controlVersion: active.controlVersion,
+      contractVersion: active.contractVersion,
       observedAt: timestamp,
     };
     const evidenceIds = [];
@@ -6384,7 +6497,7 @@ export class RuntimeStore {
           kind: "git_identity",
           subject: candidateSha,
           payload: evidencePayload,
-          dedupeKey: `git_identity:${active.taskId}:${candidateSha}`,
+          dedupeKey: `git_identity:${active.taskId}:${active.controlVersion}:${active.contractVersion}:${candidateSha}`,
         }),
       );
       this.#linkEvidence(active, evidenceIds);
@@ -6469,10 +6582,17 @@ export class RuntimeStore {
         );
       this.db
         .prepare(`INSERT INTO attempts (
-          id, task_id, number, provider, model_id, thinking_level, state,
-          started_at, worker_terminated, cause
-        ) VALUES (?, ?, ?, NULL, NULL, NULL, 'starting', ?, 0, 'repair')`)
-        .run(freshAttemptId, task.id, nextNumber, timestamp);
+          id, task_id, number, provider, model_id, thinking_level,
+          control_version, contract_version, state, started_at, worker_terminated, cause
+        ) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?, 'starting', ?, 0, 'repair')`)
+        .run(
+          freshAttemptId,
+          task.id,
+          nextNumber,
+          active.controlVersion,
+          active.contractVersion,
+          timestamp,
+        );
       this.db
         .prepare(`INSERT INTO attempt_runs (
           attempt_id, sequence, kind, control_version, contract_version,
@@ -6664,6 +6784,8 @@ export class RuntimeStore {
         );
         resolve({
           criterion: gate.id,
+          controlVersion: active.controlVersion,
+          contractVersion: active.contractVersion,
           command: gate.command,
           cwd: task.taskWorktree,
           candidateSha,
@@ -6758,7 +6880,7 @@ export class RuntimeStore {
   #recordLocalGateEvidence(active, gateResult) {
     const payload = { ...gateResult };
     delete payload.passed;
-    const dedupeKey = `local_gate_result:${active.taskId}:${gateResult.candidateSha}:${gateResult.criterion}:${gateResult.resultDigest}`;
+    const dedupeKey = `local_gate_result:${active.taskId}:${active.controlVersion}:${active.contractVersion}:${gateResult.candidateSha}:${gateResult.criterion}:${gateResult.resultDigest}`;
     const existing = this.db
       .prepare("SELECT id FROM evidence WHERE dedupe_key = ?")
       .get(dedupeKey);
@@ -7456,8 +7578,32 @@ export class RuntimeStore {
   }
 
   #currentWorkerIsSafe(active, task) {
-    if (!active.worker || !active.rpcCoherent || active.promptAmbiguous)
+    if (
+      this.active !== active ||
+      !active.worker ||
+      !active.rpcCoherent ||
+      active.promptAmbiguous
+    )
       throw new Error("Fresh Executor Attempt is not healthy/current.");
+    const durableAttempt = this.db
+      .prepare(`${ATTEMPT_SELECT} WHERE id = ? AND task_id = ?`)
+      .get(active.attemptId, active.taskId);
+    if (
+      !durableAttempt ||
+      durableAttempt.state !== "running" ||
+      Number(durableAttempt.controlVersion) !== Number(active.controlVersion) ||
+      Number(durableAttempt.contractVersion) !== Number(active.contractVersion)
+    )
+      throw new Error("Fresh Executor Attempt is stale or superseded.");
+    const durableTask = this.#taskRow(active.taskId);
+    if (
+      !durableTask ||
+      durableTask.latestAttemptId !== active.attemptId ||
+      durableTask.controlVersion !== active.controlVersion ||
+      durableTask.contractVersion !== active.contractVersion ||
+      !["accepted", "running"].includes(durableTask.state)
+    )
+      throw new Error("Fresh Executor Attempt is stale or superseded.");
     if (
       task.taskWorktree !== active.taskWorktree ||
       task.sourceRepoRoot !== active.sourceRepoRoot ||
@@ -7828,6 +7974,14 @@ export class RuntimeStore {
     this.#allocateContinuationRun(active, prompt, nextSequence);
     try {
       this.#currentWorkerIsSafe(active, task);
+      if (typeof this.beforeContinuationPrompt === "function")
+        await this.beforeContinuationPrompt({
+          task: this.getTask(active.taskId),
+          attemptId: active.attemptId,
+          sequence: nextSequence,
+          prompt,
+        });
+      this.#currentWorkerIsSafe(active, this.getTask(active.taskId));
     } catch (error) {
       this.#abortContinuationRun(active, error.message);
       throw error;
@@ -7959,7 +8113,10 @@ export class RuntimeStore {
     active.finalizing = true;
     this.#clearAttemptWatchdog(active);
     const task = this.getTask(active.taskId);
-    if (!task) return;
+    if (!task) {
+      if (this.active === active) this.active = null;
+      return;
+    }
     const finalResult =
       result == null ? null : bounded(result, MAX_TASK_RESULT_LENGTH);
     let finalDetail = bounded(detail, MAX_TASK_DETAIL_LENGTH);
@@ -8007,10 +8164,12 @@ export class RuntimeStore {
           : "aborted";
     this.db.exec("BEGIN");
     try {
-      this.db
+      const taskUpdate = this.db
         .prepare(
           `UPDATE tasks SET state = ?, updated_at = ?, final_result = ?, terminal_detail = ?,
-          final_branch_head = ?, final_revision = ?, terminal_reason = ? WHERE id = ?`,
+          final_branch_head = ?, final_revision = ?, terminal_reason = ?
+          WHERE id = ? AND latest_attempt_id = ? AND state IN ('accepted', 'running')
+            AND control_version = ? AND contract_version = ?`,
         )
         .run(
           terminalState,
@@ -8021,10 +8180,21 @@ export class RuntimeStore {
           finalBranchHead,
           terminalReason ?? finalDetail,
           active.taskId,
+          active.attemptId,
+          active.controlVersion,
+          active.contractVersion,
         );
-      this.db
+      if (taskUpdate.changes !== 1) {
+        this.db.exec("COMMIT");
+        active.finalizing = false;
+        if (this.active === active) this.active = null;
+        return;
+      }
+      const attemptUpdate = this.db
         .prepare(
-          `UPDATE attempts SET state = ?, finished_at = ?, worker_terminated = ?, final_result = ?, terminal_detail = ?, final_branch_head = ? WHERE id = ?`,
+          `UPDATE attempts SET state = ?, finished_at = ?, worker_terminated = ?, final_result = ?, terminal_detail = ?, final_branch_head = ?
+           WHERE id = ? AND task_id = ? AND state IN ('starting', 'running')
+             AND control_version = ? AND contract_version = ?`,
         )
         .run(
           attemptState,
@@ -8034,18 +8204,28 @@ export class RuntimeStore {
           finalDetail,
           finalBranchHead,
           active.attemptId,
+          active.taskId,
+          active.controlVersion,
+          active.contractVersion,
         );
-      this.db
+      if (attemptUpdate.changes !== 1)
+        throw new Error("Attempt completion fence rejected terminal outcome.");
+      const runUpdate = this.db
         .prepare(`UPDATE attempt_runs SET state = ?, settled_outcome = COALESCE(settled_outcome, ?),
           settled_at = COALESCE(settled_at, ?) WHERE attempt_id = ? AND sequence = ?
-          AND state IN ('pending', 'accepted')`)
+          AND state IN ('pending', 'accepted')
+          AND control_version = ? AND contract_version = ?`)
         .run(
           runState,
           finalResult,
           timestamp,
           active.attemptId,
           active.runSequence,
+          active.controlVersion,
+          active.contractVersion,
         );
+      if (runUpdate.changes !== 1)
+        throw new Error("AttemptRun completion fence rejected terminal outcome.");
       const outcome = ["completed", "failed"].includes(terminalState)
         ? terminalState
         : null;
@@ -8073,7 +8253,12 @@ export class RuntimeStore {
   }
 
   async terminateOwnedWorker(worker) {
-    return stopOwnedProcessGroupSync(worker, {
+    if (!worker) return true;
+    const recorded = workerMetadata(worker);
+    // A fake/in-process worker with no OS identity has nothing safe to signal.
+    // Treat it as already retired; never manufacture a PID/PGID to terminate.
+    if (!recorded) return !worker.pid && !worker.processGroupId;
+    return stopOwnedProcessGroupSync(recorded, {
       timeoutMs: this.workerStopTimeoutMs,
       currentBootId: this.bootId,
     });
@@ -8114,6 +8299,180 @@ export class RuntimeStore {
       this.active = null;
   }
 
+  async correctTask({
+    id,
+    taskId,
+    objective,
+    goal,
+    completionContract,
+    completion_contract,
+    model,
+    thinkingLevel,
+    thinking_level,
+  } = {}) {
+    this.ensureSupported();
+    const targetId = String(id ?? taskId ?? "").trim();
+    if (!targetId) throw new Error("Task correction requires a Task id.");
+    this.open();
+    const task = this.getTask(targetId);
+    if (!task) throw new Error(`Task ${targetId} was not found.`);
+    if (!["accepted", "running", "waiting"].includes(task.state))
+      throw new Error(`Task ${targetId} is already terminal (${task.state}); it cannot be corrected.`);
+    const nextObjective = objective ?? goal ?? task.goal;
+    if (typeof nextObjective !== "string" || !nextObjective.trim())
+      throw new Error("Task correction requires an objective.");
+    const cleanObjective = nextObjective.trim();
+    if (Buffer.byteLength(cleanObjective, "utf8") > MAX_TASK_GOAL_LENGTH)
+      throw new Error("Task correction objective exceeds the bounded size limit.");
+    const oldContract = parsed(task.completionContract, { objective: task.goal });
+    const requestedContract = completionContract ?? completion_contract;
+    const nextContract = requestedContract == null
+      ? { ...oldContract, objective: cleanObjective }
+      : requestedContract;
+    localGatesFromContract(nextContract);
+    const oldMeaning = { objective: task.goal, contract: oldContract };
+    const newMeaning = { objective: cleanObjective, contract: nextContract };
+    const meaningChanged = !snapshotsEqual(oldMeaning, newMeaning);
+    const oldControlVersion = Number(task.controlVersion);
+    const oldContractVersion = Number(task.contractVersion);
+    const nextControlVersion = oldControlVersion + 1;
+    const nextContractVersion = oldContractVersion + (meaningChanged ? 1 : 0);
+    const oldAttempt = task.attempts.find(({ id: attemptId }) => attemptId === task.latestAttemptId);
+    const active = this.active?.taskId === targetId ? this.active : null;
+    if (active) active.stopRequested = true;
+
+    const selectedModel = model ?? (active
+      ? { provider: active.provider, id: active.modelId }
+      : oldAttempt?.provider && oldAttempt?.modelId
+        ? { provider: oldAttempt.provider, id: oldAttempt.modelId }
+        : null);
+    const selectedThinkingLevel = thinkingLevel ?? thinking_level ?? active?.thinkingLevel ?? oldAttempt?.thinkingLevel;
+    if (!selectedModel?.provider || !selectedModel?.id || !selectedThinkingLevel)
+      throw new Error("Task correction requires the current or an explicit model and thinking level.");
+
+    const newAttemptId = randomUUID();
+    const nextNumber = Number(oldAttempt?.number ?? 0) + 1;
+    const timestamp = now();
+    const packet = buildTaskPacket({
+      taskId: targetId,
+      attemptNumber: nextNumber,
+      goal: cleanObjective,
+      taskBranch: task.taskBranch,
+      taskWorktree: task.taskWorktree,
+      baseCommit: task.baseCommit,
+      priorState: "corrected",
+      priorDetail: "The prior control version was superseded by an explicit correction.",
+    });
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.#taskRow(targetId);
+      if (!current || !["accepted", "running", "waiting"].includes(current.state) ||
+          Number(current.controlVersion) !== oldControlVersion ||
+          Number(current.contractVersion) !== oldContractVersion)
+        throw new Error(`Task ${targetId} changed before correction could commit.`);
+      const taskUpdate = this.db
+        .prepare(`UPDATE tasks SET goal = ?, completion_contract = ?, control_version = ?,
+          contract_version = ?, state = 'accepted', latest_attempt_id = ?, final_result = NULL,
+          terminal_detail = NULL, final_branch_head = NULL, final_revision = NULL,
+          completion_evidence_ref = NULL, terminal_reason = NULL, updated_at = ?
+          WHERE id = ? AND state IN ('accepted', 'running', 'waiting')
+            AND control_version = ? AND contract_version = ?`)
+        .run(
+          cleanObjective,
+          serialized(nextContract, { objective: cleanObjective }),
+          nextControlVersion,
+          nextContractVersion,
+          newAttemptId,
+          timestamp,
+          targetId,
+          oldControlVersion,
+          oldContractVersion,
+        );
+      if (taskUpdate.changes !== 1)
+        throw new Error(`Task ${targetId} correction fence was lost.`);
+      const attemptUpdate = this.db
+        .prepare(`UPDATE attempts SET state = 'superseded', finished_at = COALESCE(finished_at, ?),
+          terminal_detail = ?, worker_terminated = CASE WHEN state = 'parked_wait' THEN 1 ELSE worker_terminated END
+          WHERE id = ? AND task_id = ? AND state IN ('starting', 'running', 'parked_wait')
+            AND control_version = ? AND contract_version = ?`)
+        .run(
+          timestamp,
+          "Attempt superseded by an explicit Task correction.",
+          oldAttempt?.id ?? "",
+          targetId,
+          oldControlVersion,
+          oldContractVersion,
+        );
+      if (oldAttempt && attemptUpdate.changes !== 1)
+        throw new Error("Task correction could not supersede the prior Attempt.");
+      this.db
+        .prepare(`UPDATE attempt_runs SET state = 'aborted', settled_outcome = COALESCE(settled_outcome, ?),
+          settled_at = COALESCE(settled_at, ?) WHERE attempt_id = ? AND state IN ('pending', 'accepted')
+            AND control_version = ? AND contract_version = ?`)
+        .run("Attempt superseded by an explicit Task correction.", timestamp,
+          oldAttempt?.id ?? "", oldControlVersion, oldContractVersion);
+      this.db
+        .prepare("UPDATE wait_subscriptions SET status = 'superseded' WHERE task_id = ? AND status = 'active'")
+        .run(targetId);
+      this.db
+        .prepare(`UPDATE remote_effects SET state = 'failed', detail = ?, updated_at = ?
+          WHERE task_id = ? AND control_version = ? AND contract_version = ? AND state = 'prepared'`)
+        .run("Prepared remote publication was superseded by a Task correction.", timestamp,
+          targetId, oldControlVersion, oldContractVersion);
+      this.db
+        .prepare(`INSERT INTO attempts (
+          id, task_id, number, provider, model_id, thinking_level, control_version, contract_version,
+          state, started_at, worker_terminated, cause
+        ) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?, 'starting', ?, 0, 'initial')`)
+        .run(newAttemptId, targetId, nextNumber, nextControlVersion, nextContractVersion, timestamp);
+      this.db
+        .prepare(`INSERT INTO attempt_runs (
+          attempt_id, sequence, kind, control_version, contract_version, prompt_digest, state, evidence_refs, started_at
+        ) VALUES (?, 1, 'initial', ?, ?, ?, 'pending', '[]', ?)`)
+        .run(newAttemptId, nextControlVersion, nextContractVersion, promptDigest(packet), timestamp);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+
+    const gateStopped = active ? this.#cancelLocalGate(active) : true;
+    const workerStopped = !oldAttempt || (oldAttempt.state === "parked_wait" && oldAttempt.workerTerminated)
+      ? true
+      : await this.terminateOwnedWorker(oldAttempt);
+    if (!gateStopped || !workerStopped) {
+      const detail = !gateStopped
+        ? "Task correction could not safely terminate the prior local gate."
+        : "Task correction could not safely terminate the prior worker.";
+      this.markBlocked(targetId, oldAttempt?.id, detail);
+      throw new Error(`${detail} The correction fence was committed and no stale work may continue.`);
+    }
+    if (active) {
+      this.#clearAttemptWatchdog(active);
+      this.active = null;
+    }
+    return this.launchAttempt({
+      task: {
+        id: targetId,
+        sourceRepoRoot: task.sourceRepoRoot,
+        baseCommit: task.baseCommit,
+        taskBranch: task.taskBranch,
+        taskWorktree: task.taskWorktree,
+        goal: cleanObjective,
+        contractVersion: nextContractVersion,
+        controlVersion: nextControlVersion,
+      },
+      attemptId: newAttemptId,
+      number: nextNumber,
+      model: selectedModel,
+      thinkingLevel: selectedThinkingLevel,
+      packet,
+      priorState: "corrected",
+      priorDetail: "The prior control version was superseded by an explicit correction.",
+    });
+  }
+
   async stopTask(id) {
     this.ensureSupported();
     if (typeof id !== "string" || !id.trim())
@@ -8121,6 +8480,12 @@ export class RuntimeStore {
     this.open();
     const task = this.getTask(id.trim());
     if (!task) throw new Error(`Task ${id} was not found.`);
+    if (task.state === "stopped" && task.terminalReason === "user_stopped") {
+      const stoppedAttempt = task.attempts.find(({ id: attemptId }) => attemptId === task.latestAttemptId);
+      if (stoppedAttempt && stoppedAttempt.workerTerminated !== true)
+        await this.terminateOwnedWorker(stoppedAttempt);
+      return this.getTask(task.id);
+    }
     if (!["accepted", "running", "waiting"].includes(task.state))
       throw new Error(
         `Task ${id} is already terminal (${task.state}); it is not active.`,
@@ -8130,69 +8495,57 @@ export class RuntimeStore {
     );
     if (!attempt || (!ACTIVE_ATTEMPT_STATES.has(attempt.state) && attempt.state !== "parked_wait"))
       throw new Error(`Task ${id} has no active Attempt to stop.`);
-    const worker = attempt;
-    const active =
-      this.active?.attemptId === attempt.id ? this.active : null;
+    const active = this.active?.attemptId === attempt.id ? this.active : null;
     if (active) active.stopRequested = true;
-    const gateStopped = active
-      ? this.#cancelLocalGate(active)
-      : this.#reconcileGate(attempt) !== "ambiguous";
-    const stopped = attempt.state === "parked_wait" && attempt.workerTerminated
-      ? true
-      : await this.terminateOwnedWorker(worker);
-    if (!stopped || !gateStopped) {
-      const detail = !gateStopped
-        ? `Task ${id} local gate could not be safely terminated; ownership or group liveness was not proven.`
-        : `Task ${id} worker could not be safely terminated; ownership or group liveness was not proven.`;
-      this.markBlocked(task.id, attempt.id, detail);
-      throw new Error(
-        `${detail} No stopped outcome was recorded.`,
-      );
-    }
+
+    // Commit the control fence before doing any signalling. This makes a
+    // cancel win against a wake, settlement, continuation, or publication
+    // that is concurrently between durable allocation and its boundary.
     const timestamp = now();
-    this.db.exec("BEGIN");
+    const stopDetail = "The Task was intentionally stopped by the user.";
+    const oldControlVersion = Number(task.controlVersion);
+    const oldContractVersion = Number(task.contractVersion);
+    this.db.exec("BEGIN IMMEDIATE");
     try {
       const taskUpdate = this.db
-        .prepare(
-          "UPDATE tasks SET state = 'stopped', terminal_detail = ?, terminal_reason = ?, updated_at = ? WHERE id = ? AND state IN ('accepted', 'running', 'waiting')",
-        )
-        .run(
-          "The Task was intentionally stopped by the user.",
-          "user_stopped",
-          timestamp,
-          task.id,
-        );
-      if (taskUpdate.changes === 1) {
-        const attemptUpdate = this.db
-          .prepare(
-            "UPDATE attempts SET state = 'stopped', finished_at = ?, worker_terminated = 1, terminal_detail = ? WHERE id = ? AND state IN ('starting', 'running', 'parked_wait') AND gate_terminated = 1",
-          )
-          .run(
-            timestamp,
-            "The Task was intentionally stopped by the user.",
-            attempt.id,
-          );
-        if (attemptUpdate.changes !== 1)
-          throw new Error("Stopped Task Attempt transition was not recorded.");
-        this.db
-          .prepare(`UPDATE attempt_runs SET state = 'aborted', settled_outcome = COALESCE(settled_outcome, ?),
-            settled_at = COALESCE(settled_at, ?) WHERE attempt_id = ? AND state IN ('pending', 'accepted')`)
-          .run(
-            "The Task was intentionally stopped by the user.",
-            timestamp,
-            attempt.id,
-          );
-        this.db
-          .prepare("UPDATE wait_subscriptions SET status = 'cancelled' WHERE task_id = ? AND status = 'active'")
-          .run(task.id);
-        const resultId = this.#insertResultDelivery({
-          task: this.#taskRow(task.id),
-          outcome: "cancelled",
-          terminalDetail: "The Task was intentionally stopped by the user.",
-          terminalReason: "user_stopped",
-        });
-        if (!resultId) throw new Error("Stopped Task did not produce a Result delivery.");
-      }
+        .prepare(`UPDATE tasks SET state = 'stopped', control_version = control_version + 1,
+          terminal_detail = ?, terminal_reason = 'user_stopped', updated_at = ?
+          WHERE id = ? AND state IN ('accepted', 'running', 'waiting')
+            AND control_version = ? AND contract_version = ?`)
+        .run(stopDetail, timestamp, task.id, oldControlVersion, oldContractVersion);
+      if (taskUpdate.changes !== 1)
+        throw new Error(`Task ${id} became terminal before it could be stopped.`);
+      const attemptUpdate = this.db
+        .prepare(`UPDATE attempts SET state = 'stopped', finished_at = ?, terminal_detail = ?,
+          worker_terminated = CASE WHEN state = 'parked_wait' THEN 1 ELSE worker_terminated END
+          WHERE id = ? AND task_id = ? AND state IN ('starting', 'running', 'parked_wait')
+            AND control_version = ? AND contract_version = ?`)
+        .run(timestamp, stopDetail, attempt.id, task.id, oldControlVersion, oldContractVersion);
+      if (attemptUpdate.changes !== 1)
+        throw new Error("Stopped Task Attempt transition was not recorded.");
+      this.db
+        .prepare(`UPDATE attempt_runs SET state = 'aborted', settled_outcome = COALESCE(settled_outcome, ?),
+          settled_at = COALESCE(settled_at, ?) WHERE attempt_id = ? AND state IN ('pending', 'accepted')
+          AND control_version = ? AND contract_version = ?`)
+        .run(stopDetail, timestamp, attempt.id, oldControlVersion, oldContractVersion);
+      this.db
+        .prepare("UPDATE wait_subscriptions SET status = 'cancelled' WHERE task_id = ? AND status = 'active'")
+        .run(task.id);
+      // Prepared effects are cancelled by the new fence. A transmitted
+      // unknown effect remains unknown and is reconciled truthfully later.
+      this.db
+        .prepare(`UPDATE remote_effects SET state = 'failed', detail = ?, updated_at = ?
+          WHERE task_id = ? AND control_version = ? AND contract_version = ?
+            AND state = 'prepared'`)
+        .run("Prepared remote publication was cancelled before transmission.", timestamp,
+          task.id, oldControlVersion, oldContractVersion);
+      const resultId = this.#insertResultDelivery({
+        task: this.#taskRow(task.id),
+        outcome: "cancelled",
+        terminalDetail: stopDetail,
+        terminalReason: "user_stopped",
+      });
+      if (!resultId) throw new Error("Stopped Task did not produce a Result delivery.");
       this.db.exec("COMMIT");
     } catch (error) {
       try {
@@ -8200,6 +8553,23 @@ export class RuntimeStore {
       } catch {}
       throw error;
     }
+
+    const gateStopped = active
+      ? this.#cancelLocalGate(active)
+      : this.#reconcileGate(attempt) !== "ambiguous";
+    const stopped = attempt.state === "parked_wait" && attempt.workerTerminated
+      ? true
+      : await this.terminateOwnedWorker(attempt);
+    if (!stopped || !gateStopped) {
+      const detail = !gateStopped
+        ? `Task ${id} local gate could not be safely terminated; ownership or group liveness was not proven.`
+        : `Task ${id} worker could not be safely terminated; ownership or group liveness was not proven.`;
+      this.markBlocked(task.id, attempt.id, detail);
+      throw new Error(`${detail} The cancellation fence was committed; no stale work may continue.`);
+    }
+    this.db
+      .prepare("UPDATE attempts SET worker_terminated = 1 WHERE id = ? AND task_id = ? AND state = 'stopped'")
+      .run(attempt.id, task.id);
     if (this.active?.attemptId === attempt.id) this.active = null;
     return this.getTask(task.id);
   }
@@ -8294,9 +8664,16 @@ export class RuntimeStore {
       this.#assertFreshAttemptBudget(task.id, model, thinkingLevel);
       this.db
         .prepare(
-          "INSERT INTO attempts (id, task_id, number, provider, model_id, thinking_level, state, started_at, worker_terminated, cause) VALUES (?, ?, ?, NULL, NULL, NULL, 'starting', ?, 0, 'retry')",
+          "INSERT INTO attempts (id, task_id, number, provider, model_id, thinking_level, control_version, contract_version, state, started_at, worker_terminated, cause) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?, 'starting', ?, 0, 'retry')",
         )
-        .run(attemptId, task.id, number, timestamp);
+        .run(
+          attemptId,
+          task.id,
+          number,
+          retryTask.controlVersion,
+          retryTask.contractVersion,
+          timestamp,
+        );
       this.db
         .prepare(`INSERT INTO attempt_runs (
           attempt_id, sequence, kind, control_version, contract_version,
