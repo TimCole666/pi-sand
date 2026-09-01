@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createReadStream } from "node:fs";
+import { existsSync, watch } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:https";
@@ -28,17 +28,32 @@ const authority = {
   },
 };
 
-const nextTurn = () => new Promise((resolveTurn) => setImmediate(resolveTurn));
-
-async function eventually(read, predicate, message = "release proof timed out") {
-  const deadline = Date.now() + 10_000;
-  let value;
-  while (Date.now() < deadline) {
-    value = await read();
-    if (predicate(value)) return value;
-    await nextTurn();
-  }
-  throw new Error(`${message}: ${JSON.stringify(value)}`);
+async function waitForMarker(directory, name, message = `release barrier ${name} timed out`) {
+  const path = join(directory, name);
+  if (existsSync(path)) return;
+  await new Promise((resolveBarrier, rejectBarrier) => {
+    let settled = false;
+    let watcher;
+    const timeout = setTimeout(() => finish(new Error(message)), 10_000);
+    timeout.unref?.();
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      watcher?.close();
+      if (error) rejectBarrier(error);
+      else resolveBarrier();
+    };
+    const check = () => {
+      if (existsSync(path)) finish();
+    };
+    try {
+      watcher = watch(directory, { persistent: false }, check);
+      check();
+    } catch (error) {
+      finish(error);
+    }
+  });
 }
 
 function git(cwd, args) {
@@ -63,13 +78,19 @@ async function repository(parent) {
 async function fakePi(parent) {
   const command = join(parent, "fake-pi.cjs");
   const counter = join(parent, "pi-attempt-count");
+  const barrierDirectory = join(parent, "pi-barriers");
+  await mkdir(barrierDirectory);
   await writeFile(command, `#!/usr/bin/env node
 const fs = require("node:fs");
+const path = require("node:path");
 const counter = process.env.PI_SAND_RELEASE_COUNTER;
+const barrierDirectory = process.env.PI_SAND_RELEASE_BARRIER_DIR;
+function mark(name) { fs.writeFileSync(path.join(barrierDirectory, name), "ready"); }
 if (process.argv.includes("--version")) { process.stdout.write("0.84.4\\n"); process.exit(0); }
 let buffer = "";
 let model = null;
 let thinkingLevel = null;
+let activeAttempt = null;
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   buffer += chunk;
@@ -84,19 +105,25 @@ process.stdin.on("data", (chunk) => {
     process.stdout.write(JSON.stringify(response) + "\\n");
     if (request.type === "prompt") {
       const attempt = Number(fs.existsSync(counter) ? fs.readFileSync(counter, "utf8") : "0") + 1;
+      activeAttempt = attempt;
       fs.writeFileSync(counter, String(attempt));
       fs.writeFileSync("candidate.txt", "release-candidate-" + attempt + "\\n");
+      mark("attempt-" + attempt + "-prompt");
       process.stdout.write(JSON.stringify({ type: "agent_start" }) + "\\n");
       process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: "executor settled", stopReason: "stop" } }) + "\\n");
       process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+      mark("attempt-" + attempt + "-settled");
     }
   }
 });
-process.on("SIGTERM", () => process.exit(0));
+process.on("SIGTERM", () => {
+  if (activeAttempt !== null) mark("attempt-" + activeAttempt + "-closed");
+  process.exit(0);
+});
 setInterval(() => {}, 1000);
 `);
   await chmod(command, 0o755);
-  return { command, counter };
+  return { command, counter, barrierDirectory };
 }
 
 async function localTlsCertificate(parent) {
@@ -113,6 +140,7 @@ async function fakeGitHub(parent) {
   const tls = await localTlsCertificate(parent);
   const states = new Map();
   const requests = [];
+  const pendingRequests = new Map();
   const server = createServer(tls, (request, response) => {
     const match = request.url.match(/\/repos\/fixture\/repository\/commits\/([^/]+)\/(check-runs|status)/);
     if (!match) {
@@ -122,9 +150,16 @@ async function fakeGitHub(parent) {
     }
     const sha = match[1];
     const state = states.get(sha) ?? { checkRuns: [], statuses: [] };
-    requests.push({ sha, path: match[2], checkRuns: state.checkRuns.length, statuses: state.statuses.length });
+    const path = match[2];
+    const requestRecord = { sha, path, checkRuns: state.checkRuns.length, statuses: state.statuses.length };
+    requests.push(requestRecord);
     response.setHeader("content-type", "application/json");
-    response.end(JSON.stringify(match[2] === "check-runs"
+    response.once("finish", () => {
+      const waiters = pendingRequests.get(`${sha}:${path}`) ?? [];
+      pendingRequests.delete(`${sha}:${path}`);
+      for (const resolveRequest of waiters) resolveRequest(requestRecord);
+    });
+    response.end(JSON.stringify(path === "check-runs"
       ? { check_runs: state.checkRuns }
       : { statuses: state.statuses }));
   });
@@ -137,6 +172,20 @@ async function fakeGitHub(parent) {
     host: `127.0.0.1:${address.port}`,
     requests,
     set(sha, state) { states.set(sha, state); },
+    observe(sha) {
+      const startAt = requests.length;
+      return Promise.all(["check-runs", "status"].map((path) => {
+        const existing = requests.slice(startAt)
+          .find((request) => request.sha === sha && request.path === path);
+        if (existing) return existing;
+        return new Promise((resolveRequest) => {
+          const key = `${sha}:${path}`;
+          const waiters = pendingRequests.get(key) ?? [];
+          waiters.push(resolveRequest);
+          pendingRequests.set(key, waiters);
+        });
+      }));
+    },
     async close() { await new Promise((resolveClose) => server.close(resolveClose)); },
   };
 }
@@ -146,6 +195,7 @@ function environment(parent, pi, github) {
     ...process.env,
     PI_BIN: pi.command,
     PI_SAND_RELEASE_COUNTER: pi.counter,
+    PI_SAND_RELEASE_BARRIER_DIR: pi.barrierDirectory,
     PI_SAND_RUNTIME_DB: join(parent, "runtime.sqlite"),
     PI_SAND_TASK_WORKTREE_ROOT: join(parent, "worktrees"),
     XDG_RUNTIME_DIR: join(parent, "runtime"),
@@ -165,30 +215,85 @@ function startDaemon(env) {
   return child;
 }
 
-async function waitForDaemon(client, child) {
-  return eventually(async () => {
-    if (child.exitCode !== null) throw new Error(`daemon exited with ${child.exitCode}`);
-    try {
-      // Do not use RuntimeClient.request here: its recovery path can spawn a
-      // second daemon while the explicitly-started daemon is still binding.
-      const response = await client.requestSocket("runtime.status", {}, PROTOCOL_VERSION, 250);
-      const status = response.success ? response.data : null;
-      return status?.daemonPid === child.pid ? status : null;
-    } catch { return null; }
-  }, Boolean, "daemon did not become ready");
+async function waitForDaemonReady(client, child) {
+  return new Promise((resolveReady, rejectReady) => {
+    let settled = false;
+    const timeout = setTimeout(() => finish(new Error("daemon did not become ready")), 10_000);
+    timeout.unref?.();
+    const finish = (error, status) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (error) rejectReady(error);
+      else resolveReady(status);
+    };
+    const check = async () => {
+      if (settled) return;
+      if (child.exitCode !== null) {
+        finish(new Error(`daemon exited with ${child.exitCode}`));
+        return;
+      }
+      try {
+        // Do not use RuntimeClient.request here: its recovery path can spawn a
+        // second daemon while the explicitly-started daemon is still binding.
+        const response = await client.requestSocket("runtime.status", {}, PROTOCOL_VERSION, 250);
+        const status = response.success ? response.data : null;
+        if (status?.daemonPid === child.pid) {
+          finish(null, status);
+          return;
+        }
+      } catch {}
+      if (!settled) {
+        const retry = setTimeout(check, 25);
+        retry.unref?.();
+      }
+    };
+    void check();
+  });
+}
+
+async function waitForDaemonExit(child) {
+  if (child.exitCode !== null) return;
+  await new Promise((resolveExit, rejectExit) => {
+    let settled = false;
+    const timeout = setTimeout(() => finish(new Error("daemon did not stop")), 10_000);
+    timeout.unref?.();
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      child.off("exit", onExit);
+      if (error) rejectExit(error);
+      else resolveExit();
+    };
+    const onExit = () => finish();
+    child.once("exit", onExit);
+    if (child.exitCode !== null) finish();
+  });
 }
 
 async function stopDaemon(child) {
   if (!child) return;
-  try { process.kill(child.pid, "SIGTERM"); } catch (error) { if (error.code === "ESRCH") return; throw error; }
   try {
-    await eventually(() => {
-      try { process.kill(child.pid, 0); return false; }
-      catch (error) { if (error.code === "ESRCH") return true; throw error; }
-    }, Boolean, "daemon did not stop");
+    process.kill(child.pid, "SIGTERM");
+  } catch (error) {
+    if (error.code === "ESRCH") return;
+    throw error;
+  }
+  try {
+    await waitForDaemonExit(child);
   } catch {
     try { process.kill(child.pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
+    await waitForDaemonExit(child).catch(() => {});
   }
+}
+
+async function waitForDaemonIdle(client, child, taskId, expectedState) {
+  const status = await waitForDaemonReady(client, child);
+  assert.equal(status.state, "ready");
+  const task = await client.getTask(taskId);
+  assert.equal(task.state, expectedState);
+  return task;
 }
 
 function taskInput(goal, githubHost, { repair = false } = {}) {
@@ -218,7 +323,9 @@ async function runJourney({ repair = false } = {}) {
   let daemon;
   try {
     daemon = startDaemon(env);
-    await waitForDaemon(client, daemon);
+    await waitForDaemonReady(client, daemon);
+    const attempt1Settled = waitForMarker(pi.barrierDirectory, "attempt-1-settled");
+    const attempt1Closed = waitForMarker(pi.barrierDirectory, "attempt-1-closed");
     const managerA = createExtensionHarness({ cwd: () => repositoryValue.source });
     registerPiSandExtension(managerA.pi, { runtimeClientFactory: () => client });
     const managerContext = {
@@ -227,6 +334,7 @@ async function runJourney({ repair = false } = {}) {
       thinkingLevel: "high",
       isProjectTrusted: () => true,
     };
+    await managerA.invoke("session_start", { type: "session_start" }, managerContext);
     await managerA.commands.get("task").handler(
       taskInput("release proof", github.host, { repair }),
       managerContext,
@@ -237,11 +345,9 @@ async function runJourney({ repair = false } = {}) {
     assert.equal(acceptedTask.controlVersion, 1);
     assert.equal(acceptedTask.contractVersion, 1);
 
-    const waiting = await eventually(
-      () => client.getTask(acceptedTask.id),
-      (task) => task.state === "waiting",
-      "Task did not reach exact-SHA wait",
-    );
+    await attempt1Settled;
+    await attempt1Closed;
+    const waiting = await waitForDaemonIdle(client, daemon, acceptedTask.id, "waiting");
     const candidateR = waiting.finalRevision;
     assert.match(candidateR, /^[0-9a-f]{40}$/);
     assert.equal(git(waiting.taskWorktree, ["rev-parse", "HEAD"]), candidateR);
@@ -256,6 +362,13 @@ async function runJourney({ repair = false } = {}) {
       /active or unresolved/,
     );
 
+    await managerA.invoke("session_shutdown", { type: "session_shutdown" }, managerContext);
+    assert.equal(managerA.surface().status.text, undefined);
+    assert.equal(managerA.surface().widget.lines, undefined);
+    const managerACallCount = managerA.calls.length;
+    const managerANotificationCount = managerA.notifications.length;
+
+    assert.ok(github.requests.every(({ checkRuns, statuses }) => checkRuns === 0 && statuses === 0));
     await stopDaemon(daemon);
     daemon = undefined;
     github.set(candidateR, {
@@ -263,12 +376,23 @@ async function runJourney({ repair = false } = {}) {
       statuses: [{ id: 2, context: "release", sha: candidateR, state: repair ? "failure" : "success" }],
     });
 
+    const r1Observation = github.observe(candidateR);
+    const attempt2Settled = repair
+      ? waitForMarker(pi.barrierDirectory, "attempt-2-settled")
+      : null;
+    const attempt2Closed = repair
+      ? waitForMarker(pi.barrierDirectory, "attempt-2-closed")
+      : null;
     daemon = startDaemon(env);
-    await waitForDaemon(client, daemon);
-    let current = await eventually(
-      () => client.getTask(acceptedTask.id),
-      (task) => repair ? task.attempts.length === 2 && task.state === "waiting" : task.state === "completed",
-      repair ? `CI failure did not create one fresh repair Attempt (${JSON.stringify(github.requests)})` : "green CI did not complete the Task",
+    await waitForDaemonReady(client, daemon);
+    await r1Observation;
+    if (attempt2Settled) await attempt2Settled;
+    if (attempt2Closed) await attempt2Closed;
+    let current = await waitForDaemonIdle(
+      client,
+      daemon,
+      acceptedTask.id,
+      repair ? "waiting" : "completed",
     );
 
     if (repair) {
@@ -286,9 +410,11 @@ async function runJourney({ repair = false } = {}) {
         checkRuns: [{ id: 3, name: "ci", head_sha: candidateR2, status: "completed", conclusion: "success", app: { slug: "github-actions" } }],
         statuses: [{ id: 4, context: "release", sha: candidateR2, state: "success" }],
       });
+      const r2Observation = github.observe(candidateR2);
       daemon = startDaemon(env);
-      await waitForDaemon(client, daemon);
-      current = await eventually(() => client.getTask(acceptedTask.id), (task) => task.state === "completed", `R2 CI did not complete the Task (${JSON.stringify(github.requests)})`);
+      await waitForDaemonReady(client, daemon);
+      await r2Observation;
+      current = await waitForDaemonIdle(client, daemon, acceptedTask.id, "completed");
       assert.equal(current.finalRevision, candidateR2);
     }
 
@@ -301,14 +427,18 @@ async function runJourney({ repair = false } = {}) {
     registerPiSandExtension(managerB.pi, { runtimeClientFactory: () => client });
     const managerBContext = managerB.context("manager-b");
     await managerB.invoke("session_start", { type: "session_start" }, managerBContext);
-    const resultNotification = await eventually(
-      () => managerB.notifications.map(({ message }) => JSON.parse(message)).find((value) => value?.id === current.result?.id || value?.taskId === current.id),
-      Boolean,
-      "Manager B did not receive the durable Result",
-    );
+    const resultNotification = managerB.notifications
+      .map(({ message }) => JSON.parse(message))
+      .find((value) => value?.id === current.result?.id || value?.taskId === current.id);
+    assert.ok(resultNotification, "Manager B did not receive the durable Result");
+    assert.equal(managerB.surface().status.text, "pi-sand: idle");
+    assert.deepEqual(managerB.surface().widget.lines, ["pi-sand activity: idle"]);
     assert.equal(resultNotification.outcome, "completed");
     assert.equal(resultNotification.payload.finalRevision, current.finalRevision);
     assert.equal(await client.claimResult("manager-c"), null);
+    assert.equal(managerA.calls.length, managerACallCount);
+    assert.equal(managerA.notifications.length, managerANotificationCount);
+    assert.ok(resultNotification.id);
     await managerB.invoke("session_shutdown", { type: "session_shutdown" }, managerBContext);
     return { current, candidateR, parent, github, env };
   } finally {

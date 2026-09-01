@@ -1730,6 +1730,7 @@ export class RuntimeStore {
     this.waitReactorEnabled = false;
     this.waitReactorTimer = null;
     this.waitReactorRunning = false;
+    this.waitReactorPromise = null;
     this.waitReactorRequested = false;
     this.databaseLock = null;
     this.db = null;
@@ -5675,7 +5676,7 @@ export class RuntimeStore {
       : WAIT_REACTOR_IDLE_INTERVAL_MS;
     this.waitReactorTimer = this.waitTimer.setTimeout(() => {
       this.waitReactorTimer = null;
-      void this.#runWaitReactor();
+      return this.#runWaitReactor();
     }, delay);
     this.waitReactorTimer?.unref?.();
   }
@@ -5684,23 +5685,32 @@ export class RuntimeStore {
     if (!this.waitReactorEnabled || this.closed || !this.db) return;
     if (this.waitReactorRunning) {
       this.waitReactorRequested = true;
-      return;
+      return this.waitReactorPromise;
     }
     this.waitReactorRunning = true;
-    try {
-      do {
-        this.waitReactorRequested = false;
-        await this.reconcileActiveWaits({
-          dueOnly: true,
-          now: this.waitClock(),
-          gitHubAdapter: this.waitObserver ?? this.gitHubAdapter,
-          trigger: true,
-        }, WAIT_RECONCILE_CAPABILITY);
-      } while (this.waitReactorRequested);
-    } finally {
-      this.waitReactorRunning = false;
-      this.#scheduleWaitReactor();
-    }
+    const run = (async () => {
+      try {
+        do {
+          this.waitReactorRequested = false;
+          await this.reconcileActiveWaits({
+            dueOnly: true,
+            now: this.waitClock(),
+            gitHubAdapter: this.waitObserver ?? this.gitHubAdapter,
+            trigger: true,
+          }, WAIT_RECONCILE_CAPABILITY);
+        } while (this.waitReactorRequested);
+      } finally {
+        this.waitReactorRunning = false;
+        this.#scheduleWaitReactor();
+        this.waitReactorPromise = null;
+      }
+    })();
+    this.waitReactorPromise = run;
+    return run;
+  }
+
+  async waitForWaitReactorIdle() {
+    await this.waitReactorPromise;
   }
 
   async startWaitReactor({ observer, skipSpawn = false, model, thinkingLevel } = {}) {

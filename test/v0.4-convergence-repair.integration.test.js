@@ -242,20 +242,20 @@ test("due reactor persists exact ci_not_observable control evidence and terminal
     const firstNext = value.runtime.getWaitSubscription(waitId).nextReconcileAt;
 
     clock += firstDue.delay + 1;
-    firstDue.callback();
-    await eventually(
-      () => value.runtime.getWaitSubscription(waitId),
-      (subscription) => subscription.nextReconcileAt !== firstNext,
-    );
-    await eventually(() => timers.length, (count) => count > 0);
+    await firstDue.callback();
+    await value.runtime.waitForWaitReactorIdle();
+    const afterFirst = value.runtime.getWaitSubscription(waitId);
+    assert.notEqual(afterFirst.nextReconcileAt, firstNext);
     const graceDue = timers.shift();
     assert.ok(graceDue);
-    clock = Date.parse(value.runtime.getWaitSubscription(waitId).nextReconcileAt) + 1;
-    graceDue.callback();
-    const blocked = await eventually(
-      () => value.runtime.getTask(value.task.id),
-      (task) => task.state === "blocked",
-    );
+    clock = Math.max(
+      Date.parse(waiting.waitSubscriptions[0].createdAt) + 60_000,
+      Date.parse(afterFirst.nextReconcileAt),
+    ) + 1;
+    await graceDue.callback();
+    await value.runtime.waitForWaitReactorIdle();
+    const blocked = value.runtime.getTask(value.task.id);
+    assert.equal(blocked.state, "blocked");
     const waitAfter = value.runtime.getWaitSubscription(waitId);
     assert.equal(waitAfter.status, "triggered");
     assert.equal(waitAfter.continuationAttemptId, null);
