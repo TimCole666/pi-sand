@@ -1548,3 +1548,52 @@ test("15. active Attempt watchdog durably fails a never-settling worker", async 
     await closeFixture(value);
   }
 });
+
+// -----------------------------------------------------------------------------
+// Regression: an active Attempt deadline remains authoritative during a gate
+// -----------------------------------------------------------------------------
+test("active Attempt deadline expires during a passing local gate", async () => {
+  let watchdogCallback = null;
+  let clock = Date.now();
+  const timer = {
+    setTimeout(callback) {
+      watchdogCallback = callback;
+      return { unref() {} };
+    },
+    clearTimeout() {},
+  };
+  const value = await fixture({
+    attemptTimer: timer,
+    attemptClock: () => clock,
+    budget: { maxActiveAttemptDurationMs: 1 },
+    completionContract: {
+      objective: "expire during local verification",
+      localGates: [{
+        id: "slow-pass",
+        command: [process.execPath, "-e", "setTimeout(() => process.exit(0), 200)"],
+      }],
+    },
+  });
+  try {
+    assert.equal(typeof watchdogCallback, "function");
+    await eventually(
+      () => value.runtime.db.prepare("SELECT gate_state AS gateState FROM attempts WHERE id = ?").get(value.task.latestAttemptId),
+      (attempt) => attempt?.gateState === "running",
+    );
+    const startedAt = value.runtime.db
+      .prepare("SELECT started_at AS startedAt FROM attempts WHERE id = ?")
+      .get(value.task.latestAttemptId).startedAt;
+    clock = Date.parse(startedAt) + 2;
+    watchdogCallback();
+    const failed = await eventually(
+      () => value.runtime.getTask(value.task.id),
+      (task) => ["failed", "blocked", "completed"].includes(task.state),
+    );
+    assert.equal(failed.state, "failed");
+    assert.equal(failed.terminalReason, "external_timeout");
+    assert.equal(failed.attempts[0].workerTerminated, true);
+    assert.equal(value.runtime.db.prepare("SELECT COUNT(*) AS count FROM result_deliveries WHERE task_id = ?").get(value.task.id).count, 1);
+  } finally {
+    await closeFixture(value);
+  }
+});

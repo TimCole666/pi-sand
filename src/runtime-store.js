@@ -5141,7 +5141,21 @@ export class RuntimeStore {
       );
   }
 
-  #failActiveForBudget(active, detail, terminalReason = "budget_exhausted") {
+  #attemptDeadlineExpired(active, task = this.#taskRow(active.taskId)) {
+    const attempt = this.db
+      .prepare("SELECT started_at AS startedAt FROM attempts WHERE id = ? AND task_id = ?")
+      .get(active.attemptId, active.taskId);
+    const startedAt = new Date(attempt?.startedAt ?? "").getTime();
+    const currentTime = new Date(this.attemptClock()).getTime();
+    const budget = normalizeBudget(task?.budget);
+    return (
+      Number.isFinite(startedAt) &&
+      Number.isFinite(currentTime) &&
+      currentTime - startedAt >= budget.maxActiveAttemptDurationMs
+    );
+  }
+
+  #failActiveForBudget(active, detail, terminalReason = "budget_exhausted", failureContext = {}) {
     if (active.budgetFailurePromise) return active.budgetFailurePromise;
     active.budgetFailurePromise = (async () => {
       let retired = false;
@@ -5149,13 +5163,25 @@ export class RuntimeStore {
         retired = await this.retireWorker(active.worker, active.workerMetadata);
       } catch {}
       if (this.active !== active || active.stopRequested) return;
-      await this.settle(active, {
-        success: false,
-        result: active.finalAssistant?.result ?? null,
-        detail,
-        terminalReason,
-        checkpoint: false,
-      });
+      if (active.runSettled) {
+        this.#verificationFailure(active, {
+          state: retired ? "failed" : "blocked",
+          reason: retired ? terminalReason : "worker_retirement_ambiguous",
+          detail: retired
+            ? detail
+            : `${detail} Fresh Executor could not be safely retired; executor capacity remains blocked.`,
+          ...failureContext,
+          workerTerminated: retired,
+        });
+      } else {
+        await this.settle(active, {
+          success: false,
+          result: active.finalAssistant?.result ?? null,
+          detail,
+          terminalReason,
+          checkpoint: false,
+        });
+      }
       if (!retired && this.active === active) {
         this.markBlocked(active.taskId, active.attemptId, detail);
       }
@@ -5762,7 +5788,7 @@ export class RuntimeStore {
   }
 
   async #runAttemptWatchdog(active) {
-    if (this.active !== active || active.stopRequested || active.runSettled) return;
+    if (this.active !== active || active.stopRequested) return;
     const task = this.#taskRow(active.taskId);
     const attempt = this.db
       .prepare("SELECT state, started_at AS startedAt FROM attempts WHERE id = ? AND task_id = ?")
@@ -6917,23 +6943,12 @@ export class RuntimeStore {
       if (!current) return;
       const task = current.task;
       const budget = normalizeBudget(task.budget);
-      const attemptStartedAt = new Date(current.attempt.startedAt).getTime();
-      const attemptNow = new Date(this.attemptClock()).getTime();
-      if (
-        Number.isFinite(attemptStartedAt) &&
-        Number.isFinite(attemptNow) &&
-        attemptNow - attemptStartedAt >= budget.maxActiveAttemptDurationMs
-      ) {
-        const retired = await this.retireWorker(active.worker, active.workerMetadata);
-        if (this.active !== active || active.stopRequested) return;
-        this.#verificationFailure(active, {
-          state: retired ? "failed" : "blocked",
-          reason: retired ? "external_timeout" : "worker_retirement_ambiguous",
-          detail: retired
-            ? "Task active Attempt duration expired."
-            : "Task active Attempt duration expired and the Fresh Executor could not be safely retired.",
-          workerTerminated: retired,
-        });
+      if (this.#attemptDeadlineExpired(active, task)) {
+        await this.#failActiveForBudget(
+          active,
+          "Task active Attempt duration expired.",
+          "external_timeout",
+        );
         return;
       }
       const completionContract = parsed(task.completionContract);
@@ -6984,6 +6999,19 @@ export class RuntimeStore {
 
         if (this.active !== active || !this.#supervisorState(active) || active.stopRequested)
           return;
+        if (active.attemptWatchdogDue || this.#attemptDeadlineExpired(active, task)) {
+          await this.#failActiveForBudget(
+            active,
+            "Task active Attempt duration expired.",
+            "external_timeout",
+            {
+              observedCandidateSha,
+              recordedCandidateSha,
+              finalBranchHead: gateResult.postCandidateSha ?? recordedCandidateSha,
+            },
+          );
+          return;
+        }
         this.db.exec("BEGIN");
         try {
           const gateEvidence = this.#recordLocalGateEvidence(active, gateResult);
@@ -7293,7 +7321,33 @@ export class RuntimeStore {
       // Task on an exact-SHA wait; never emit verified_local in that case.
       const requiredChecks = requiredChecksFromContract(completionContract);
       if (requiredChecks.length > 0) {
+        if (active.attemptWatchdogDue || this.#attemptDeadlineExpired(active, task)) {
+          await this.#failActiveForBudget(
+            active,
+            "Task active Attempt duration expired.",
+            "external_timeout",
+            {
+              observedCandidateSha,
+              recordedCandidateSha,
+              finalBranchHead: recordedCandidateSha,
+            },
+          );
+          return;
+        }
         await this.publishTask({ id: task.id, candidateSha: recordedCandidateSha });
+        if (active.attemptWatchdogDue || this.#attemptDeadlineExpired(active, task)) {
+          await this.#failActiveForBudget(
+            active,
+            "Task active Attempt duration expired.",
+            "external_timeout",
+            {
+              observedCandidateSha,
+              recordedCandidateSha,
+              finalBranchHead: recordedCandidateSha,
+            },
+          );
+          return;
+        }
         await this.registerWaitSubscription({
           taskId: task.id,
           revisionSha: recordedCandidateSha,
@@ -7317,6 +7371,19 @@ export class RuntimeStore {
           recordedCandidateSha,
           workerTerminated: false,
         });
+        return;
+      }
+      if (active.attemptWatchdogDue || this.#attemptDeadlineExpired(active, task)) {
+        await this.#failActiveForBudget(
+          active,
+          "Task active Attempt duration expired.",
+          "external_timeout",
+          {
+            observedCandidateSha,
+            recordedCandidateSha,
+            finalBranchHead: recordedCandidateSha,
+          },
+        );
         return;
       }
       this.#completeVerified(active, recordedCandidateSha, [
