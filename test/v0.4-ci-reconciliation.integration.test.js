@@ -4,7 +4,11 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { RuntimeStore } from "../src/runtime-store.js";
+import {
+  defaultGitHubAdapter,
+  matchCommitStatus,
+  RuntimeStore,
+} from "../src/runtime-store.js";
 
 const wait = (milliseconds) =>
   new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
@@ -207,6 +211,43 @@ async function closeFixture(fixtureValue) {
   fixtureValue.runtime.close();
   await rm(fixtureValue.parent, { recursive: true, force: true });
 }
+
+test("default GitHub status adapter annotates documented status items with the queried SHA", async () => {
+  const originalFetch = globalThis.fetch;
+  const revisionSha = "0123456789abcdef0123456789abcdef01234567";
+  const requestedUrls = [];
+  globalThis.fetch = async (url) => {
+    requestedUrls.push(String(url));
+    return {
+      ok: true,
+      async json() {
+        return {
+          // GitHub's GET /repos/{owner}/{repo}/commits/{ref}/status response
+          // documents context/state fields on each status, not a per-item sha.
+          statuses: [{ id: 2005, context: "build", state: "success" }],
+        };
+      },
+    };
+  };
+  try {
+    const statuses = await defaultGitHubAdapter.fetchCommitStatuses({
+      repository: "fixture/repository",
+      sha: revisionSha,
+    });
+    assert.deepEqual(statuses, [
+      { id: 2005, context: "build", state: "success", sha: revisionSha },
+    ]);
+    assert.equal(
+      matchCommitStatus("commit_status:build", statuses[0], revisionSha),
+      true,
+    );
+    assert.deepEqual(requestedUrls, [
+      `https://api.github.com/repos/fixture/repository/commits/${revisionSha}/status?per_page=100&page=1`,
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 test("1. exact R has all required checks success -> normalized success", async () => {
   const value = await fixture({

@@ -1171,12 +1171,25 @@ export const defaultGitHubAdapter = {
       githubHost === "github.com"
         ? "https://api.github.com"
         : `https://${githubHost}/api/v3`;
-    return fetchGitHubPages({
+    const statuses = await fetchGitHubPages({
       apiBase,
       repository,
       sha,
       path: "status",
       key: "statuses",
+    });
+    // The commit-status endpoint identifies the commit in its URL, but the
+    // documented status items do not normally repeat that SHA. Preserve an
+    // explicitly returned SHA for the observer's mismatch fence and annotate
+    // only items where the provider omitted the field.
+    return statuses.map((status) => {
+      if (
+        !status ||
+        typeof status !== "object" ||
+        Object.hasOwn(status, "sha")
+      )
+        return status;
+      return { ...status, sha };
     });
   },
 };
@@ -2655,7 +2668,7 @@ export class RuntimeStore {
     );
   }
 
-  #reconcileRetiredWaitRegistrationFailure(taskId, attemptId, error) {
+  #reconcileRetiredWaitRegistrationFailure(fence, error) {
     const detail = boundedDetail(
       `Wait registration failed after the Fresh Executor was retired: ${commandError(error)} The Attempt was safely interrupted.`,
     );
@@ -2663,81 +2676,124 @@ export class RuntimeStore {
 
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const task = this.#taskRow(taskId);
+      const task = this.#taskRow(fence.taskId);
       const attempt = this.db
         .prepare(`${ATTEMPT_SELECT} WHERE id = ? AND task_id = ?`)
-        .get(attemptId, taskId);
-
-      if (attempt) {
-        // Retirement already proved this exact worker gone. Only fence the
-        // durable bit; retain PID/PGID/start/boot identity for the audit trail.
+        .get(fence.attemptId, fence.taskId);
+      const activeWait = this.db
+        .prepare(`SELECT id, generation FROM wait_subscriptions
+          WHERE task_id = ? AND status = 'active'
+          ORDER BY generation DESC, created_at DESC, id DESC LIMIT 1`)
+        .get(fence.taskId);
+      const maxGeneration = Number(
         this.db
-          .prepare("UPDATE attempts SET worker_terminated = 1 WHERE id = ? AND task_id = ?")
-          .run(attemptId, taskId);
+          .prepare("SELECT COALESCE(MAX(generation), 0) AS generation FROM wait_subscriptions WHERE task_id = ?")
+          .get(fence.taskId).generation,
+      );
+      const registrationWait = this.db
+        .prepare("SELECT id FROM wait_subscriptions WHERE id = ? AND task_id = ?")
+        .get(fence.operationId, fence.taskId);
+      const priorWaitStillCurrent = fence.preExistingActiveWaitId
+        ? activeWait?.id === fence.preExistingActiveWaitId &&
+          Number(activeWait.generation) === fence.preExistingActiveWaitGeneration
+        : !activeWait;
+      const noNewerWait =
+        maxGeneration <= fence.preExistingMaxWaitGeneration && !registrationWait;
+      const fenceMatches =
+        task &&
+        task.latestAttemptId === fence.attemptId &&
+        Number(task.controlVersion) === fence.controlVersion &&
+        Number(task.contractVersion) === fence.contractVersion &&
+        ["accepted", "running", "waiting"].includes(task.state) &&
+        attempt &&
+        ["starting", "running", "parked_wait"].includes(attempt.state);
+
+      // A failed registration may only repair the state it fenced before
+      // retiring the worker. In particular, an active wait with a newer
+      // generation belongs to another registration and must be left alone.
+      if (!fenceMatches || !priorWaitStillCurrent || !noNewerWait) {
+        this.db.exec("ROLLBACK");
+        return false;
       }
 
-      let taskInterrupted = false;
-      if (
-        task &&
-        task.latestAttemptId === attemptId &&
-        ["accepted", "running", "waiting"].includes(task.state)
-      ) {
-        const taskUpdate = this.db
-          .prepare(`UPDATE tasks SET state = 'interrupted', updated_at = ?,
-            final_result = NULL, final_branch_head = COALESCE(final_branch_head, ?),
-            final_revision = COALESCE(final_revision, ?), terminal_detail = ?,
-            terminal_reason = ? WHERE id = ? AND latest_attempt_id = ?
-            AND state IN ('accepted', 'running', 'waiting')`)
-          .run(
-            timestamp,
-            attempt?.finalBranchHead ?? task.finalBranchHead ?? null,
-            task.finalRevision ?? attempt?.finalBranchHead ?? null,
-            detail,
-            "wait_registration_interrupted",
-            taskId,
-            attemptId,
-          );
-        taskInterrupted = taskUpdate.changes === 1;
+      // Retirement already proved this exact worker gone. Only fence the
+      // durable bit; retain PID/PGID/start/boot identity for the audit trail.
+      this.db
+        .prepare("UPDATE attempts SET worker_terminated = 1 WHERE id = ? AND task_id = ?")
+        .run(fence.attemptId, fence.taskId);
 
-        if (attempt) {
-          this.db
-            .prepare(`UPDATE attempts SET state = CASE
-                WHEN state IN ('starting', 'running', 'parked_wait') THEN 'interrupted'
-                ELSE state END,
-              finished_at = CASE
-                WHEN state IN ('starting', 'running', 'parked_wait') THEN COALESCE(finished_at, ?)
-                ELSE finished_at END,
-              terminal_detail = CASE
-                WHEN state IN ('starting', 'running', 'parked_wait') THEN ?
-                ELSE terminal_detail END,
-              worker_terminated = 1 WHERE id = ? AND task_id = ?`)
-            .run(timestamp, detail, attemptId, taskId);
+      // A pre-existing wait belongs to this failed registration's fenced
+      // state. Cancel only that exact identity; a newer registration is
+      // rejected above and is never touched by compensation.
+      if (fence.preExistingActiveWaitId) {
+        const cancelledWait = this.db
+          .prepare(`UPDATE wait_subscriptions SET status = 'cancelled'
+            WHERE id = ? AND task_id = ? AND generation = ? AND status = 'active'`)
+          .run(
+            fence.preExistingActiveWaitId,
+            fence.taskId,
+            fence.preExistingActiveWaitGeneration,
+          );
+        if (cancelledWait.changes !== 1) {
+          this.db.exec("ROLLBACK");
+          return false;
         }
       }
 
-      if (taskInterrupted) {
-        this.db
-          .prepare(`UPDATE attempt_runs SET state = 'aborted',
-            settled_outcome = COALESCE(settled_outcome, ?),
-            settled_at = COALESCE(settled_at, ?) WHERE attempt_id = ?
-            AND state IN ('pending', 'accepted')`)
-          .run(detail, timestamp, attemptId);
-        this.db
-          .prepare("UPDATE wait_subscriptions SET status = 'cancelled' WHERE task_id = ? AND status = 'active'")
-          .run(taskId);
-        const currentTask = this.#taskRow(taskId);
-        const resultId = this.#insertResultDelivery({
-          task: currentTask,
-          outcome: "failed",
-          finalResult: null,
-          terminalDetail: detail,
-          terminalReason: "wait_registration_interrupted",
-          finalRevision: currentTask?.finalRevision ?? null,
-          finalBranchHead: currentTask?.finalBranchHead ?? null,
-        });
-        if (!resultId)
-          throw new Error("Interrupted Task did not produce a Result delivery.");
+      const taskUpdate = this.db
+        .prepare(`UPDATE tasks SET state = 'interrupted', updated_at = ?,
+          final_result = NULL, final_branch_head = COALESCE(final_branch_head, ?),
+          final_revision = COALESCE(final_revision, ?), terminal_detail = ?,
+          terminal_reason = ? WHERE id = ? AND latest_attempt_id = ?
+          AND state IN ('accepted', 'running', 'waiting')
+          AND control_version = ? AND contract_version = ?`)
+        .run(
+          timestamp,
+          attempt.finalBranchHead ?? task.finalBranchHead ?? null,
+          task.finalRevision ?? attempt.finalBranchHead ?? null,
+          detail,
+          "wait_registration_interrupted",
+          fence.taskId,
+          fence.attemptId,
+          fence.controlVersion,
+          fence.contractVersion,
+        );
+      if (taskUpdate.changes !== 1) {
+        this.db.exec("ROLLBACK");
+        return false;
       }
+
+      this.db
+        .prepare(`UPDATE attempts SET state = CASE
+            WHEN state IN ('starting', 'running', 'parked_wait') THEN 'interrupted'
+            ELSE state END,
+          finished_at = CASE
+            WHEN state IN ('starting', 'running', 'parked_wait') THEN COALESCE(finished_at, ?)
+            ELSE finished_at END,
+          terminal_detail = CASE
+            WHEN state IN ('starting', 'running', 'parked_wait') THEN ?
+            ELSE terminal_detail END,
+          worker_terminated = 1 WHERE id = ? AND task_id = ?
+          AND state IN ('starting', 'running', 'parked_wait')`)
+        .run(timestamp, detail, fence.attemptId, fence.taskId);
+      this.db
+        .prepare(`UPDATE attempt_runs SET state = 'aborted',
+          settled_outcome = COALESCE(settled_outcome, ?),
+          settled_at = COALESCE(settled_at, ?) WHERE attempt_id = ?
+          AND state IN ('pending', 'accepted')`)
+        .run(detail, timestamp, fence.attemptId);
+      const currentTask = this.#taskRow(fence.taskId);
+      const resultId = this.#insertResultDelivery({
+        task: currentTask,
+        outcome: "failed",
+        finalResult: null,
+        terminalDetail: detail,
+        terminalReason: "wait_registration_interrupted",
+        finalRevision: currentTask?.finalRevision ?? null,
+        finalBranchHead: currentTask?.finalBranchHead ?? null,
+      });
+      if (!resultId)
+        throw new Error("Interrupted Task did not produce a Result delivery.");
 
       this.db.exec("COMMIT");
       return true;
@@ -3015,6 +3071,28 @@ export class RuntimeStore {
     const timestamp = now();
     const capturedControlVersion = Number(taskRow.controlVersion);
     const capturedContractVersion = Number(taskRow.contractVersion);
+    const preExistingActiveWait = this.db
+      .prepare(`SELECT id, generation FROM wait_subscriptions
+        WHERE task_id = ? AND status = 'active'
+        ORDER BY generation DESC, created_at DESC, id DESC LIMIT 1`)
+      .get(targetTaskId);
+    const preExistingMaxWaitGeneration = Number(
+      this.db
+        .prepare("SELECT COALESCE(MAX(generation), 0) AS generation FROM wait_subscriptions WHERE task_id = ?")
+        .get(targetTaskId).generation,
+    );
+    const registrationFence = {
+      taskId: targetTaskId,
+      attemptId: latestAttemptId,
+      controlVersion: capturedControlVersion,
+      contractVersion: capturedContractVersion,
+      operationId: subscriptionId,
+      preExistingActiveWaitId: preExistingActiveWait?.id ?? null,
+      preExistingActiveWaitGeneration: preExistingActiveWait
+        ? Number(preExistingActiveWait.generation)
+        : null,
+      preExistingMaxWaitGeneration,
+    };
 
     // Do not publish a parked/waiting state until both ownership barriers have
     // been proven. In particular, a live local gate must remain unresolved in
@@ -3185,8 +3263,7 @@ export class RuntimeStore {
       if (workerRetired) {
         try {
           const reconciled = this.#reconcileRetiredWaitRegistrationFailure(
-            targetTaskId,
-            latestAttemptId,
+            registrationFence,
             error,
           );
           if (reconciled && this.active?.attemptId === latestAttemptId)

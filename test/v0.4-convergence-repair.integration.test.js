@@ -309,7 +309,7 @@ test("due reactor persists exact ci_not_observable control evidence and terminal
   }
 });
 
-test("retirement/version barrier reconciles a dead worker without a running Task or false wait", async () => {
+test("retirement/version fence does not reconcile a changed Task or cancel its wait", async () => {
   const value = await fixture();
   try {
     const waiting = await eventually(
@@ -338,20 +338,100 @@ test("retirement/version barrier reconciles a dead worker without a running Task
     );
 
     const reconciled = value.runtime.getTask(value.task.id);
-    assert.equal(reconciled.state, "interrupted");
-    assert.equal(reconciled.attempts[0].state, "interrupted");
+    assert.equal(reconciled.state, "waiting");
+    assert.equal(reconciled.attempts[0].state, "parked_wait");
     assert.equal(reconciled.attempts[0].workerTerminated, true);
     assert.equal(value.runtime.active, null);
     assert.equal(
       reconciled.waitSubscriptions.filter((subscription) => subscription.status === "active").length,
-      0,
+      1,
     );
-    assert.equal(value.runtime.hasCapacityConflict(), false);
+    assert.equal(value.runtime.hasCapacityConflict(), true);
     assert.equal(
       value.runtime.db
         .prepare("SELECT COUNT(*) AS count FROM result_deliveries WHERE task_id = ? AND outcome = 'failed'")
         .get(value.task.id).count,
+      0,
+    );
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("retirement compensation cannot interrupt Task or cancel a newer wait", async () => {
+  const value = await fixture();
+  try {
+    const waiting = await eventually(
+      () => value.runtime.getTask(value.task.id),
+      (task) => task.state === "waiting",
+    );
+    const priorWait = waiting.waitSubscriptions.find(
+      (subscription) => subscription.status === "active",
+    );
+    const candidate = waiting.finalRevision;
+    const originalRetire = value.runtime.retireWorker.bind(value.runtime);
+    let injected = false;
+    let failRegistration = false;
+    let newerRegistration;
+
+    const originalPrepare = value.runtime.db.prepare.bind(value.runtime.db);
+    value.runtime.db.prepare = (sql) => {
+      const statement = originalPrepare(sql);
+      if (failRegistration && sql.startsWith("UPDATE tasks SET state = 'waiting'")) {
+        failRegistration = false;
+        return {
+          run() {
+            throw Object.assign(new Error("deterministic registration barrier"), {
+              code: "registration_barrier",
+            });
+          },
+        };
+      }
+      return statement;
+    };
+    value.runtime.retireWorker = async (...args) => {
+      const retired = await originalRetire(...args);
+      if (retired && !injected) {
+        injected = true;
+        newerRegistration = await value.runtime.registerWaitSubscription({
+          taskId: value.task.id,
+          revisionSha: candidate,
+          requiredChecks: ["check_run:github-actions/ci", "commit_status:build"],
+        });
+        // Registration A resumes only after B has committed its newer wait.
+        failRegistration = true;
+      }
+      return retired;
+    };
+
+    await assert.rejects(
+      () => value.runtime.registerWaitSubscription({
+        taskId: value.task.id,
+        revisionSha: candidate,
+        requiredChecks: ["check_run:github-actions/ci", "commit_status:build"],
+      }),
+      (error) => error.code === "registration_barrier",
+    );
+
+    const reconciled = value.runtime.getTask(value.task.id);
+    const newerWait = value.runtime.getWaitSubscription(
+      newerRegistration.waitSubscription.id,
+    );
+    assert.equal(priorWait.status, "active");
+    assert.equal(newerRegistration.waitSubscription.generation, priorWait.generation + 1);
+    assert.equal(newerWait.status, "active");
+    assert.equal(reconciled.state, "waiting");
+    assert.equal(reconciled.attempts[0].state, "parked_wait");
+    assert.equal(reconciled.attempts[0].workerTerminated, true);
+    assert.equal(
+      reconciled.waitSubscriptions.filter((subscription) => subscription.status === "active").length,
       1,
+    );
+    assert.equal(
+      value.runtime.db
+        .prepare("SELECT COUNT(*) AS count FROM result_deliveries WHERE task_id = ? AND outcome = 'failed'")
+        .get(value.task.id).count,
+      0,
     );
   } finally {
     await closeFixture(value);
