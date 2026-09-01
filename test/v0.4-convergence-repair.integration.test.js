@@ -209,6 +209,52 @@ test("public wait reconciliation ignores caller future time and remains an obser
   }
 });
 
+test("public IPC timeout leaves the wait active until the daemon reactor owns the timeout", async () => {
+  const value = await fixture();
+  let daemon;
+  try {
+    const waiting = await eventually(() => value.runtime.getTask(value.task.id), (task) => task.state === "waiting");
+    const waitId = waiting.waitSubscriptions[0].id;
+    const dbPath = value.runtime.dbPath;
+    const socketPath = join(value.parent, "runtime-public-timeout.sock");
+    value.runtime.close();
+    const restarted = new RuntimeStore({
+      dbPath,
+      piCommand: value.piCommand,
+      worktreeRoot: join(value.parent, "worktrees"),
+      gitHubAdapter: value.adapter,
+    });
+    daemon = await startRuntimeDaemon({ dbPath, socketPath, store: restarted });
+    restarted.db
+      .prepare("UPDATE wait_subscriptions SET deadline_at = ? WHERE id = ?")
+      .run("2000-01-01T00:00:00.000Z", waitId);
+    const client = new RuntimeClient({ socketPath, dbPath });
+    const response = await client.requestSocket(
+      "wait.reconcile",
+      {
+        id: waitId,
+        now: "2999-01-01T00:00:00.000Z",
+        classification: "success",
+        evidenceId: "caller-forged-evidence",
+        trigger: true,
+      },
+      PROTOCOL_VERSION,
+    );
+    assert.equal(response.success, true);
+    assert.equal(response.data.task.state, "waiting");
+    assert.equal(response.data.waitSubscription.status, "active");
+    const timedOut = await eventually(
+      () => restarted.getTask(value.task.id),
+      (task) => task.state === "failed",
+    );
+    assert.equal(timedOut.terminalReason, "external_timeout");
+    assert.equal(restarted.getWaitSubscription(waitId).status, "timed_out");
+  } finally {
+    await daemon?.close();
+    await rm(value.parent, { recursive: true, force: true });
+  }
+});
+
 test("daemon-owned wait reactor reconciles a due CI change without a user request", async () => {
   const value = await fixture();
   let nowValue = Date.now();

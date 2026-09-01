@@ -220,6 +220,7 @@ test("default GitHub status adapter annotates documented status items with the q
     requestedUrls.push(String(url));
     return {
       ok: true,
+      headers: { get(name) { return name.toLowerCase() === "retry-after" ? "17" : null; } },
       async json() {
         return {
           // GitHub's GET /repos/{owner}/{repo}/commits/{ref}/status response
@@ -241,6 +242,7 @@ test("default GitHub status adapter annotates documented status items with the q
       matchCommitStatus("commit_status:build", statuses[0], revisionSha),
       true,
     );
+    assert.equal(statuses.providerGuidanceMs, 17_000);
     assert.deepEqual(requestedUrls, [
       `https://api.github.com/repos/fixture/repository/commits/${revisionSha}/status?per_page=100&page=1`,
     ]);
@@ -297,6 +299,63 @@ test("default GitHub requests abort at the effective wait deadline", async () =>
     );
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("default GitHub requests abort while response body parsing hangs", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => await new Promise(() => {}),
+  });
+  try {
+    await assert.rejects(
+      () => defaultGitHubAdapter.fetchCheckRuns({
+        repository: "fixture/repository",
+        sha: "0123456789abcdef0123456789abcdef01234567",
+        deadlineAt: Date.now() + 20,
+      }),
+      (error) => error.code === "network_error" && error.timedOut === true,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("provider guidance controls pending schedule over nominal polling and respects the deadline", async () => {
+  const value = await fixture();
+  try {
+    const candidate = await commitCandidate(value.task.taskWorktree, "scheduled.txt", "scheduled\n", "scheduled");
+    await value.runtime.publishTask({ id: value.task.id, candidateSha: candidate });
+    const registered = await value.runtime.registerWaitSubscription({
+      taskId: value.task.id,
+      revisionSha: candidate,
+      timeoutMs: 300_000,
+    });
+    const adapter = {
+      async fetchCheckRuns() {
+        const runs = [];
+        Object.defineProperty(runs, "providerGuidanceMs", { value: 120_000 });
+        return runs;
+      },
+      async fetchCommitStatuses() {
+        const statuses = [];
+        Object.defineProperty(statuses, "providerGuidanceMs", { value: 90_000 });
+        return statuses;
+      },
+    };
+    const observedAt = Date.now();
+    const result = await value.runtime.reconcileWaitSubscription(
+      registered.waitSubscription.id,
+      { now: observedAt, gitHubAdapter: adapter },
+    );
+    assert.equal(result.classification, "pending");
+    assert.equal(
+      Date.parse(result.waitSubscription.nextReconcileAt) - observedAt,
+      120_000,
+    );
+  } finally {
+    await closeFixture(value);
   }
 });
 

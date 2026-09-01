@@ -1205,8 +1205,9 @@ export async function callFetchCheckRuns(adapter, params) {
       "GitHub adapter must provide fetchCheckRuns or getCheckRuns.",
     );
   const res = await fn.call(adapter, params);
-  if (Array.isArray(res)) return res;
-  if (res && Array.isArray(res.check_runs)) return res.check_runs;
+  if (Array.isArray(res)) return decorateProviderItems(res, res.providerGuidanceMs);
+  if (res && Array.isArray(res.check_runs))
+    return decorateProviderItems(res.check_runs, res.providerGuidanceMs);
   return [];
 }
 
@@ -1221,8 +1222,9 @@ export async function callFetchCommitStatuses(adapter, params) {
       "GitHub adapter must provide fetchCommitStatuses or getCommitStatus.",
     );
   const res = await fn.call(adapter, params);
-  if (Array.isArray(res)) return res;
-  if (res && Array.isArray(res.statuses)) return res.statuses;
+  if (Array.isArray(res)) return decorateProviderItems(res, res.providerGuidanceMs);
+  if (res && Array.isArray(res.statuses))
+    return decorateProviderItems(res.statuses, res.providerGuidanceMs);
   return [];
 }
 
@@ -1235,6 +1237,11 @@ function redactSecrets(message) {
 
 function headerValue(response, name) {
   return response?.headers?.get?.(name) ?? null;
+}
+
+function finiteNonNegativeMs(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
 }
 
 function delayHeaderMs(value, now = Date.now()) {
@@ -1256,13 +1263,47 @@ function providerGuidanceMs(response) {
 }
 
 function decorateProviderItems(items, guidanceMs) {
-  if (guidanceMs == null) return items;
+  const sanitizedGuidance = finiteNonNegativeMs(guidanceMs);
+  if (sanitizedGuidance == null) return items;
+  const descriptor = Object.getOwnPropertyDescriptor(items, "providerGuidanceMs");
+  if (descriptor && !descriptor.configurable) return items;
   Object.defineProperty(items, "providerGuidanceMs", {
-    value: guidanceMs,
+    value: sanitizedGuidance,
     enumerable: false,
     configurable: true,
   });
   return items;
+}
+
+function readResponseBody(response, method, signal) {
+  return new Promise((resolveBody, rejectBody) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      callback(value);
+    };
+    const onAbort = () => {
+      finish(
+        rejectBody,
+        Object.assign(new Error("GitHub response body read aborted."), {
+          name: "AbortError",
+        }),
+      );
+    };
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve()
+      .then(() => response[method]())
+      .then(
+        (value) => finish(resolveBody, value),
+        (error) => finish(rejectBody, error),
+      );
+  });
 }
 
 async function fetchGitHubJson(url, token, { deadlineAt = Number.POSITIVE_INFINITY } = {}) {
@@ -1272,8 +1313,14 @@ async function fetchGitHubJson(url, token, { deadlineAt = Number.POSITIVE_INFINI
     "X-GitHub-Api-Version": "2022-11-28",
   };
   if (token) headers["Authorization"] = `Bearer ${token}`;
-  const remaining = Number.isFinite(deadlineAt)
-    ? deadlineAt - Date.now()
+  const deadline = deadlineAt == null ? Number.POSITIVE_INFINITY : Number(deadlineAt);
+  if (!Number.isFinite(deadline) && deadline !== Number.POSITIVE_INFINITY)
+    throw Object.assign(new Error("GitHub request deadline is invalid."), {
+      code: "network_error",
+      timedOut: false,
+    });
+  const remaining = Number.isFinite(deadline)
+    ? deadline - Date.now()
     : Number.POSITIVE_INFINITY;
   const requestTimeoutMs = Math.min(30_000, Math.max(1, remaining));
   const controller = new AbortController();
@@ -1283,58 +1330,66 @@ async function fetchGitHubJson(url, token, { deadlineAt = Number.POSITIVE_INFINI
   let res;
   try {
     res = await fetch(url, { headers, signal: controller.signal });
+
+    if (!res.ok) {
+      const status = res.status;
+      const text = await readResponseBody(res, "text", controller.signal);
+      const guidanceMs = providerGuidanceMs(res);
+      if (status === 429 || status === 401 || status === 403) {
+        const remainingHeader = headerValue(res, "x-ratelimit-remaining");
+        const retryAfterMs = delayHeaderMs(headerValue(res, "retry-after"));
+        const resetHeader = headerValue(res, "x-ratelimit-reset");
+        const resetMs = Number(resetHeader) * 1000 - Date.now();
+        if (status === 429 || remainingHeader === "0" || retryAfterMs != null) {
+          throw Object.assign(new Error("GitHub API rate limit exceeded"), {
+            code: "rate_limited",
+            retryAfterMs: finiteNonNegativeMs(
+              retryAfterMs ?? (Number.isFinite(resetMs) ? Math.max(0, resetMs) : 60_000),
+            ) ?? 60_000,
+            providerGuidanceMs: guidanceMs,
+            status,
+          });
+        }
+        throw Object.assign(
+          new Error(
+            `GitHub API authentication/permission error (${status}): ${text.slice(0, 200)}`,
+          ),
+          { code: "auth_failure", providerGuidanceMs: guidanceMs, status },
+        );
+      }
+      if (status >= 500) {
+        throw Object.assign(
+          new Error(`GitHub API server error (${status})`),
+          { code: "provider_error", providerGuidanceMs: guidanceMs, status },
+        );
+      }
+      throw Object.assign(
+        new Error(
+          `GitHub API request failed (${status}): ${text.slice(0, 200)}`,
+        ),
+        { code: "api_error", providerGuidanceMs: guidanceMs, status },
+      );
+    }
+
+    const data = await readResponseBody(res, "json", controller.signal);
+    return { data, guidanceMs: providerGuidanceMs(res), response: res };
   } catch (err) {
+    if (["rate_limited", "auth_failure", "provider_error", "api_error"].includes(err?.code))
+      throw err;
     const timedOut = controller.signal.aborted;
     throw Object.assign(new Error(
       timedOut
         ? "GitHub request timed out before the wait deadline."
-        : `GitHub network error: ${err.message}`,
+        : `GitHub network error: ${err?.message ?? err}`,
     ), {
       code: "network_error",
       cause: err,
       timedOut,
+      providerGuidanceMs: finiteNonNegativeMs(providerGuidanceMs(res)),
     });
   } finally {
     clearTimeout(timer);
   }
-
-  if (!res.ok) {
-    const status = res.status;
-    const text = await res.text().catch(() => "");
-    if (status === 429 || status === 401 || status === 403) {
-      const remainingHeader = headerValue(res, "x-ratelimit-remaining");
-      const retryAfterMs = delayHeaderMs(headerValue(res, "retry-after"));
-      const resetHeader = headerValue(res, "x-ratelimit-reset");
-      const resetMs = Number(resetHeader) * 1000 - Date.now();
-      if (status === 429 || remainingHeader === "0" || retryAfterMs != null) {
-        throw Object.assign(new Error("GitHub API rate limit exceeded"), {
-          code: "rate_limited",
-          retryAfterMs: retryAfterMs ?? (Number.isFinite(resetMs) ? Math.max(0, resetMs) : 60_000),
-          status,
-        });
-      }
-      throw Object.assign(
-        new Error(
-          `GitHub API authentication/permission error (${status}): ${text.slice(0, 200)}`,
-        ),
-        { code: "auth_failure", status },
-      );
-    }
-    if (status >= 500) {
-      throw Object.assign(
-        new Error(`GitHub API server error (${status})`),
-        { code: "provider_error", status },
-      );
-    }
-    throw Object.assign(
-      new Error(
-        `GitHub API request failed (${status}): ${text.slice(0, 200)}`,
-      ),
-      { code: "api_error", status },
-    );
-  }
-
-  return { data: await res.json(), guidanceMs: providerGuidanceMs(res), response: res };
 }
 
 function nextLink(response) {
@@ -1412,7 +1467,7 @@ export const defaultGitHubAdapter = {
     // documented status items do not normally repeat that SHA. Preserve an
     // explicitly returned SHA for the observer's mismatch fence and annotate
     // only items where the provider omitted the field.
-    return statuses.map((status) => {
+    const annotatedStatuses = statuses.map((status) => {
       if (
         !status ||
         typeof status !== "object" ||
@@ -1421,6 +1476,7 @@ export const defaultGitHubAdapter = {
         return status;
       return { ...status, sha };
     });
+    return decorateProviderItems(annotatedStatuses, statuses.providerGuidanceMs);
   },
 };
 
@@ -2903,7 +2959,10 @@ export class RuntimeStore {
           detail: "Exact endpoint/ref readback confirmed the transmitted candidate after control mutation.",
           readback,
         });
-      } else if (readback === (effect.expectedOldOid?.toLowerCase() ?? null) || readback === null) {
+      } else if (
+        readback === (effect.expectedOldOid?.toLowerCase() ?? null) ||
+        (readback === null && effect.expectedOldOid == null)
+      ) {
         this.#updateRemoteEffect(effect.id, "failed", {
           detail: "Exact endpoint/ref readback confirmed the transmitted candidate was not applied after control mutation.",
           readback,
@@ -2919,6 +2978,13 @@ export class RuntimeStore {
           "Remote publication readback found an unexpected ref value after control mutation.",
         );
       }
+    }
+    if (this.#hasUnknownRemoteEffects(taskId)) {
+      throw this.#remotePublicationFailure(
+        null,
+        "remote_readback_unknown",
+        "A transmitted remote effect remains unknown after exact readback; no new Attempt may start.",
+      );
     }
   }
 
@@ -3338,7 +3404,10 @@ export class RuntimeStore {
         });
         return this.#remoteEffectResult(taskId, effect.id);
       }
-      if (readback === expectedOldOid || readback === null) {
+      if (
+        readback === expectedOldOid ||
+        (readback === null && expectedOldOid == null)
+      ) {
         this.#updateRemoteEffect(effect.id, "failed", {
           detail: "Exact endpoint/ref readback confirmed the transmitted candidate was not applied after control mutation.",
           readback,
@@ -4348,6 +4417,7 @@ export class RuntimeStore {
       markBlockedOnAuth = true,
       trigger = false,
       autoTrigger = false,
+      publicObservation = false,
     } = options;
     this.ensureSupported();
     const id = String(subscriptionId ?? "").trim();
@@ -4369,7 +4439,14 @@ export class RuntimeStore {
     const taskRow = this.#taskRow(subscription.taskId);
     if (!taskRow) throw new Error(`Task ${subscription.taskId} was not found.`);
 
-    const nowTime = nowOverride ? new Date(nowOverride).getTime() : new Date(this.waitClock()).getTime();
+    const nowTime = nowOverride != null
+      ? new Date(nowOverride).getTime()
+      : new Date(this.waitClock()).getTime();
+    if (!Number.isFinite(nowTime)) {
+      throw Object.assign(new Error("Wait reconciliation clock returned an invalid time."), {
+        code: "invalid_wait_clock",
+      });
+    }
     const nowIso = new Date(nowTime).toISOString();
     const taskBudget = normalizeBudget(taskRow.budget);
     const acceptedAt = new Date(taskRow.acceptedAt || taskRow.createdAt).getTime();
@@ -4377,12 +4454,20 @@ export class RuntimeStore {
       ? acceptedAt + taskBudget.totalCommitmentWallClockDeadlineMs
       : Number.NaN;
     const subscriptionDeadline = new Date(subscription.deadlineAt).getTime();
+    if (!Number.isFinite(subscriptionDeadline)) {
+      throw Object.assign(new Error("Wait subscription deadline is invalid."), {
+        code: "invalid_deadline",
+      });
+    }
     const effectiveDeadline = Number.isFinite(totalCommitmentDeadline)
       ? Math.min(subscriptionDeadline, totalCommitmentDeadline)
       : subscriptionDeadline;
-    const effectiveDeadlineIso = Number.isFinite(effectiveDeadline)
-      ? new Date(effectiveDeadline).toISOString()
-      : subscription.deadlineAt;
+    if (!Number.isFinite(effectiveDeadline)) {
+      throw Object.assign(new Error("Wait effective deadline is invalid."), {
+        code: "invalid_deadline",
+      });
+    }
+    const effectiveDeadlineIso = new Date(effectiveDeadline).toISOString();
 
     const adapter = gitHubAdapter ?? gitHubClient ?? this.gitHubAdapter;
     let checkRuns = [];
@@ -4482,11 +4567,20 @@ export class RuntimeStore {
               WAIT_TRIGGER_CAPABILITY,
             );
           }
-          this.db
-            .prepare(
-              "UPDATE wait_subscriptions SET status = 'timed_out', last_reconciled_at = ?, next_reconcile_at = NULL, deadline_at = MIN(deadline_at, ?) WHERE id = ? AND status = 'active'",
-            )
-            .run(nowIso, effectiveDeadlineIso, id);
+          if (!publicObservation) {
+            this.db
+              .prepare(
+                "UPDATE wait_subscriptions SET status = 'timed_out', last_reconciled_at = ?, next_reconcile_at = NULL, deadline_at = MIN(deadline_at, ?) WHERE id = ? AND status = 'active'",
+              )
+              .run(nowIso, effectiveDeadlineIso, id);
+          } else {
+            this.db
+              .prepare(
+                "UPDATE wait_subscriptions SET last_reconciled_at = ?, next_reconcile_at = NULL, deadline_at = MIN(deadline_at, ?) WHERE id = ? AND status = 'active'",
+              )
+              .run(nowIso, effectiveDeadlineIso, id);
+            this.#wakeWaitReactor();
+          }
           return {
             task: this.getTask(subscription.taskId),
             waitSubscription: this.getWaitSubscription(id),
@@ -4494,9 +4588,18 @@ export class RuntimeStore {
             transientError,
           };
         }
+        const nominalDelay = computeReconcileInterval(
+          subscription.createdAt,
+          nowTime,
+          subscription.id,
+        );
+        const providerDelay = finiteNonNegativeMs(error.providerGuidanceMs) ?? 0;
+        const requestedDelay = finiteNonNegativeMs(error.retryAfterMs);
+        const fallbackDelay = isRateLimit ? 60_000 : 15_000;
         const retryDelay = Math.max(
-          error.retryAfterMs ?? (isRateLimit ? 60_000 : 15_000),
-          isRateLimit && error.retryAfterMs != null ? 0 : 15_000,
+          nominalDelay,
+          providerDelay,
+          requestedDelay ?? fallbackDelay,
         );
         const nextReconcileIso = new Date(
           Math.min(nowTime + retryDelay, effectiveDeadline),
@@ -4714,7 +4817,10 @@ export class RuntimeStore {
       // Keep the row active until the runtime-owned trigger transaction when
       // this is a wake. That transaction must atomically create the timeout
       // Result; an intervening daemon crash must leave the wait replayable.
-      if (!(capability === WAIT_RECONCILE_CAPABILITY && (trigger || autoTrigger))) {
+      if (
+        !publicObservation &&
+        !(capability === WAIT_RECONCILE_CAPABILITY && (trigger || autoTrigger))
+      ) {
         this.db
           .prepare(
             "UPDATE wait_subscriptions SET status = 'timed_out', last_reconciled_at = ?, next_reconcile_at = NULL WHERE id = ?",
@@ -4727,8 +4833,8 @@ export class RuntimeStore {
     if (classification === "pending") {
       const nextInterval = Math.max(
         computeReconcileInterval(subscription.createdAt, nowTime, subscription.id),
-        Number(checkRuns.providerGuidanceMs ?? 0),
-        Number(commitStatuses.providerGuidanceMs ?? 0),
+        finiteNonNegativeMs(checkRuns.providerGuidanceMs) ?? 0,
+        finiteNonNegativeMs(commitStatuses.providerGuidanceMs) ?? 0,
       );
       nextReconcileIso = new Date(
         Math.min(nowTime + nextInterval, effectiveDeadline),
@@ -4770,7 +4876,7 @@ export class RuntimeStore {
     // that can allocate a continuation or complete the Task.
     if (
       capability !== WAIT_RECONCILE_CAPABILITY &&
-      ["success", "failure", "ci_not_observable"].includes(classification)
+      ["success", "failure", "ci_not_observable", "timed_out"].includes(classification)
     ) {
       this.#wakeWaitReactor();
     }
@@ -9691,7 +9797,7 @@ export class RuntimeStore {
         .prepare("UPDATE wait_subscriptions SET status = 'cancelled' WHERE task_id = ? AND status = 'active'")
         .run(task.id);
       // Prepared effects are cancelled by the new fence. A transmitted
-      // unknown effect remains unknown and is reconciled truthfully later.
+      // unknown effect is reconciled at the exact endpoint after this fence.
       this.db
         .prepare(`UPDATE remote_effects SET state = 'failed', detail = ?, updated_at = ?
           WHERE task_id = ? AND control_version = ? AND contract_version = ?
@@ -9713,6 +9819,14 @@ export class RuntimeStore {
       throw error;
     }
 
+    let remoteReadbackError = null;
+    try {
+      if (this.#hasUnknownRemoteEffects(task.id))
+        await this.#reconcileUnknownRemoteEffects(task.id);
+    } catch (error) {
+      remoteReadbackError = error;
+    }
+
     const gateStopped = active
       ? this.#cancelLocalGate(active)
       : this.#reconcileGate(attempt) !== "ambiguous";
@@ -9729,6 +9843,10 @@ export class RuntimeStore {
     this.db
       .prepare("UPDATE attempts SET worker_terminated = 1 WHERE id = ? AND task_id = ? AND state = 'stopped'")
       .run(attempt.id, task.id);
+    if (remoteReadbackError) {
+      this.markBlocked(task.id, attempt.id, remoteReadbackError.message);
+      throw remoteReadbackError;
+    }
     if (this.active?.attemptId === attempt.id) this.active = null;
     return this.getTask(task.id);
   }

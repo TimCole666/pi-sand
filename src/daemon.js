@@ -92,11 +92,12 @@ async function handleRequest(request, store) {
         evidenceId: _evidenceId,
         evidenceIds: _evidenceIds,
         selectorResults: _selectorResults,
+        publicObservation: _publicObservation,
         ...observationParams
       } = params;
       return await store.reconcileWaitSubscription(
         params.id ?? params.subscriptionId ?? params.waitId,
-        observationParams,
+        { ...observationParams, publicObservation: true },
       );
     }
     case "result.claim": {
