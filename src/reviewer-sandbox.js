@@ -64,7 +64,7 @@ function main() {
 
   const result = spawnSync(
     SETPRIV,
-    ["--no-new-privs", "--bounding-set=-sys_admin", "--", command, ...argumentsForCommand],
+    ["--no-new-privs", "--inh-caps=-all", "--bounding-set=-all", "--", command, ...argumentsForCommand],
     { stdio: ["inherit", "inherit", "pipe"], encoding: "utf8" },
   );
   if (result.stderr) process.stderr.write(result.stderr);

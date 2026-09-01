@@ -18,6 +18,12 @@ if (process.argv.includes("--version")) {
   process.exit(0);
 }
 record({ type: "spawn", args: process.argv.slice(2), cwd: process.cwd() });
+if (process.env.FAKE_PI_CAPABILITY_PROBE) {
+  const capabilityNames = ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"];
+  const status = fs.readFileSync("/proc/self/status", "utf8");
+  const capabilities = Object.fromEntries(capabilityNames.map((name) => [name, status.match(new RegExp("^" + name + ":\\\\s+([0-9a-f]+)$", "m"))?.[1] ?? null]));
+  record({ type: "capabilities", capabilities });
+}
 if (process.env.FAKE_PI_ENV_PROBE) record({ type: "env", runtimeDb: process.env.PI_SAND_RUNTIME_DB || null, socket: process.env.PI_SAND_SOCKET || null, taskWorktreeRoot: process.env.PI_SAND_TASK_WORKTREE_ROOT || null });
 let buffer = "";
 const send = (value, delay = 0) => setTimeout(() => process.stdout.write(JSON.stringify(value) + "\\n"), delay);
@@ -229,6 +235,22 @@ test("Fresh Executor reviewer profile exposes only read-only Pi tools", async ()
     assert.equal(FRESH_REVIEWER_ARGS.at(-1), "read,grep,find,ls");
     assert.equal(FRESH_REVIEWER_ARGS.some((arg) => /bash|write|edit|task|daemon|push/i.test(arg)), false);
     assert.equal(FRESH_REVIEWER_ARGS.includes("--approve"), true);
+    return handle;
+  });
+});
+
+test("Fresh Executor reviewer process has zero Linux capabilities", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+  await withExecutor({}, async ({ fake, taskCwd }) => {
+    const handle = await start(fake, taskCwd, {
+      role: "reviewer",
+      env: { ...process.env, ...fake.env, FAKE_PI_CAPABILITY_PROBE: "1" },
+    });
+    const capabilityRecord = (await readCommands(fake.log)).find(({ type }) => type === "capabilities");
+    assert.ok(capabilityRecord);
+    for (const [name, value] of Object.entries(capabilityRecord.capabilities)) {
+      assert.equal(typeof value, "string", `${name} must be reported by /proc/self/status`);
+      assert.equal(BigInt(`0x${value}`), 0n, `${name} must be zero`);
+    }
     return handle;
   });
 });
