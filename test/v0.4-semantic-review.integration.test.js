@@ -34,8 +34,12 @@ async function fixture({ completionContract, reviewerFactory, workerFactory, bud
     calls.push({ role, cwd, taskPrompt });
     if (role === "reviewer") {
       calls.at(-1).candidateAtStart = git(cwd, ["rev-parse", "HEAD"]);
-      await writeFile(join(cwd, "reviewer-only.txt"), "isolated\n");
-      onEvent({ type: "message_end", message: { role: "assistant", content: JSON.stringify({ criteria: ["semantic criterion"], verdicts: [], findings: [], uncertainty: "", recommendation: "accept" }), stopReason: "stop" } });
+      await assert.rejects(
+        writeFile(join(cwd, "reviewer-only.txt"), "isolated\n"),
+        /EACCES|permission denied/i,
+        "the reviewer view must reject filesystem mutation",
+      );
+      onEvent({ type: "message_end", message: { role: "assistant", content: JSON.stringify({ candidateSha: calls.at(-1).candidateAtStart, verdicts: [{ criterion: "semantic criterion", verdict: "pass", evidenceRefs: ["deterministic-gates"] }], findings: [{ severity: "info", detail: "No semantic discrepancies found.", evidenceRefs: ["deterministic-gates"] }], uncertainty: "", recommendation: "accept" }), stopReason: "stop" } });
     } else {
       await writeFile(join(cwd, "candidate.txt"), "candidate\n");
       onEvent({ type: "message_end", message: { role: "assistant", content: "IMPLEMENTER_TRANSCRIPT_MARKER", stopReason: "stop" } });
@@ -71,6 +75,7 @@ test("conditional review is a fresh exact-candidate Attempt with bounded context
     assert.ok(reviewer);
     assert.equal(reviewer.cause, "review");
     assert.equal(completed.terminalReason, "verified_semantic_review");
+    assert.equal(completed.finalResult, "IMPLEMENTER_TRANSCRIPT_MARKER");
     const executor = value.calls.find(({ role }) => role === "executor");
     const reviewCall = value.calls.find(({ role }) => role === "reviewer");
     assert.notEqual(reviewCall.cwd, executor.cwd);
@@ -81,6 +86,29 @@ test("conditional review is a fresh exact-candidate Attempt with bounded context
     assert.equal(await readFile(join(completed.taskWorktree, "reviewer-only.txt")).catch(() => null), null);
     assert.equal(completed.evidence.filter((evidence) => evidence.kind === "semantic_review").length, 1);
   } finally { await closeFixture(value); }
+});
+
+test("malformed semantic receipts are durably blocked and never verified", async () => {
+  for (const receipt of [
+    { candidateSha: "MATCH", verdicts: [], findings: [], recommendation: "accept" },
+    { candidateSha: "0".repeat(40), verdicts: [{ criterion: "semantic criterion", verdict: "pass", evidenceRefs: [] }], findings: [{ severity: "unknown", detail: "bad", evidenceRefs: ["x"] }], recommendation: "accept" },
+  ]) {
+    const value = await fixture({
+      reviewerFactory: async ({ onEvent, taskPrompt }) => {
+        const candidateSha = taskPrompt.match(/Candidate SHA: ([0-9a-f]{40})/)?.[1] ?? "";
+        const actualReceipt = receipt.candidateSha === "MATCH" ? { ...receipt, candidateSha } : receipt;
+        onEvent({ type: "message_end", message: { role: "assistant", content: JSON.stringify(actualReceipt), stopReason: "stop" } });
+        onEvent({ type: "agent_settled" });
+        return { callbacksAttached: true, executionSnapshot: { sessionId: "review-session" }, close() {} };
+      },
+      completionContract: { objective: "malformed receipt", semanticReview: true, semanticCriteria: ["semantic criterion"], localGates: [{ id: "green", command: [process.execPath, "-e", "process.exit(0)"] }] },
+    });
+    try {
+      const blocked = await eventually(() => value.runtime.getTask(value.task.id), (task) => task.state === "blocked");
+      assert.notEqual(blocked.terminalReason, "verified_semantic_review");
+      assert.equal(blocked.evidence.some((evidence) => evidence.kind === "semantic_review"), true);
+    } finally { await closeFixture(value); }
+  }
 });
 
 test("repair recommendation uses a fresh executor and enforces the reviewer budget", async () => {
@@ -94,9 +122,11 @@ test("repair recommendation uses a fresh executor and enforces the reviewer budg
     onEvent({ type: "agent_settled" });
     return { callbacksAttached: true, executionSnapshot: { sessionId: `executor-${executorRuns}` }, close() {} };
   };
-  const reviewerFactory = async ({ onEvent }) => {
+  const reviewerFactory = async ({ onEvent, taskPrompt }) => {
     reviewRuns += 1;
-    onEvent({ type: "message_end", message: { role: "assistant", content: JSON.stringify({ criteria: ["semantic criterion"], verdicts: [], findings: reviewRuns === 1 ? [{ severity: "major", detail: "repair" }] : [], uncertainty: "", recommendation: reviewRuns === 1 ? "repair" : "accept" }), stopReason: "stop" } });
+    const candidateSha = taskPrompt.match(/Candidate SHA: ([0-9a-f]{40})/)?.[1] ?? "";
+    const needsRepair = reviewRuns === 1;
+    onEvent({ type: "message_end", message: { role: "assistant", content: JSON.stringify({ candidateSha, verdicts: [{ criterion: "semantic criterion", verdict: needsRepair ? "fail" : "pass", evidenceRefs: ["deterministic-gates"] }], findings: needsRepair ? [{ severity: "major", detail: "repair", evidenceRefs: ["deterministic-gates"] }] : [{ severity: "info", detail: "No semantic discrepancies found.", evidenceRefs: ["deterministic-gates"] }], uncertainty: "", recommendation: needsRepair ? "repair" : "accept" }), stopReason: "stop" } });
     onEvent({ type: "agent_settled" });
     return { callbacksAttached: true, executionSnapshot: { sessionId: `review-${reviewRuns}` }, close() {} };
   };

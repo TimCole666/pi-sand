@@ -10,7 +10,27 @@ export const FRESH_EXECUTOR_ARGS = [
   "--approve",
   "--no-extensions",
 ];
+export const FRESH_REVIEWER_ARGS = [
+  ...FRESH_EXECUTOR_ARGS,
+  "--tools",
+  "read,grep,find,ls",
+];
 export const FRESH_EXECUTOR_VERSION_ERROR = "Fresh Executor requires Pi 0.84.4 exactly.";
+
+function argsForRole(role) {
+  return role === "reviewer" ? FRESH_REVIEWER_ARGS : FRESH_EXECUTOR_ARGS;
+}
+
+function environmentForRole(role, env) {
+  if (role !== "reviewer") return env;
+  const restricted = { ...env };
+  // A reviewer has no daemon or runtime IPC authority. It retains provider
+  // credentials so Pi can answer the review, but cannot discover the shared
+  // Task database/socket through inherited configuration.
+  for (const key of ["PI_SAND_RUNTIME_DB", "PI_SAND_SOCKET", "PI_SAND_DB", "PI_SAND_TASK_WORKTREE_ROOT"])
+    delete restricted[key];
+  return restricted;
+}
 
 export class FreshExecutorError extends Error {
   constructor(message, { code = "FRESH_EXECUTOR_STARTUP_FAILED", phase = "startup", cause } = {}) {
@@ -117,8 +137,10 @@ class FreshExecutorClient {
   #sessionId = null;
   #sessionIdentityChanged = false;
   #executionSnapshot;
+  #args;
 
   constructor(options) {
+    const role = options?.role === "reviewer" ? "reviewer" : "executor";
     this.#options = {
       command: process.env.PI_BIN ?? "pi",
       env: process.env,
@@ -127,7 +149,10 @@ class FreshExecutorClient {
       spawnImpl: spawn,
       spawnSyncImpl: spawnSync,
       ...options,
+      role,
     };
+    this.#options.env = environmentForRole(role, this.#options.env);
+    this.#args = [...argsForRole(role)];
     if (typeof this.#options.cwd !== "string" || this.#options.cwd.length === 0) {
       throw startupError("Fresh Executor requires a task worktree cwd.", { code: "INVALID_CWD" });
     }
@@ -139,7 +164,8 @@ class FreshExecutorClient {
     this.#executionSnapshot = frozenExecutionSnapshot({
       command: this.#options.command,
       cwd: this.#options.cwd,
-      args: FRESH_EXECUTOR_ARGS,
+      args: this.#args,
+      role: this.#options.role,
       provider: this.#options.provider,
       modelId: this.#options.modelId,
       thinkingLevel: this.#options.thinkingLevel,
@@ -236,7 +262,7 @@ class FreshExecutorClient {
 
   #spawn() {
     try {
-      this.#child = this.#options.spawnImpl(this.#options.command, [...FRESH_EXECUTOR_ARGS], {
+      this.#child = this.#options.spawnImpl(this.#options.command, [...this.#args], {
         cwd: this.#options.cwd,
         detached: true,
         env: this.#options.env,
@@ -537,7 +563,8 @@ class FreshExecutorClient {
     if (typeof this.#options.onEvent === "function") this.#eventListeners.add(this.#options.onEvent);
     if (typeof this.#options.onClose === "function") this.#closeListeners.add(this.#options.onClose);
     return {
-      args: [...FRESH_EXECUTOR_ARGS],
+      args: [...this.#args],
+      role: this.#options.role,
       ...this.#metadata,
       callbacksAttached: typeof this.#options.onEvent === "function" || typeof this.#options.onClose === "function",
       get events() { return [...client.#eventHistory]; },

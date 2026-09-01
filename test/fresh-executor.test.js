@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startFreshExecutor, FRESH_EXECUTOR_ARGS } from "../src/fresh-executor.js";
+import { startFreshExecutor, FRESH_EXECUTOR_ARGS, FRESH_REVIEWER_ARGS } from "../src/fresh-executor.js";
 import { processGroupStatus } from "../src/process.js";
 
 const FAKE_PI_SOURCE = `#!/usr/bin/env node
@@ -17,6 +17,7 @@ if (process.argv.includes("--version")) {
   process.exit(0);
 }
 record({ type: "spawn", args: process.argv.slice(2), cwd: process.cwd() });
+if (process.env.FAKE_PI_ENV_PROBE) record({ type: "env", runtimeDb: process.env.PI_SAND_RUNTIME_DB || null, socket: process.env.PI_SAND_SOCKET || null, taskWorktreeRoot: process.env.PI_SAND_TASK_WORKTREE_ROOT || null });
 let buffer = "";
 const send = (value, delay = 0) => setTimeout(() => process.stdout.write(JSON.stringify(value) + "\\n"), delay);
 process.stdin.setEncoding("utf8");
@@ -199,6 +200,31 @@ test("Fresh Executor refuses a stale initial prompt without transmitting it", as
       (error) => error.code === "RPC_STARTUP_FAILED" && error.cause?.code === "STALE_ATTEMPT",
     );
     assert.equal((await readCommands(fake.log)).filter(({ type }) => type === "prompt").length, 0);
+  });
+});
+
+test("Fresh Executor reviewer profile exposes only read-only Pi tools", async () => {
+  await withExecutor({}, async ({ fake, taskCwd }) => {
+    const handle = await start(fake, taskCwd, { role: "reviewer" });
+    const commands = await readCommands(fake.log);
+    assert.deepEqual(commands[0], { type: "spawn", args: FRESH_REVIEWER_ARGS, cwd: taskCwd });
+    assert.equal(FRESH_REVIEWER_ARGS.includes("--tools"), true);
+    assert.equal(FRESH_REVIEWER_ARGS.at(-1), "read,grep,find,ls");
+    assert.equal(FRESH_REVIEWER_ARGS.some((arg) => /bash|write|edit|task|daemon|push/i.test(arg)), false);
+    assert.equal(FRESH_REVIEWER_ARGS.includes("--approve"), true);
+    return handle;
+  });
+});
+
+test("Fresh Executor reviewer process does not inherit daemon authority", async () => {
+  await withExecutor({}, async ({ fake, taskCwd }) => {
+    const handle = await start(fake, taskCwd, {
+      role: "reviewer",
+      env: { ...process.env, ...fake.env, FAKE_PI_ENV_PROBE: "1", PI_SAND_RUNTIME_DB: "/shared/runtime.sqlite", PI_SAND_SOCKET: "/shared/runtime.sock", PI_SAND_TASK_WORKTREE_ROOT: "/shared/worktrees" },
+    });
+    const envRecord = (await readCommands(fake.log)).find(({ type }) => type === "env");
+    assert.deepEqual(envRecord, { type: "env", runtimeDb: null, socket: null, taskWorktreeRoot: null });
+    return handle;
   });
 });
 

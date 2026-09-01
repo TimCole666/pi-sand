@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, readdirSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
@@ -1527,7 +1527,7 @@ function buildSemanticReviewContext({ task, candidateSha, deterministicEvidence,
     `Deterministic gate Evidence: ${bounded(JSON.stringify(deterministicEvidence), 4 * 1024)}`,
     `Remaining reviewer budget: ${JSON.stringify({ remainingReviewerAttempts: Math.max(0, Number(remainingReviewerAttempts ?? 0)) })}`,
     "Review exact candidate SHA only. Do not edit files, push refs, message the user, create child Tasks, or use another worker.",
-    "Return one bounded JSON receipt with criteria, verdicts, findings, uncertainty, and recommendation (accept, repair, or blocked).",
+    "Return one bounded JSON receipt: candidateSha must equal the Candidate SHA above; verdicts must contain exactly one object per configured criterion with criterion, verdict (pass/fail/repair/blocked/uncertain), and non-empty evidenceRefs; findings must be a non-empty array of objects with severity, detail, and non-empty evidenceRefs (use an info finding when no discrepancy exists); uncertainty must be a string; recommendation must be accept, repair, or blocked.",
   ];
   let context = sections.join("\n");
   if (Buffer.byteLength(context, "utf8") > MAX_REVIEW_CONTEXT_LENGTH) {
@@ -1536,36 +1536,97 @@ function buildSemanticReviewContext({ task, candidateSha, deterministicEvidence,
   return context;
 }
 
-function parseSemanticReviewResult(value, contract) {
+export function parseSemanticReviewResult(value, contract, expectedCandidateSha = null) {
   const raw = String(value ?? "").trim();
   let receipt = null;
   try { receipt = raw ? JSON.parse(raw) : null; } catch {}
-  if (typeof receipt === "string") receipt = { recommendation: receipt };
-  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) receipt = {};
-  const recommendation = String(receipt.recommendation ?? receipt.verdict ?? "").trim().toLowerCase();
-  const validRecommendation = ["accept", "repair", "blocked"].includes(recommendation);
-  const criteria = receipt.criteria ?? receipt.verdicts ?? semanticReviewCriteria(contract);
-  const boundedList = (items) => (Array.isArray(items) ? items.slice(0, 8).map((item) => {
-    if (typeof item === "string") return bounded(item, 512);
-    if (!item || typeof item !== "object" || Array.isArray(item)) return bounded(JSON.stringify(item), 1_024);
-    return Object.fromEntries(Object.entries(item).slice(0, 16).map(([key, itemValue]) => [
-      bounded(key, 128),
-      typeof itemValue === "string"
-        ? bounded(itemValue, 512)
-        : typeof itemValue === "number" || typeof itemValue === "boolean" || itemValue === null
-          ? itemValue
-          : bounded(JSON.stringify(itemValue), 1_024),
-    ]));
-  }) : []);
-  const findings = boundedList(receipt.findings);
-  const uncertainty = bounded(receipt.uncertainty ?? receipt.unresolvedUncertainty ?? "", 2 * 1024);
+  const objectReceipt = receipt && typeof receipt === "object" && !Array.isArray(receipt)
+    ? receipt
+    : {};
+  const configured = contract?.semanticCriteria ?? contract?.semantic_criteria ??
+    contract?.semanticReview?.criteria ?? contract?.semantic_review?.criteria;
+  const configuredCriteria = configured == null
+    ? semanticReviewCriteria(contract)
+    : Array.isArray(configured) && configured.length > 0
+      ? configured.map((criterion) => typeof criterion === "string"
+        ? criterion.trim()
+        : criterion && typeof criterion === "object" && !Array.isArray(criterion)
+          ? String(criterion.id ?? criterion.description ?? "").trim()
+          : "")
+      : semanticReviewCriteria(contract);
+  const criteriaValid = Array.isArray(configuredCriteria) &&
+    configuredCriteria.length > 0 &&
+    configuredCriteria.length <= MAX_REVIEW_FINDINGS &&
+    configuredCriteria.every((criterion) => criterion.length > 0 && Buffer.byteLength(criterion, "utf8") <= 512) &&
+    new Set(configuredCriteria).size === configuredCriteria.length;
+  const criteria = criteriaValid ? configuredCriteria : semanticReviewCriteria(contract);
+  const candidateSha = String(
+    objectReceipt.candidateSha ?? objectReceipt.candidate_sha ?? objectReceipt.reviewedCandidateSha ?? "",
+  ).trim().toLowerCase();
+  const expectedSha = String(expectedCandidateSha ?? "").trim().toLowerCase();
+  const candidateValid = /^[0-9a-f]{40}$/.test(candidateSha) &&
+    (expectedSha ? candidateSha === expectedSha : true);
+  const recommendation = String(objectReceipt.recommendation ?? "").trim().toLowerCase();
+  const recommendationValid = ["accept", "repair", "blocked"].includes(recommendation);
+  const boundedText = (text, limit, required = true) => {
+    if (typeof text !== "string") return null;
+    const trimmed = text.trim();
+    if (required && !trimmed) return null;
+    if (Buffer.byteLength(trimmed, "utf8") > limit || trimmed.includes(String.fromCharCode(0))) return null;
+    return trimmed;
+  };
+  const boundedRefs = (refs) => {
+    if (!Array.isArray(refs) || refs.length === 0 || refs.length > 8) return null;
+    const normalized = refs.map((ref) => boundedText(ref, 256));
+    return normalized.every(Boolean) ? normalized : null;
+  };
+  const verdicts = Array.isArray(objectReceipt.verdicts) && objectReceipt.verdicts.length <= MAX_REVIEW_FINDINGS
+    ? objectReceipt.verdicts.map((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+      const criterion = boundedText(item.criterion ?? item.id, 512);
+      const verdict = boundedText(item.verdict ?? item.status, 32)?.toLowerCase();
+      const evidenceRefs = boundedRefs(item.evidenceRefs ?? item.evidence_refs);
+      const detail = item.detail == null ? "" : boundedText(item.detail, 2 * 1024, false);
+      if (!criterion || !["pass", "fail", "repair", "blocked", "uncertain"].includes(verdict) || !evidenceRefs || detail == null)
+        return null;
+      return { criterion, verdict, evidenceRefs, ...(detail ? { detail } : {}) };
+    })
+    : [];
+  const verdictCriteria = verdicts.map((verdict) => verdict?.criterion);
+  const verdictsValid = verdicts.length === criteria.length &&
+    verdicts.every(Boolean) &&
+    new Set(verdictCriteria).size === criteria.length &&
+    criteria.every((criterion) => verdictCriteria.includes(criterion));
+  const findings = Array.isArray(objectReceipt.findings) && objectReceipt.findings.length <= MAX_REVIEW_FINDINGS
+    ? objectReceipt.findings.map((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+      const severity = boundedText(item.severity, 32)?.toLowerCase();
+      const detail = boundedText(item.detail ?? item.description, 2 * 1024);
+      const evidenceRefs = boundedRefs(item.evidenceRefs ?? item.evidence_refs);
+      if (!severity || !["info", "low", "minor", "medium", "major", "high", "critical", "blocker"].includes(severity) || !detail || !evidenceRefs)
+        return null;
+      return { severity, detail, evidenceRefs };
+    })
+    : [];
+  const findingsValid = Array.isArray(objectReceipt.findings) &&
+    findings.length > 0 && findings.length === objectReceipt.findings.length;
+  const recommendationContentValid = recommendation !== "accept" ||
+    verdicts.every((verdict) => verdict?.verdict === "pass");
+  const uncertainty = boundedText(
+    objectReceipt.uncertainty ?? objectReceipt.unresolvedUncertainty ?? "",
+    2 * 1024,
+    false,
+  );
+  const valid = candidateValid && criteriaValid && recommendationValid &&
+    verdictsValid && findingsValid && recommendationContentValid && uncertainty != null;
   return {
-    criteria: Array.isArray(criteria) ? boundedList(criteria) : semanticReviewCriteria(contract),
-    verdicts: boundedList(receipt.verdicts ?? receipt.criteria),
-    findings,
-    uncertainty,
-    recommendation: validRecommendation ? recommendation : "blocked",
-    valid: validRecommendation,
+    candidateSha,
+    criteria,
+    verdicts: verdicts.filter(Boolean),
+    findings: findings.filter(Boolean),
+    uncertainty: uncertainty ?? "",
+    recommendation: recommendationValid ? recommendation : "blocked",
+    valid,
     raw: bounded(raw, MAX_TASK_RESULT_LENGTH),
   };
 }
@@ -3827,8 +3888,8 @@ export class RuntimeStore {
       // Both barriers were proven before this transaction. Retain that proof in
       // the same transition that exposes Task waiting and parks the Attempt.
       const attemptUpdate = this.db
-        .prepare("UPDATE attempts SET state = 'parked_wait', gate_state = 'terminated', gate_terminated = 1, worker_terminated = 1 WHERE id = ? AND gate_terminated = 1")
-        .run(latestAttemptId);
+        .prepare("UPDATE attempts SET state = 'parked_wait', gate_state = 'terminated', gate_terminated = 1, worker_terminated = 1, final_result = COALESCE(final_result, ?) WHERE id = ? AND gate_terminated = 1")
+        .run(active?.finalAssistant?.result ?? null, latestAttemptId);
       if (attemptUpdate.changes !== 1)
         throw new Error("Attempt gate/worker retirement fence rejected wait registration.");
 
@@ -4840,16 +4901,20 @@ export class RuntimeStore {
           };
           reviewAttemptId = randomUUID();
           reviewAttemptNumber = this.#getTaskAttemptsCount(taskRow.id) + 1;
-          this.db.prepare("UPDATE attempts SET state = 'completed', finished_at = ?, worker_terminated = 1, final_result = NULL, terminal_detail = ?, final_branch_head = ? WHERE id = ? AND state = 'parked_wait'")
+          this.db.prepare("UPDATE attempts SET state = 'completed', finished_at = ?, worker_terminated = 1, terminal_detail = ?, final_branch_head = ? WHERE id = ? AND state = 'parked_wait'")
             .run(timestamp, `Exact CI evidence passed; semantic review required (${reviewTrigger}).`, waitRow.revisionSha, waitRow.createdByAttemptId);
           this.db.prepare("INSERT INTO attempts (id, task_id, number, role, control_version, contract_version, state, started_at, worker_terminated, cause) VALUES (?, ?, ?, 'reviewer', ?, ?, 'starting', ?, 0, 'review')")
             .run(reviewAttemptId, taskRow.id, reviewAttemptNumber, taskRow.controlVersion, taskRow.contractVersion, timestamp);
           this.db.prepare("INSERT INTO attempt_runs (attempt_id, sequence, kind, control_version, contract_version, prompt_digest, state, evidence_refs, started_at) VALUES (?, 1, 'review', ?, ?, ?, 'pending', ?, ?)")
             .run(reviewAttemptId, taskRow.controlVersion, taskRow.contractVersion, promptDigest(reviewPacket), evidenceRefsJson, timestamp);
-          this.db.prepare("UPDATE tasks SET latest_attempt_id = ?, state = 'running', updated_at = ? WHERE id = ? AND state = 'waiting' AND latest_attempt_id = ? AND control_version = ? AND contract_version = ?")
+          const taskUpdate = this.db.prepare("UPDATE tasks SET latest_attempt_id = ?, state = 'running', updated_at = ? WHERE id = ? AND state = 'waiting' AND latest_attempt_id = ? AND control_version = ? AND contract_version = ?")
             .run(reviewAttemptId, timestamp, taskRow.id, waitRow.createdByAttemptId, taskRow.controlVersion, taskRow.contractVersion);
-          this.db.prepare("UPDATE wait_subscriptions SET status = 'triggered', trigger_evidence_id = ?, continuation_attempt_id = ?, last_reconciled_at = ?, next_reconcile_at = NULL WHERE id = ? AND status = 'active'")
+          if (taskUpdate.changes !== 1)
+            throw new Error("Task state CAS failed when allocating semantic reviewer after CI.");
+          const waitUpdate = this.db.prepare("UPDATE wait_subscriptions SET status = 'triggered', trigger_evidence_id = ?, continuation_attempt_id = ?, last_reconciled_at = ?, next_reconcile_at = NULL WHERE id = ? AND status = 'active'")
             .run(triggerEvidenceId, reviewAttemptId, timestamp, id);
+          if (waitUpdate.changes !== 1)
+            throw new Error("Wait subscription trigger CAS failed when allocating semantic reviewer after CI.");
         } else {
         // CI Success without remaining model work: CAS Task -> completed
         const taskUpdate = this.db
@@ -7464,9 +7529,43 @@ export class RuntimeStore {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
       });
-      return canonicalPath(worktree);
+      const canonical = canonicalPath(worktree);
+      this.#setReviewWorktreeReadOnly(canonical);
+      return canonical;
     } catch (error) {
       throw new Error(`Semantic reviewer worktree creation failed: ${commandError(error)}`, { cause: error });
+    }
+  }
+
+  #setReviewWorktreeReadOnly(worktree) {
+    const entries = [worktree];
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      let stat;
+      try { stat = lstatSync(entry); } catch { continue; }
+      if (stat.isSymbolicLink()) continue;
+      if (stat.isDirectory()) {
+        for (const child of readdirSync(entry)) entries.push(join(entry, child));
+        chmodSync(entry, 0o555);
+      } else {
+        chmodSync(entry, 0o444);
+      }
+    }
+  }
+
+  #restoreReviewWorktreeAccess(worktree) {
+    const entries = [worktree];
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      let stat;
+      try { stat = lstatSync(entry); } catch { continue; }
+      if (stat.isSymbolicLink()) continue;
+      if (stat.isDirectory()) {
+        chmodSync(entry, 0o755);
+        for (const child of readdirSync(entry)) entries.push(join(entry, child));
+      } else {
+        chmodSync(entry, 0o644);
+      }
     }
   }
 
@@ -7474,6 +7573,7 @@ export class RuntimeStore {
     const worktree = active?.reviewWorktree;
     if (!worktree) return true;
     try {
+      this.#restoreReviewWorktreeAccess(worktree);
       execFileSync("git", ["worktree", "remove", "--force", worktree], {
         cwd: active.sourceRepoRoot,
         stdio: "ignore",
@@ -7528,6 +7628,11 @@ export class RuntimeStore {
     }
     const reviewerAttemptId = randomUUID();
     const number = this.#getTaskAttemptsCount(task.id) + 1;
+    const implementationResult = bounded(
+      String(active.finalAssistant?.result ?? "").trim() ||
+        `Implementation completed for candidate ${candidateSha}.`,
+      MAX_TASK_RESULT_LENGTH,
+    );
     const timestamp = now();
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -7539,8 +7644,8 @@ export class RuntimeStore {
       const currentReviewerCount = Number(this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE task_id = ? AND role = 'reviewer'").get(task.id)?.count ?? 0);
       if (currentReviewerCount >= budget.maxReviewerAttempts)
         throw new Error("Task semantic reviewer budget exhausted.");
-      this.db.prepare("UPDATE attempts SET state = 'completed', finished_at = ?, worker_terminated = 1, final_branch_head = ?, terminal_detail = ? WHERE id = ? AND task_id = ? AND state = 'running' AND control_version = ? AND contract_version = ?")
-        .run(timestamp, candidateSha, `Deterministic gates passed; semantic review required (${trigger}).`, active.attemptId, task.id, active.controlVersion, active.contractVersion);
+      this.db.prepare("UPDATE attempts SET state = 'completed', finished_at = ?, worker_terminated = 1, final_result = ?, final_branch_head = ?, terminal_detail = ? WHERE id = ? AND task_id = ? AND state = 'running' AND control_version = ? AND contract_version = ?")
+        .run(timestamp, implementationResult, candidateSha, `Deterministic gates passed; semantic review required (${trigger}).`, active.attemptId, task.id, active.controlVersion, active.contractVersion);
       this.db.prepare("INSERT INTO attempts (id, task_id, number, role, control_version, contract_version, state, started_at, worker_terminated, cause) VALUES (?, ?, ?, 'reviewer', ?, ?, 'starting', ?, 0, 'review')")
         .run(reviewerAttemptId, task.id, number, active.controlVersion, active.contractVersion, timestamp);
       this.db.prepare("INSERT INTO attempt_runs (attempt_id, sequence, kind, control_version, contract_version, prompt_digest, state, evidence_refs, started_at) VALUES (?, 1, 'review', ?, ?, ?, 'pending', ?, ?)")
@@ -7575,10 +7680,16 @@ export class RuntimeStore {
     const timestamp = now();
     const detail = "Task completed after deterministic gates and semantic review passed.";
     const refs = JSON.stringify(evidenceIds);
+    const implementationAttempt = this.db.prepare("SELECT final_result AS finalResult FROM attempts WHERE task_id = ? AND role = 'executor' AND final_branch_head = ? AND final_result IS NOT NULL ORDER BY number DESC LIMIT 1").get(active.taskId, candidateSha);
+    const implementationResult = bounded(
+      String(implementationAttempt?.finalResult ?? "").trim() ||
+        `Implementation completed for candidate ${candidateSha}.`,
+      MAX_TASK_RESULT_LENGTH,
+    );
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const taskUpdate = this.db.prepare("UPDATE tasks SET state = 'completed', updated_at = ?, final_result = ?, terminal_detail = ?, final_branch_head = ?, final_revision = ?, completion_evidence_ref = ?, terminal_reason = 'verified_semantic_review' WHERE id = ? AND latest_attempt_id = ? AND state = 'running' AND control_version = ? AND contract_version = ? AND final_revision = ?")
-        .run(timestamp, active.finalAssistant?.result ?? null, detail, candidateSha, candidateSha, refs, active.taskId, active.attemptId, active.controlVersion, active.contractVersion, candidateSha);
+        .run(timestamp, implementationResult, detail, candidateSha, candidateSha, refs, active.taskId, active.attemptId, active.controlVersion, active.contractVersion, candidateSha);
       if (taskUpdate.changes !== 1) { this.db.exec("COMMIT"); return false; }
       const attemptUpdate = this.db.prepare("UPDATE attempts SET state = 'completed', finished_at = ?, worker_terminated = 1, final_result = ?, terminal_detail = ?, final_branch_head = ? WHERE id = ? AND task_id = ? AND state = 'running' AND control_version = ? AND contract_version = ?")
         .run(timestamp, active.finalAssistant?.result ?? null, detail, candidateSha, active.attemptId, active.taskId, active.controlVersion, active.contractVersion);
@@ -7586,7 +7697,7 @@ export class RuntimeStore {
       const runUpdate = this.db.prepare("UPDATE attempt_runs SET evidence_refs = ? WHERE attempt_id = ? AND sequence = ? AND state = 'settled' AND control_version = ? AND contract_version = ?")
         .run(refs, active.attemptId, active.runSequence, active.controlVersion, active.contractVersion);
       if (runUpdate.changes !== 1) throw new Error("Reviewer AttemptRun completion fence rejected semantic acceptance.");
-      const resultId = this.#insertResultDelivery({ task: this.#taskRow(active.taskId), outcome: "completed", finalResult: active.finalAssistant?.result ?? null, terminalDetail: detail, terminalReason: "verified_semantic_review", finalRevision: candidateSha, finalBranchHead: candidateSha, evidenceRefs: evidenceIds });
+      const resultId = this.#insertResultDelivery({ task: this.#taskRow(active.taskId), outcome: "completed", finalResult: implementationResult, terminalDetail: detail, terminalReason: "verified_semantic_review", finalRevision: candidateSha, finalBranchHead: candidateSha, evidenceRefs: evidenceIds });
       if (!resultId) throw new Error("Reviewed Task did not produce a Result delivery.");
       this.db.exec("COMMIT");
       this.#clearAttemptWatchdog(active);
@@ -7660,7 +7771,11 @@ export class RuntimeStore {
         this.#verificationFailure(active, { state: "blocked", reason: "reviewer_retirement_ambiguous", detail: "Semantic reviewer could not be safely retired.", recordedCandidateSha: candidateSha, finalBranchHead: candidateSha, workerTerminated: false, evidenceRefs });
         return;
       }
-      const receipt = parseSemanticReviewResult(active.finalAssistant?.result, parsed(task.completionContract, {}));
+      const receipt = parseSemanticReviewResult(
+        active.finalAssistant?.result,
+        parsed(task.completionContract, {}),
+        candidateSha,
+      );
       const valid = receipt.valid && !receipt.uncertainty && this.#deterministicReviewGreen(task, candidateSha, evidenceRefs);
       const reviewPayload = {
         candidateSha,
