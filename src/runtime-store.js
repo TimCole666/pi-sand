@@ -2581,6 +2581,7 @@ export class RuntimeStore {
       eventGeneration: active.eventGeneration,
       finalAssistant: active.finalAssistant,
       settled: active.settled,
+      awaitingAgentStart: active.awaitingAgentStart,
       runAccepted: active.runAccepted,
       runSettled: active.runSettled,
     };
@@ -2630,6 +2631,10 @@ export class RuntimeStore {
     active.pendingEventGeneration = null;
     active.runPromptInFlight = false;
     active.runAccepted = true;
+    // The acknowledgement only proves prompt acceptance. Ordinary Pi events
+    // have no run id, so a fresh agent_start must open the new run before any
+    // buffered message_end or agent_settled can be observed.
+    active.awaitingAgentStart = true;
     return true;
   }
 
@@ -2641,6 +2646,7 @@ export class RuntimeStore {
     active.pendingEventGeneration = null;
     active.finalAssistant = previous.finalAssistant;
     active.settled = previous.settled;
+    active.awaitingAgentStart = previous.awaitingAgentStart;
     active.runAccepted = previous.runAccepted;
     active.runSettled = previous.runSettled;
     active.runPromptInFlight = false;
