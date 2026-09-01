@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, realpathSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
@@ -35,6 +35,8 @@ export const MAX_LOCAL_GATE_COUNT = 16;
 export const MAX_LOCAL_GATE_COMMAND_LENGTH = 4 * 1024;
 export const MAX_LOCAL_GATE_TIMEOUT_MS = 60_000;
 export const MAX_RESULT_PAYLOAD_LENGTH = 64 * 1024;
+export const MAX_REVIEW_CONTEXT_LENGTH = 16 * 1024;
+export const MAX_REVIEW_FINDINGS = 32;
 export const RESULT_CLAIM_LEASE_MS = 30_000;
 export const MAX_RESULT_CLAIM_LEASE_MS = 24 * 60 * 60 * 1000;
 export const WORKER_STOP_TIMEOUT_MS = 2_000;
@@ -211,7 +213,7 @@ const TASK_SELECT = `SELECT id, source_repo_root AS sourceRepoRoot, base_commit 
   final_revision AS finalRevision, completion_evidence_ref AS completionEvidenceRef,
   terminal_reason AS terminalReason, publication_count AS publicationCount
   FROM tasks`;
-const ATTEMPT_SELECT = `SELECT id, task_id AS taskId, number, applied_provider AS provider, applied_model_id AS modelId,
+const ATTEMPT_SELECT = `SELECT id, task_id AS taskId, number, role, applied_provider AS provider, applied_model_id AS modelId,
   applied_thinking_level AS thinkingLevel, control_version AS controlVersion,
   contract_version AS contractVersion, state, started_at AS startedAt, finished_at AS finishedAt,
   worker_pid AS workerPid, worker_pgid AS workerPgid, worker_terminated AS workerTerminated,
@@ -719,6 +721,63 @@ function defaultCompletionContract(goal) {
   return { objective: goal };
 }
 
+const SEMANTIC_REVIEW_RISK_MARKERS = new Set([
+  "public_api",
+  "api",
+  "schema",
+  "security",
+  "concurrency",
+  "migration",
+]);
+
+function truthyReviewMarker(value) {
+  if (value === true) return true;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return value.required === true || value.enabled === true || value.marked === true;
+}
+
+/** Return the one concrete reason a semantic review is required, if any. */
+export function semanticReviewTrigger(contract, {
+  goal = "",
+  userRequestedReview = false,
+  reviewRequested = false,
+  policyRiskMarker = false,
+  supervisorCoverageGap = false,
+} = {}) {
+  const value = contract && typeof contract === "object" && !Array.isArray(contract)
+    ? contract
+    : {};
+  if (value.requiresSemanticReview === true || value.requires_semantic_review === true ||
+      value.semanticReviewRequired === true || value.semantic_review_required === true ||
+      value.reviewRequired === true || value.review_required === true ||
+      value.semanticReview === true || value.semantic_review === true ||
+      value.semanticAcceptanceRequired === true || value.semantic_acceptance_required === true)
+    return "contract_semantic_review";
+  if (truthyReviewMarker(value.semanticReview) || truthyReviewMarker(value.semantic_review) ||
+      truthyReviewMarker(value.review))
+    return "contract_semantic_review";
+  if (value.review === "required" || value.reviewMode === "semantic" || value.review_mode === "semantic")
+    return "contract_semantic_review";
+  const criteria = value.semanticCriteria ?? value.semantic_criteria;
+  if (Array.isArray(criteria) && criteria.length > 0) return "semantic_criterion";
+  const markers = value.policyRiskMarkers ?? value.policy_risk_markers ??
+    value.riskMarkers ?? value.risk_markers ?? value.policyRiskMarker ?? value.policy_risk_marker;
+  if ((Array.isArray(markers) ? markers : [markers]).some((marker) =>
+    typeof marker === "string" && SEMANTIC_REVIEW_RISK_MARKERS.has(marker.trim().toLowerCase().replace(/[ -]+/g, "_"))))
+    return "policy_risk_marker";
+  if (truthyReviewMarker(value.policyRiskMarker) || truthyReviewMarker(value.policy_risk_marker) ||
+      policyRiskMarker === true)
+    return "policy_risk_marker";
+  if (truthyReviewMarker(value.supervisorCoverageGap) || truthyReviewMarker(value.supervisor_coverage_gap) ||
+      truthyReviewMarker(value.deterministicCoverageGap) || truthyReviewMarker(value.deterministic_coverage_gap) ||
+      supervisorCoverageGap === true)
+    return "supervisor_coverage_gap";
+  if (userRequestedReview === true || reviewRequested === true || value.userRequestedReview === true || value.user_requested_review === true || value.reviewRequested === true || value.review_requested === true ||
+      /(?:^|\s)(?:please\s+)?(?:review|audit)(?:\s|$)/i.test(String(goal)))
+    return "explicit_user_review_request";
+  return null;
+}
+
 function normalizeGithubHost(value) {
   if (value == null) return "github.com";
   if (typeof value !== "string" || !value.trim() || value.includes("\0"))
@@ -936,6 +995,7 @@ function attemptSnapshot(row, attemptRuns = []) {
     id: row.id,
     taskId: row.taskId,
     number: row.number,
+    role: row.role ?? (row.cause === "review" ? "reviewer" : "executor"),
     provider: row.provider,
     modelId: row.modelId,
     thinkingLevel: row.thinkingLevel,
@@ -1426,6 +1486,90 @@ export function buildRepairPrompt({
   return prompt;
 }
 
+function readBoundedFile(path, limit = 4 * 1024) {
+  try {
+    return existsSync(path) ? bounded(readFileSync(path, "utf8"), limit) : "";
+  } catch {
+    return "";
+  }
+}
+
+function semanticReviewCriteria(contract) {
+  const criteria = contract?.semanticCriteria ?? contract?.semantic_criteria ??
+    contract?.semanticReview?.criteria ?? contract?.semantic_review?.criteria;
+  if (Array.isArray(criteria) && criteria.length > 0)
+    return criteria.slice(0, MAX_REVIEW_FINDINGS).map((criterion) =>
+      typeof criterion === "string" ? criterion : criterion?.id ?? criterion?.description ?? JSON.stringify(criterion),
+    ).map((criterion) => bounded(criterion, 512));
+  return ["The completion contract's non-deterministic semantic requirements are satisfied."];
+}
+
+function buildSemanticReviewContext({ task, candidateSha, deterministicEvidence, remainingReviewerAttempts }) {
+  const contract = parsed(task.completionContract, {});
+  const diff = bounded(git(task.sourceRepoRoot, ["diff", "--no-ext-diff", "--unified=80", task.baseCommit, candidateSha]), 6 * 1024);
+  const documents = [
+    ["AGENTS.md", readBoundedFile(join(task.sourceRepoRoot, "AGENTS.md"))],
+    ["CONTEXT.md", readBoundedFile(join(task.sourceRepoRoot, "CONTEXT.md"))],
+  ].filter(([, content]) => content);
+  const spec = contract.spec ?? contract.issue ?? contract.acceptanceCriteria ?? contract.acceptance_criteria ?? null;
+  const sections = [
+    "pi-sand bounded semantic review context",
+    `Task id: ${task.id}`,
+    `Completion contract: ${bounded(JSON.stringify(contract), 2 * 1024)}`,
+    `Base SHA: ${task.baseCommit}`,
+    `Candidate SHA: ${candidateSha}`,
+    `Current control version: ${task.controlVersion}`,
+    `Current contract version: ${task.contractVersion}`,
+    `Criteria: ${bounded(JSON.stringify(semanticReviewCriteria(contract)), 2 * 1024)}`,
+    `Required issue/spec text: ${bounded(typeof spec === "string" ? spec : JSON.stringify(spec ?? "(contained in completion contract)"), 2 * 1024)}`,
+    `Project standards and domain docs: ${bounded(JSON.stringify(documents), 3 * 1024)}`,
+    `Diff between base and candidate:\n${diff}`,
+    `Deterministic gate Evidence: ${bounded(JSON.stringify(deterministicEvidence), 4 * 1024)}`,
+    `Remaining reviewer budget: ${JSON.stringify({ remainingReviewerAttempts: Math.max(0, Number(remainingReviewerAttempts ?? 0)) })}`,
+    "Review exact candidate SHA only. Do not edit files, push refs, message the user, create child Tasks, or use another worker.",
+    "Return one bounded JSON receipt with criteria, verdicts, findings, uncertainty, and recommendation (accept, repair, or blocked).",
+  ];
+  let context = sections.join("\n");
+  if (Buffer.byteLength(context, "utf8") > MAX_REVIEW_CONTEXT_LENGTH) {
+    context = appendBounded("", context, MAX_REVIEW_CONTEXT_LENGTH);
+  }
+  return context;
+}
+
+function parseSemanticReviewResult(value, contract) {
+  const raw = String(value ?? "").trim();
+  let receipt = null;
+  try { receipt = raw ? JSON.parse(raw) : null; } catch {}
+  if (typeof receipt === "string") receipt = { recommendation: receipt };
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) receipt = {};
+  const recommendation = String(receipt.recommendation ?? receipt.verdict ?? "").trim().toLowerCase();
+  const validRecommendation = ["accept", "repair", "blocked"].includes(recommendation);
+  const criteria = receipt.criteria ?? receipt.verdicts ?? semanticReviewCriteria(contract);
+  const boundedList = (items) => (Array.isArray(items) ? items.slice(0, 8).map((item) => {
+    if (typeof item === "string") return bounded(item, 512);
+    if (!item || typeof item !== "object" || Array.isArray(item)) return bounded(JSON.stringify(item), 1_024);
+    return Object.fromEntries(Object.entries(item).slice(0, 16).map(([key, itemValue]) => [
+      bounded(key, 128),
+      typeof itemValue === "string"
+        ? bounded(itemValue, 512)
+        : typeof itemValue === "number" || typeof itemValue === "boolean" || itemValue === null
+          ? itemValue
+          : bounded(JSON.stringify(itemValue), 1_024),
+    ]));
+  }) : []);
+  const findings = boundedList(receipt.findings);
+  const uncertainty = bounded(receipt.uncertainty ?? receipt.unresolvedUncertainty ?? "", 2 * 1024);
+  return {
+    criteria: Array.isArray(criteria) ? boundedList(criteria) : semanticReviewCriteria(contract),
+    verdicts: boundedList(receipt.verdicts ?? receipt.criteria),
+    findings,
+    uncertainty,
+    recommendation: validRecommendation ? recommendation : "blocked",
+    valid: validRecommendation,
+    raw: bounded(raw, MAX_TASK_RESULT_LENGTH),
+  };
+}
+
 function workerMetadata(worker) {
   const workerPid = Number(worker?.workerPid ?? worker?.pid);
   const workerPgid = Number(
@@ -1454,6 +1598,7 @@ export class RuntimeStore {
     dbPath = runtimeDatabasePath(),
     piCommand = process.env.PI_BIN ?? "pi",
     workerFactory = startFreshExecutor,
+    reviewerFactory,
     workerEnv = process.env,
     worktreeRoot,
     workerRetireTimeoutMs = WORKER_RETIRE_TIMEOUT_MS,
@@ -1476,6 +1621,7 @@ export class RuntimeStore {
     this.dbPath = dbPath;
     this.piCommand = piCommand;
     this.workerFactory = workerFactory;
+    this.reviewerFactory = reviewerFactory ?? workerFactory;
     this.workerEnv = workerEnv;
     this.worktreeRoot = worktreeRoot;
     this.workerRetireTimeoutMs = Math.max(
@@ -1603,6 +1749,7 @@ export class RuntimeStore {
         this.db.exec(`ALTER TABLE attempts RENAME TO attempts_legacy;
           CREATE TABLE attempts (
             id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), number INTEGER NOT NULL,
+            role TEXT NOT NULL DEFAULT 'executor' CHECK(role IN ('executor', 'reviewer')),
             provider TEXT, model_id TEXT, thinking_level TEXT, state TEXT NOT NULL,
             started_at TEXT NOT NULL, finished_at TEXT, worker_pid INTEGER, worker_pgid INTEGER,
             worker_start_identity TEXT, worker_boot_id TEXT,
@@ -1652,6 +1799,7 @@ export class RuntimeStore {
         .map((row) => row.name),
     );
     for (const [name, type] of [
+      ["role", "TEXT NOT NULL DEFAULT 'executor' CHECK(role IN ('executor', 'reviewer'))"],
       ["resume_wait_id", "TEXT REFERENCES wait_subscriptions(id)"],
       ["cause", "TEXT CHECK(cause IN ('initial', 'continuation', 'repair', 'review', 'retry'))"],
     ]) {
@@ -1662,6 +1810,7 @@ export class RuntimeStore {
     this.db.exec(
       "CREATE UNIQUE INDEX IF NOT EXISTS attempts_resume_wait ON attempts(resume_wait_id)",
     );
+    this.db.exec("UPDATE attempts SET role = CASE WHEN cause = 'review' THEN 'reviewer' ELSE 'executor' END WHERE role IS NULL OR role = ''");
     const refreshedColumns = new Set(
       this.db
         .prepare("PRAGMA table_info(attempts)")
@@ -1945,6 +2094,7 @@ export class RuntimeStore {
         );
         CREATE TABLE IF NOT EXISTS attempts (
           id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), number INTEGER NOT NULL,
+          role TEXT NOT NULL DEFAULT 'executor' CHECK(role IN ('executor', 'reviewer')),
           provider TEXT, model_id TEXT, thinking_level TEXT, state TEXT NOT NULL,
           started_at TEXT NOT NULL, finished_at TEXT, worker_pid INTEGER, worker_pgid INTEGER,
           worker_start_identity TEXT, worker_boot_id TEXT,
@@ -4454,6 +4604,10 @@ export class RuntimeStore {
     let effectiveModel = null;
     let effectiveThinkingLevel = null;
     let repairDetail = null;
+    let reviewWorktree = null;
+    let reviewPacket = null;
+    let reviewAttemptId = null;
+    let reviewAttemptNumber = null;
     let targetTaskId = null;
     let classification = null;
     let selectorResults = [];
@@ -4657,7 +4811,47 @@ export class RuntimeStore {
         if (!resultId)
           throw new Error("Blocked Task did not produce a Result delivery.");
       } else if (classification === "success") {
-        // 7A. CI Success without remaining model work: CAS Task -> completed
+        // 7A. CI success may still require the one conditional fresh reviewer.
+        const completionContract = parsed(taskRow.completionContract, {});
+        const reviewTrigger = semanticReviewTrigger(completionContract, { goal: taskRow.goal });
+        if (reviewTrigger) {
+          const reviewerCount = this.#getTaskReviewerAttemptsCount(taskRow.id);
+          if (reviewerCount >= normalizeBudget(taskRow.budget).maxReviewerAttempts)
+            throw new Error("Task semantic reviewer budget exhausted.");
+          reviewWorktree = this.#reviewWorktree(taskRow, waitRow.revisionSha);
+          reviewPacket = buildSemanticReviewContext({
+            task: taskRow,
+            candidateSha: waitRow.revisionSha,
+            deterministicEvidence: this.#reviewDeterministicEvidence(taskRow, waitRow.revisionSha, allEvidenceIds),
+            remainingReviewerAttempts: normalizeBudget(taskRow.budget).maxReviewerAttempts - reviewerCount - 1,
+          });
+          const reviewerSource = this.db.prepare("SELECT applied_provider AS provider, applied_model_id AS modelId, applied_thinking_level AS thinkingLevel FROM attempts WHERE task_id = ? AND role = 'executor' AND applied_provider IS NOT NULL ORDER BY number DESC LIMIT 1").get(taskRow.id);
+          effectiveModel = { provider: reviewerSource?.provider ?? "anthropic", id: reviewerSource?.modelId ?? "claude-3-5-sonnet" };
+          effectiveThinkingLevel = reviewerSource?.thinkingLevel ?? "off";
+          taskToLaunch = {
+            id: taskRow.id,
+            sourceRepoRoot: taskRow.sourceRepoRoot,
+            baseCommit: taskRow.baseCommit,
+            taskBranch: taskRow.taskBranch,
+            taskWorktree: taskRow.taskWorktree,
+            goal: taskRow.goal,
+            contractVersion: taskRow.contractVersion,
+            controlVersion: taskRow.controlVersion,
+          };
+          reviewAttemptId = randomUUID();
+          reviewAttemptNumber = this.#getTaskAttemptsCount(taskRow.id) + 1;
+          this.db.prepare("UPDATE attempts SET state = 'completed', finished_at = ?, worker_terminated = 1, final_result = NULL, terminal_detail = ?, final_branch_head = ? WHERE id = ? AND state = 'parked_wait'")
+            .run(timestamp, `Exact CI evidence passed; semantic review required (${reviewTrigger}).`, waitRow.revisionSha, waitRow.createdByAttemptId);
+          this.db.prepare("INSERT INTO attempts (id, task_id, number, role, control_version, contract_version, state, started_at, worker_terminated, cause) VALUES (?, ?, ?, 'reviewer', ?, ?, 'starting', ?, 0, 'review')")
+            .run(reviewAttemptId, taskRow.id, reviewAttemptNumber, taskRow.controlVersion, taskRow.contractVersion, timestamp);
+          this.db.prepare("INSERT INTO attempt_runs (attempt_id, sequence, kind, control_version, contract_version, prompt_digest, state, evidence_refs, started_at) VALUES (?, 1, 'review', ?, ?, ?, 'pending', ?, ?)")
+            .run(reviewAttemptId, taskRow.controlVersion, taskRow.contractVersion, promptDigest(reviewPacket), evidenceRefsJson, timestamp);
+          this.db.prepare("UPDATE tasks SET latest_attempt_id = ?, state = 'running', updated_at = ? WHERE id = ? AND state = 'waiting' AND latest_attempt_id = ? AND control_version = ? AND contract_version = ?")
+            .run(reviewAttemptId, timestamp, taskRow.id, waitRow.createdByAttemptId, taskRow.controlVersion, taskRow.contractVersion);
+          this.db.prepare("UPDATE wait_subscriptions SET status = 'triggered', trigger_evidence_id = ?, continuation_attempt_id = ?, last_reconciled_at = ?, next_reconcile_at = NULL WHERE id = ? AND status = 'active'")
+            .run(triggerEvidenceId, reviewAttemptId, timestamp, id);
+        } else {
+        // CI Success without remaining model work: CAS Task -> completed
         const taskUpdate = this.db
           .prepare(
             `UPDATE tasks SET state = 'completed', updated_at = ?, final_result = ?,
@@ -4724,8 +4918,9 @@ export class RuntimeStore {
           evidenceRefs: allEvidenceIds,
         });
 
-        if (!resultId) {
+          if (!resultId) {
           throw new Error("Completed Task did not produce a Result delivery.");
+        }
         }
       } else {
         // 7B. CI Failure, ci_not_observable, timed_out, etc.
@@ -5051,10 +5246,36 @@ export class RuntimeStore {
       try {
         this.db.exec("ROLLBACK");
       } catch {}
+      if (reviewWorktree) this.#removeReviewWorktree({
+        sourceRepoRoot: this.#taskRow(targetTaskId)?.sourceRepoRoot,
+        reviewWorktree,
+      });
       throw error;
     }
 
     // Step 9: AFTER COMMIT: only then spawn if a new Attempt exists
+    if (reviewAttemptId && reviewPacket && reviewWorktree && !skipSpawn) {
+      await this.launchAttempt({
+        task: {
+          id: targetTaskId,
+          sourceRepoRoot: this.#taskRow(targetTaskId).sourceRepoRoot,
+          baseCommit: this.#taskRow(targetTaskId).baseCommit,
+          taskBranch: this.#taskRow(targetTaskId).taskBranch,
+          taskWorktree: this.#taskRow(targetTaskId).taskWorktree,
+          goal: this.#taskRow(targetTaskId).goal,
+          contractVersion: this.#taskRow(targetTaskId).contractVersion,
+          controlVersion: this.#taskRow(targetTaskId).controlVersion,
+        },
+        attemptId: reviewAttemptId,
+        number: reviewAttemptNumber,
+        model: effectiveModel ?? { provider: "anthropic", id: "claude-3-5-sonnet" },
+        thinkingLevel: effectiveThinkingLevel ?? "off",
+        packet: reviewPacket,
+        role: "reviewer",
+        reviewWorktree,
+        reviewCandidateSha: this.#taskRow(targetTaskId).finalRevision,
+      });
+    }
     if (newAttemptId && taskToLaunch && !skipSpawn) {
       await this.launchAttempt({
         task: taskToLaunch,
@@ -5072,7 +5293,7 @@ export class RuntimeStore {
       task: this.getTask(targetTaskId ?? (this.getWaitSubscription(id)?.taskId ?? id)),
       waitSubscription: this.getWaitSubscription(id),
       classification,
-      continuationAttemptId: newAttemptId ?? null,
+      continuationAttemptId: newAttemptId ?? reviewAttemptId ?? null,
       triggered: true,
     };
   }
@@ -5625,6 +5846,10 @@ export class RuntimeStore {
     authority,
     budget,
     returnRoute,
+    userRequestedReview = false,
+    reviewRequested = false,
+    policyRiskMarker = false,
+    supervisorCoverageGap = false,
   }) {
     this.ensureSupported();
     if (typeof goal !== "string" || !goal.trim())
@@ -5637,8 +5862,13 @@ export class RuntimeStore {
       throw new Error("/task requires a selected provider and model.");
     if (!thinkingLevel)
       throw new Error("/task requires a selected thinking level.");
-    const requestedCompletionContract =
-      completionContract ?? defaultCompletionContract(goal.trim());
+    const requestedCompletionContract = completionContract == null
+      ? defaultCompletionContract(goal.trim())
+      : { ...completionContract };
+    if (userRequestedReview || reviewRequested)
+      requestedCompletionContract.userRequestedReview = true;
+    if (policyRiskMarker) requestedCompletionContract.policyRiskMarker = true;
+    if (supervisorCoverageGap) requestedCompletionContract.supervisorCoverageGap = true;
     localGatesFromContract(requestedCompletionContract);
     const normalizedAuthority = normalizeAuthority(authority);
 
@@ -6017,6 +6247,7 @@ export class RuntimeStore {
       !task ||
       !["accepted", "running"].includes(task.state) ||
       task.latestAttemptId !== active.attemptId ||
+      (active.role === "reviewer" && task.finalRevision !== active.reviewCandidateSha) ||
       Number(task.controlVersion) !== Number(active.controlVersion) ||
       Number(task.contractVersion) !== Number(active.contractVersion) ||
       !attempt ||
@@ -6064,6 +6295,9 @@ export class RuntimeStore {
     packet,
     priorState,
     priorDetail,
+    role = "executor",
+    reviewWorktree = null,
+    reviewCandidateSha = null,
   }) {
     const taskPacket =
       packet ??
@@ -6087,7 +6321,10 @@ export class RuntimeStore {
       modelId: model.id,
       thinkingLevel,
       taskWorktree: task.taskWorktree,
+      workerCwd: reviewWorktree ?? task.taskWorktree,
       sourceRepoRoot: task.sourceRepoRoot,
+      role,
+      reviewCandidateSha,
       taskBranch: task.taskBranch,
       baseCommit: task.baseCommit,
       worker: null,
@@ -6116,6 +6353,7 @@ export class RuntimeStore {
       attemptWatchdogTimer: null,
       attemptWatchdogDue: false,
       budgetFailurePromise: null,
+      reviewWorktree,
     };
     this.active = active;
     this.#scheduleAttemptWatchdog(active);
@@ -6135,14 +6373,24 @@ export class RuntimeStore {
         active.contractVersion,
       );
       assertTaskWorktreeIdentity(task);
-      const worker = await this.workerFactory({
-        cwd: task.taskWorktree,
+      const workerFactory = active.role === "reviewer" ? this.reviewerFactory : this.workerFactory;
+      const worker = await workerFactory({
+        cwd: active.workerCwd,
         command: this.piCommand,
         env: this.workerEnv,
         provider: model.provider,
         modelId: model.id,
         thinkingLevel,
         taskPrompt: taskPacket,
+        role: active.role,
+        candidateSha: active.reviewCandidateSha ?? null,
+        reviewContext: active.role === "reviewer" ? taskPacket : null,
+        reviewOnly: active.role === "reviewer",
+        allowTaskMutation: active.role === "reviewer" ? false : undefined,
+        remotePublicationAuthority: active.role === "reviewer" ? null : undefined,
+        allowRemotePublication: active.role === "reviewer" ? false : undefined,
+        allowUserMessaging: active.role === "reviewer" ? false : undefined,
+        allowChildTasks: active.role === "reviewer" ? false : undefined,
         onEvent: (event, metadata) => this.handleWorkerEvent(active, event, metadata),
         onClose: (details) => this.handleWorkerClose(active, details),
         workerStopTimeoutMs: this.workerStopTimeoutMs,
@@ -6235,6 +6483,7 @@ export class RuntimeStore {
           detail: `Fresh Executor failed before prompt acceptance: ${commandError(error)}`,
           checkpoint: false,
         });
+        if (active.reviewWorktree) this.#removeReviewWorktree(active);
       }
       throw new Error(
         `Fresh Executor failed before prompt acceptance: ${commandError(error)}`,
@@ -6462,7 +6711,10 @@ export class RuntimeStore {
       return;
     }
     const settled = await this.settleInitialRun(active, outcome);
-    if (settled) await this.superviseSettled(active, outcome);
+    if (settled) {
+      if (active.role === "reviewer") await this.superviseReviewerSettled(active, outcome);
+      else await this.superviseSettled(active, outcome);
+    }
   }
 
   #supervisorState(active) {
@@ -7202,6 +7454,263 @@ export class RuntimeStore {
     }
   }
 
+  #reviewWorktree(task, candidateSha) {
+    const root = this.worktreeRoot ?? join(dirname(task.sourceRepoRoot), ".pi-sand-tasks");
+    const worktree = join(root, `${task.id}-review-${randomUUID()}`);
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    try {
+      execFileSync("git", ["worktree", "add", "--detach", "--quiet", worktree, candidateSha], {
+        cwd: task.sourceRepoRoot,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      return canonicalPath(worktree);
+    } catch (error) {
+      throw new Error(`Semantic reviewer worktree creation failed: ${commandError(error)}`, { cause: error });
+    }
+  }
+
+  #removeReviewWorktree(active) {
+    const worktree = active?.reviewWorktree;
+    if (!worktree) return true;
+    try {
+      execFileSync("git", ["worktree", "remove", "--force", worktree], {
+        cwd: active.sourceRepoRoot,
+        stdio: "ignore",
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  #reviewDeterministicEvidence(task, candidateSha, evidenceIds) {
+    const rows = this.db.prepare("SELECT id, kind, payload FROM evidence WHERE task_id = ? AND id IN (" + evidenceIds.map(() => "?").join(",") + ")").all(task.id, ...evidenceIds);
+    return rows.map((row) => ({ id: row.id, kind: row.kind, payload: parsed(row.payload, {}) }));
+  }
+
+  #deterministicReviewGreen(task, candidateSha, evidenceIds) {
+    if (this.currentBranchHead(task.taskWorktree) !== candidateSha) return false;
+    try {
+      if (git(task.taskWorktree, ["status", "--porcelain=v1", "--untracked-files=all"])) return false;
+    } catch { return false; }
+    const evidence = this.#reviewDeterministicEvidence(task, candidateSha, evidenceIds);
+    const contract = parsed(task.completionContract, {});
+    const gates = localGatesFromContract(contract);
+    for (const gate of gates) {
+      if (!evidence.some(({ kind, payload }) => kind === "local_gate_result" &&
+        payload.criterion === gate.id && payload.candidateSha === candidateSha &&
+        payload.controlVersion === task.controlVersion && payload.contractVersion === task.contractVersion &&
+        payload.exitCategory === "passed" && payload.processTerminated === true)) return false;
+    }
+    const requiredChecks = requiredChecksFromContract(contract);
+    if (requiredChecks.length > 0 && !evidence.some(({ kind, payload }) =>
+      kind === "wait_trigger" && payload.revisionSha === candidateSha && payload.classification === "success")) return false;
+    return true;
+  }
+
+  async #startSemanticReview(active, task, candidateSha, evidenceIds) {
+    const trigger = semanticReviewTrigger(parsed(task.completionContract, {}), {
+      goal: task.goal,
+    });
+    if (!trigger) return false;
+    const budget = normalizeBudget(task.budget);
+    const reviewerCount = Number(this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE task_id = ? AND role = 'reviewer'").get(task.id)?.count ?? 0);
+    if (reviewerCount >= budget.maxReviewerAttempts) return false;
+    const reviewWorktree = this.#reviewWorktree(task, candidateSha);
+    let context;
+    try {
+      const deterministicEvidence = this.#reviewDeterministicEvidence(task, candidateSha, evidenceIds);
+      context = buildSemanticReviewContext({ task, candidateSha, deterministicEvidence, remainingReviewerAttempts: budget.maxReviewerAttempts - reviewerCount - 1 });
+    } catch (error) {
+      this.#removeReviewWorktree({ ...active, reviewWorktree });
+      throw error;
+    }
+    const reviewerAttemptId = randomUUID();
+    const number = this.#getTaskAttemptsCount(task.id) + 1;
+    const timestamp = now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.#taskRow(task.id);
+      if (!current || current.latestAttemptId !== active.attemptId || current.state !== "running" ||
+          current.controlVersion !== active.controlVersion || current.contractVersion !== active.contractVersion ||
+          current.finalRevision !== candidateSha)
+        throw new Error("Semantic review became stale before allocation.");
+      const currentReviewerCount = Number(this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE task_id = ? AND role = 'reviewer'").get(task.id)?.count ?? 0);
+      if (currentReviewerCount >= budget.maxReviewerAttempts)
+        throw new Error("Task semantic reviewer budget exhausted.");
+      this.db.prepare("UPDATE attempts SET state = 'completed', finished_at = ?, worker_terminated = 1, final_branch_head = ?, terminal_detail = ? WHERE id = ? AND task_id = ? AND state = 'running' AND control_version = ? AND contract_version = ?")
+        .run(timestamp, candidateSha, `Deterministic gates passed; semantic review required (${trigger}).`, active.attemptId, task.id, active.controlVersion, active.contractVersion);
+      this.db.prepare("INSERT INTO attempts (id, task_id, number, role, control_version, contract_version, state, started_at, worker_terminated, cause) VALUES (?, ?, ?, 'reviewer', ?, ?, 'starting', ?, 0, 'review')")
+        .run(reviewerAttemptId, task.id, number, active.controlVersion, active.contractVersion, timestamp);
+      this.db.prepare("INSERT INTO attempt_runs (attempt_id, sequence, kind, control_version, contract_version, prompt_digest, state, evidence_refs, started_at) VALUES (?, 1, 'review', ?, ?, ?, 'pending', ?, ?)")
+        .run(reviewerAttemptId, active.controlVersion, active.contractVersion, promptDigest(context), JSON.stringify(evidenceIds), timestamp);
+      const taskUpdate = this.db.prepare("UPDATE tasks SET latest_attempt_id = ?, state = 'running', updated_at = ? WHERE id = ? AND latest_attempt_id = ? AND state = 'running' AND control_version = ? AND contract_version = ?")
+        .run(reviewerAttemptId, timestamp, task.id, active.attemptId, active.controlVersion, active.contractVersion);
+      if (taskUpdate.changes !== 1) throw new Error("Task fence rejected semantic reviewer allocation.");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      this.#removeReviewWorktree({ ...active, reviewWorktree });
+      throw error;
+    }
+    this.#clearAttemptWatchdog(active);
+    active.stopRequested = true;
+    if (this.active === active) this.active = null;
+    await this.launchAttempt({
+      task: { ...task, contractVersion: active.contractVersion, controlVersion: active.controlVersion },
+      attemptId: reviewerAttemptId,
+      number,
+      model: { provider: active.provider, id: active.modelId },
+      thinkingLevel: active.thinkingLevel,
+      packet: context,
+      role: "reviewer",
+      reviewWorktree,
+      reviewCandidateSha: candidateSha,
+    });
+    return true;
+  }
+
+  #completeReviewed(active, candidateSha, evidenceIds) {
+    const timestamp = now();
+    const detail = "Task completed after deterministic gates and semantic review passed.";
+    const refs = JSON.stringify(evidenceIds);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const taskUpdate = this.db.prepare("UPDATE tasks SET state = 'completed', updated_at = ?, final_result = ?, terminal_detail = ?, final_branch_head = ?, final_revision = ?, completion_evidence_ref = ?, terminal_reason = 'verified_semantic_review' WHERE id = ? AND latest_attempt_id = ? AND state = 'running' AND control_version = ? AND contract_version = ? AND final_revision = ?")
+        .run(timestamp, active.finalAssistant?.result ?? null, detail, candidateSha, candidateSha, refs, active.taskId, active.attemptId, active.controlVersion, active.contractVersion, candidateSha);
+      if (taskUpdate.changes !== 1) { this.db.exec("COMMIT"); return false; }
+      const attemptUpdate = this.db.prepare("UPDATE attempts SET state = 'completed', finished_at = ?, worker_terminated = 1, final_result = ?, terminal_detail = ?, final_branch_head = ? WHERE id = ? AND task_id = ? AND state = 'running' AND control_version = ? AND contract_version = ?")
+        .run(timestamp, active.finalAssistant?.result ?? null, detail, candidateSha, active.attemptId, active.taskId, active.controlVersion, active.contractVersion);
+      if (attemptUpdate.changes !== 1) throw new Error("Reviewer completion fence rejected semantic acceptance.");
+      const runUpdate = this.db.prepare("UPDATE attempt_runs SET evidence_refs = ? WHERE attempt_id = ? AND sequence = ? AND state = 'settled' AND control_version = ? AND contract_version = ?")
+        .run(refs, active.attemptId, active.runSequence, active.controlVersion, active.contractVersion);
+      if (runUpdate.changes !== 1) throw new Error("Reviewer AttemptRun completion fence rejected semantic acceptance.");
+      const resultId = this.#insertResultDelivery({ task: this.#taskRow(active.taskId), outcome: "completed", finalResult: active.finalAssistant?.result ?? null, terminalDetail: detail, terminalReason: "verified_semantic_review", finalRevision: candidateSha, finalBranchHead: candidateSha, evidenceRefs: evidenceIds });
+      if (!resultId) throw new Error("Reviewed Task did not produce a Result delivery.");
+      this.db.exec("COMMIT");
+      this.#clearAttemptWatchdog(active);
+      if (this.active === active) this.active = null;
+      return true;
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+
+  async #startFreshReviewRepair(active, task, receipt, candidateSha, evidenceIds) {
+    const budget = normalizeBudget(task.budget);
+    this.#assertFreshAttemptBudget(task.id, { provider: active.provider, id: active.modelId }, active.thinkingLevel);
+    const number = this.#getTaskAttemptsCount(task.id) + 1;
+    const prompt = buildRepairPrompt({
+      taskId: task.id,
+      attemptNumber: number,
+      goal: task.goal,
+      taskBranch: task.taskBranch,
+      taskWorktree: task.taskWorktree,
+      baseCommit: task.baseCommit,
+      candidateSha,
+      completionContract: parsed(task.completionContract),
+      priorFailureDetail: `Semantic review requested repair. Findings: ${JSON.stringify(receipt.findings).slice(0, 2 * 1024)}`,
+      remainingBudget: { remainingAttempts: Math.max(0, budget.maxTotalAttempts - number), remainingReviewerAttempts: Math.max(0, budget.maxReviewerAttempts - this.#getTaskReviewerAttemptsCount(task.id)), remainingRunsInAttempt: budget.maxPiRunsPerAttempt },
+    });
+    const repairAttemptId = randomUUID();
+    const timestamp = now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.#taskRow(task.id);
+      if (!current || current.latestAttemptId !== active.attemptId || current.state !== "running" || current.controlVersion !== active.controlVersion || current.contractVersion !== active.contractVersion || current.finalRevision !== candidateSha)
+        throw new Error("Semantic repair became stale before allocation.");
+      this.db.prepare("UPDATE attempts SET state = 'failed', finished_at = ?, worker_terminated = 1, terminal_detail = ?, final_branch_head = ? WHERE id = ? AND state = 'running' AND role = 'reviewer'").run(timestamp, "Semantic review requested a fresh repair Attempt.", candidateSha, active.attemptId);
+      this.db.prepare("INSERT INTO attempts (id, task_id, number, role, control_version, contract_version, state, started_at, worker_terminated, cause) VALUES (?, ?, ?, 'executor', ?, ?, 'starting', ?, 0, 'repair')").run(repairAttemptId, task.id, number, active.controlVersion, active.contractVersion, timestamp);
+      this.db.prepare("INSERT INTO attempt_runs (attempt_id, sequence, kind, control_version, contract_version, prompt_digest, state, evidence_refs, started_at) VALUES (?, 1, 'local_repair', ?, ?, ?, 'pending', ?, ?)").run(repairAttemptId, active.controlVersion, active.contractVersion, promptDigest(prompt), JSON.stringify(evidenceIds), timestamp);
+      const updated = this.db.prepare("UPDATE tasks SET latest_attempt_id = ?, state = 'running', updated_at = ? WHERE id = ? AND latest_attempt_id = ? AND state = 'running' AND control_version = ? AND contract_version = ?").run(repairAttemptId, timestamp, task.id, active.attemptId, active.controlVersion, active.contractVersion);
+      if (updated.changes !== 1) throw new Error("Task fence rejected semantic repair allocation.");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+    this.#clearAttemptWatchdog(active);
+    active.stopRequested = true;
+    if (this.active === active) this.active = null;
+    await this.launchAttempt({ task: { ...task }, attemptId: repairAttemptId, number, model: { provider: active.provider, id: active.modelId }, thinkingLevel: active.thinkingLevel, packet: prompt, priorState: "semantic_review_repair", priorDetail: "Fresh executor repair after semantic review.", role: "executor" });
+  }
+
+  #getTaskReviewerAttemptsCount(taskId) {
+    return Number(this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE task_id = ? AND role = 'reviewer'").get(taskId)?.count ?? 0);
+  }
+
+  async superviseReviewerSettled(active) {
+    if (this.active !== active || active.stopRequested || active.finalizing) return;
+    active.finalizing = true;
+    const current = this.#supervisorState(active);
+    if (!current) {
+      this.#removeReviewWorktree(active);
+      active.finalizing = false;
+      return;
+    }
+    const task = current.task;
+    const candidateSha = active.reviewCandidateSha;
+    const evidenceRefs = parsed(current.run.evidenceRefs, []);
+    let retired = false;
+    try {
+      retired = await this.retireWorker(active.worker, active.workerMetadata);
+      if (!retired) {
+        this.#verificationFailure(active, { state: "blocked", reason: "reviewer_retirement_ambiguous", detail: "Semantic reviewer could not be safely retired.", recordedCandidateSha: candidateSha, finalBranchHead: candidateSha, workerTerminated: false, evidenceRefs });
+        return;
+      }
+      const receipt = parseSemanticReviewResult(active.finalAssistant?.result, parsed(task.completionContract, {}));
+      const valid = receipt.valid && !receipt.uncertainty && this.#deterministicReviewGreen(task, candidateSha, evidenceRefs);
+      const reviewPayload = {
+        candidateSha,
+        baseSha: task.baseCommit,
+        trigger: semanticReviewTrigger(parsed(task.completionContract, {}), { goal: task.goal }),
+        reviewerAttemptId: active.attemptId,
+        criteria: receipt.criteria,
+        verdicts: receipt.verdicts,
+        findings: receipt.findings,
+        uncertainty: receipt.uncertainty,
+        recommendation: receipt.recommendation,
+        deterministicGreen: valid,
+        reviewer: { attemptId: active.attemptId, model: active.modelId, provider: active.provider, thinkingLevel: active.thinkingLevel },
+        controlVersion: active.controlVersion,
+        contractVersion: active.contractVersion,
+        evidenceRefs,
+      };
+      this.db.exec("BEGIN IMMEDIATE");
+      const evidenceId = this.#appendEvidence({
+        taskId: task.id,
+        attemptId: active.attemptId,
+        attemptRunId: `${active.attemptId}:${active.runSequence}`,
+        kind: "semantic_review",
+        source: "fresh_reviewer",
+        subject: candidateSha,
+        payload: reviewPayload,
+        dedupeKey: `semantic_review:${task.id}:${active.attemptId}:${candidateSha}`,
+      });
+      this.#linkEvidence(active, [evidenceId]);
+      this.db.exec("COMMIT");
+      this.#removeReviewWorktree(active);
+      if (!valid || receipt.recommendation === "blocked") {
+        const reason = receipt.valid ? "semantic_review_blocked" : "semantic_review_uncertain";
+        this.#verificationFailure(active, { state: "blocked", reason, detail: receipt.valid ? "Semantic reviewer reported blocked or unresolved acceptance." : "Semantic reviewer receipt was invalid or uncertain.", recordedCandidateSha: candidateSha, finalBranchHead: candidateSha, workerTerminated: true, evidenceRefs: [...evidenceRefs, evidenceId] });
+      } else if (receipt.recommendation === "repair") {
+        await this.#startFreshReviewRepair(active, task, receipt, candidateSha, [...evidenceRefs, evidenceId]);
+      } else {
+        this.#completeReviewed(active, candidateSha, [...evidenceRefs, evidenceId]);
+      }
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      this.#removeReviewWorktree(active);
+      if (this.active === active && !active.stopRequested) {
+        this.#verificationFailure(active, { state: retired ? "blocked" : "blocked", reason: "semantic_review_failed", detail: `Semantic review failed: ${commandError(error)}`, recordedCandidateSha: candidateSha, finalBranchHead: candidateSha, workerTerminated: retired, evidenceRefs });
+      }
+    } finally {
+      active.finalizing = false;
+    }
+  }
+
   async superviseSettled(active) {
     if (this.active !== active || active.stopRequested || active.finalizing) return;
     active.finalizing = true;
@@ -7657,10 +8166,32 @@ export class RuntimeStore {
         );
         return;
       }
-      this.#completeVerified(active, recordedCandidateSha, [
+      const deterministicEvidenceIds = [
         ...candidateEvidenceIds,
         ...localGateEvidenceIds,
-      ]);
+      ];
+      if (semanticReviewTrigger(parsed(task.completionContract, {}), { goal: task.goal })) {
+        const started = await this.#startSemanticReview(
+          active,
+          task,
+          recordedCandidateSha,
+          deterministicEvidenceIds,
+        );
+        if (!started) {
+          this.#verificationFailure(active, {
+            state: "failed",
+            reason: "budget_exhausted",
+            detail: "Semantic reviewer budget exhausted.",
+            observedCandidateSha,
+            recordedCandidateSha,
+            finalBranchHead: recordedCandidateSha,
+            workerTerminated: true,
+            evidenceRefs: deterministicEvidenceIds,
+          });
+        }
+        return;
+      }
+      this.#completeVerified(active, recordedCandidateSha, deterministicEvidenceIds);
     } catch (error) {
       if (this.active !== active || active.stopRequested) return;
       let retired = false;
@@ -7798,6 +8329,8 @@ export class RuntimeStore {
   }
 
   #assertContinuationSafe(active, options) {
+    if (active.role === "reviewer")
+      throw new Error("Semantic reviewer is limited to one bounded run.");
     if (
       this.active !== active ||
       active.stopRequested ||
@@ -8273,6 +8806,7 @@ export class RuntimeStore {
       active.finalizing = false;
       return;
     }
+    if (active.reviewWorktree) this.#removeReviewWorktree(active);
     if (!retired) {
       terminalState = "blocked";
       attemptState = "orphaned";

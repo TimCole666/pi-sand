@@ -1,0 +1,111 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { RuntimeStore } from "../src/runtime-store.js";
+
+const git = (cwd, args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
+const eventually = async (read, predicate) => {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const value = await read();
+    if (predicate(value)) return value;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error("timed out waiting for semantic reviewer");
+};
+
+async function fixture({ completionContract, reviewerFactory, workerFactory, budget } = {}) {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-semantic-review-"));
+  const source = join(parent, "source");
+  execFileSync("git", ["init", "-q", source]);
+  execFileSync("git", ["-C", source, "config", "user.email", "test@example.com"]);
+  execFileSync("git", ["-C", source, "config", "user.name", "Test"]);
+  await writeFile(join(source, "base.txt"), "base\n");
+  execFileSync("git", ["-C", source, "add", "."]);
+  execFileSync("git", ["-C", source, "commit", "-qm", "base"]);
+  const piCommand = join(parent, "pi-version");
+  await writeFile(piCommand, "#!/bin/sh\nprintf '0.84.4\\n'\n");
+  await chmod(piCommand, 0o755);
+  const calls = [];
+  const defaultWorker = async ({ role, cwd, onEvent, taskPrompt }) => {
+    calls.push({ role, cwd, taskPrompt });
+    if (role === "reviewer") {
+      calls.at(-1).candidateAtStart = git(cwd, ["rev-parse", "HEAD"]);
+      await writeFile(join(cwd, "reviewer-only.txt"), "isolated\n");
+      onEvent({ type: "message_end", message: { role: "assistant", content: JSON.stringify({ criteria: ["semantic criterion"], verdicts: [], findings: [], uncertainty: "", recommendation: "accept" }), stopReason: "stop" } });
+    } else {
+      await writeFile(join(cwd, "candidate.txt"), "candidate\n");
+      onEvent({ type: "message_end", message: { role: "assistant", content: "IMPLEMENTER_TRANSCRIPT_MARKER", stopReason: "stop" } });
+    }
+    onEvent({ type: "agent_settled" });
+    return { callbacksAttached: true, executionSnapshot: { sessionId: `${role}-session` }, close() {} };
+  };
+  const runtime = new RuntimeStore({ dbPath: join(parent, "runtime.sqlite"), piCommand, worktreeRoot: join(parent, "worktrees"), workerFactory: workerFactory ?? defaultWorker, reviewerFactory });
+  const task = await runtime.createTask({ cwd: source, trusted: true, goal: "implement fixture", model: { provider: "provider", id: "model" }, thinkingLevel: "low", completionContract: completionContract ?? { objective: "implement fixture", localGates: [{ id: "green", command: [process.execPath, "-e", "process.exit(0)"] }] }, budget });
+  return { parent, source, runtime, task, calls };
+}
+
+async function closeFixture(value) {
+  try { await value.runtime.shutdown(); } catch {}
+  try { value.runtime.release(); } catch {}
+  await rm(value.parent, { recursive: true, force: true });
+}
+
+test("no semantic trigger creates no reviewer Attempt", async () => {
+  const value = await fixture();
+  try {
+    const completed = await eventually(() => value.runtime.getTask(value.task.id), (task) => task.state === "completed");
+    assert.equal(completed.attempts.filter((attempt) => attempt.role === "reviewer").length, 0);
+    assert.deepEqual(value.calls.map(({ role }) => role), ["executor"]);
+  } finally { await closeFixture(value); }
+});
+
+test("conditional review is a fresh exact-candidate Attempt with bounded context and isolated mutation", async () => {
+  const value = await fixture({ completionContract: { objective: "implement fixture", semanticReview: true, semanticCriteria: ["semantic criterion"], localGates: [{ id: "green", command: [process.execPath, "-e", "process.exit(0)"] }] } });
+  try {
+    const completed = await eventually(() => value.runtime.getTask(value.task.id), (task) => task.state === "completed");
+    const reviewer = completed.attempts.find((attempt) => attempt.role === "reviewer");
+    assert.ok(reviewer);
+    assert.equal(reviewer.cause, "review");
+    assert.equal(completed.terminalReason, "verified_semantic_review");
+    const executor = value.calls.find(({ role }) => role === "executor");
+    const reviewCall = value.calls.find(({ role }) => role === "reviewer");
+    assert.notEqual(reviewCall.cwd, executor.cwd);
+    assert.equal(reviewCall.candidateAtStart, completed.finalRevision);
+    assert.equal(reviewCall.taskPrompt.includes("IMPLEMENTER_TRANSCRIPT_MARKER"), false);
+    assert.equal(reviewCall.taskPrompt.includes(completed.baseCommit), true);
+    assert.equal(reviewCall.taskPrompt.includes(completed.finalRevision), true);
+    assert.equal(await readFile(join(completed.taskWorktree, "reviewer-only.txt")).catch(() => null), null);
+    assert.equal(completed.evidence.filter((evidence) => evidence.kind === "semantic_review").length, 1);
+  } finally { await closeFixture(value); }
+});
+
+test("repair recommendation uses a fresh executor and enforces the reviewer budget", async () => {
+  let executorRuns = 0;
+  let reviewRuns = 0;
+  const workerFactory = async ({ role, cwd, onEvent }) => {
+    if (role === "reviewer") return reviewerFactory({ cwd, onEvent });
+    executorRuns += 1;
+    await writeFile(join(cwd, `candidate-${executorRuns}.txt`), "candidate\n");
+    onEvent({ type: "message_end", message: { role: "assistant", content: `executor-${executorRuns}`, stopReason: "stop" } });
+    onEvent({ type: "agent_settled" });
+    return { callbacksAttached: true, executionSnapshot: { sessionId: `executor-${executorRuns}` }, close() {} };
+  };
+  const reviewerFactory = async ({ onEvent }) => {
+    reviewRuns += 1;
+    onEvent({ type: "message_end", message: { role: "assistant", content: JSON.stringify({ criteria: ["semantic criterion"], verdicts: [], findings: reviewRuns === 1 ? [{ severity: "major", detail: "repair" }] : [], uncertainty: "", recommendation: reviewRuns === 1 ? "repair" : "accept" }), stopReason: "stop" } });
+    onEvent({ type: "agent_settled" });
+    return { callbacksAttached: true, executionSnapshot: { sessionId: `review-${reviewRuns}` }, close() {} };
+  };
+  const value = await fixture({ workerFactory, reviewerFactory, budget: { maxReviewerAttempts: 1 }, completionContract: { objective: "repair then review", semanticReview: true, semanticCriteria: ["semantic criterion"], localGates: [{ id: "green", command: [process.execPath, "-e", "process.exit(0)"] }] } });
+  try {
+    const failed = await eventually(() => value.runtime.getTask(value.task.id), (task) => task.state === "failed");
+    assert.equal(failed.terminalReason, "budget_exhausted");
+    assert.equal(reviewRuns, 1);
+    assert.equal(executorRuns, 2);
+    assert.equal(failed.attempts.some((attempt) => attempt.role === "executor" && attempt.cause === "repair"), true);
+  } finally { await closeFixture(value); }
+});
