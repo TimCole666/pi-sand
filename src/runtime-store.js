@@ -866,7 +866,6 @@ export function matchCheckRun(selector, checkRun) {
   const checkName = rest.slice(slashIdx + 1).trim();
 
   if (checkRun.name !== checkName) return false;
-  if (appSelector === "*") return true;
 
   const app = checkRun.app;
   if (!app) return false;
@@ -957,10 +956,10 @@ export function normalizeCommitStatus(
 }
 
 export function classifyOverallObservation(selectorResults) {
-  if (selectorResults.some((r) => r.normalizedState === "ci_not_observable"))
-    return "ci_not_observable";
   if (selectorResults.some((r) => r.normalizedState === "failure"))
     return "failure";
+  if (selectorResults.some((r) => r.normalizedState === "ci_not_observable"))
+    return "ci_not_observable";
   if (selectorResults.some((r) => r.normalizedState === "pending"))
     return "pending";
   if (
@@ -1018,6 +1017,74 @@ export async function callFetchCommitStatuses(adapter, params) {
   return [];
 }
 
+function redactSecrets(message) {
+  return String(message ?? "")
+    .replace(/gh[pousr]_[A-Za-z0-9_]{36,}/g, "[REDACTED]")
+    .replace(/github_pat_[A-Za-z0-9_]{82,}/g, "[REDACTED]")
+    .replace(/Bearer\s+[A-Za-z0-9_\-\.]+/gi, "Bearer [REDACTED]");
+}
+
+async function fetchGitHubJson(url, token) {
+  const headers = {
+    Accept: "application/vnd.github+json",
+    "User-Agent": "pi-sand",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  let res;
+  try {
+    res = await fetch(url, { headers });
+  } catch (err) {
+    throw Object.assign(new Error(`GitHub network error: ${err.message}`), {
+      code: "network_error",
+      cause: err,
+    });
+  }
+
+  if (!res.ok) {
+    const status = res.status;
+    const text = await res.text().catch(() => "");
+    if (status === 429 || status === 401 || status === 403) {
+      const remaining = res.headers.get("x-ratelimit-remaining");
+      const retryAfter = res.headers.get("retry-after");
+      const resetHeader = res.headers.get("x-ratelimit-reset");
+      if (status === 429 || remaining === "0" || retryAfter) {
+        const retryAfterMs = retryAfter
+          ? Number(retryAfter) * 1000
+          : resetHeader
+            ? Math.max(0, Number(resetHeader) * 1000 - Date.now())
+            : 60_000;
+        throw Object.assign(new Error("GitHub API rate limit exceeded"), {
+          code: "rate_limited",
+          retryAfterMs,
+          status,
+        });
+      }
+      throw Object.assign(
+        new Error(
+          `GitHub API authentication/permission error (${status}): ${text.slice(0, 200)}`,
+        ),
+        { code: "auth_failure", status },
+      );
+    }
+    if (status >= 500) {
+      throw Object.assign(
+        new Error(`GitHub API server error (${status})`),
+        { code: "provider_error", status },
+      );
+    }
+    throw Object.assign(
+      new Error(
+        `GitHub API request failed (${status}): ${text.slice(0, 200)}`,
+      ),
+      { code: "api_error", status },
+    );
+  }
+
+  return await res.json();
+}
+
 export const defaultGitHubAdapter = {
   async fetchCheckRuns({ repository, sha, githubHost = "github.com" }) {
     const apiBase =
@@ -1026,64 +1093,7 @@ export const defaultGitHubAdapter = {
         : `https://${githubHost}/api/v3`;
     const url = `${apiBase}/repos/${repository}/commits/${sha}/check-runs`;
     const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
-    const headers = {
-      Accept: "application/vnd.github+json",
-      "User-Agent": "pi-sand",
-      "X-GitHub-Api-Version": "2022-11-28",
-    };
-    if (token) headers["Authorization"] = `Bearer ${token}`;
-
-    let res;
-    try {
-      res = await fetch(url, { headers });
-    } catch (err) {
-      throw Object.assign(new Error(`GitHub network error: ${err.message}`), {
-        code: "network_error",
-        cause: err,
-      });
-    }
-
-    if (!res.ok) {
-      const status = res.status;
-      const text = await res.text().catch(() => "");
-      if (status === 401 || status === 403) {
-        const remaining = res.headers.get("x-ratelimit-remaining");
-        const retryAfter = res.headers.get("retry-after");
-        const resetHeader = res.headers.get("x-ratelimit-reset");
-        if (remaining === "0" || status === 429 || retryAfter) {
-          const retryAfterMs = retryAfter
-            ? Number(retryAfter) * 1000
-            : resetHeader
-              ? Math.max(0, Number(resetHeader) * 1000 - Date.now())
-              : 60_000;
-          throw Object.assign(new Error("GitHub API rate limit exceeded"), {
-            code: "rate_limited",
-            retryAfterMs,
-            status,
-          });
-        }
-        throw Object.assign(
-          new Error(
-            `GitHub API authentication/permission error (${status}): ${text.slice(0, 200)}`,
-          ),
-          { code: "auth_failure", status },
-        );
-      }
-      if (status >= 500) {
-        throw Object.assign(
-          new Error(`GitHub API server error (${status})`),
-          { code: "provider_error", status },
-        );
-      }
-      throw Object.assign(
-        new Error(
-          `GitHub API request failed (${status}): ${text.slice(0, 200)}`,
-        ),
-        { code: "api_error", status },
-      );
-    }
-
-    const data = await res.json();
+    const data = await fetchGitHubJson(url, token);
     return data.check_runs ?? [];
   },
 
@@ -1094,64 +1104,7 @@ export const defaultGitHubAdapter = {
         : `https://${githubHost}/api/v3`;
     const url = `${apiBase}/repos/${repository}/commits/${sha}/status`;
     const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
-    const headers = {
-      Accept: "application/vnd.github+json",
-      "User-Agent": "pi-sand",
-      "X-GitHub-Api-Version": "2022-11-28",
-    };
-    if (token) headers["Authorization"] = `Bearer ${token}`;
-
-    let res;
-    try {
-      res = await fetch(url, { headers });
-    } catch (err) {
-      throw Object.assign(new Error(`GitHub network error: ${err.message}`), {
-        code: "network_error",
-        cause: err,
-      });
-    }
-
-    if (!res.ok) {
-      const status = res.status;
-      const text = await res.text().catch(() => "");
-      if (status === 401 || status === 403) {
-        const remaining = res.headers.get("x-ratelimit-remaining");
-        const retryAfter = res.headers.get("retry-after");
-        const resetHeader = res.headers.get("x-ratelimit-reset");
-        if (remaining === "0" || status === 429 || retryAfter) {
-          const retryAfterMs = retryAfter
-            ? Number(retryAfter) * 1000
-            : resetHeader
-              ? Math.max(0, Number(resetHeader) * 1000 - Date.now())
-              : 60_000;
-          throw Object.assign(new Error("GitHub API rate limit exceeded"), {
-            code: "rate_limited",
-            retryAfterMs,
-            status,
-          });
-        }
-        throw Object.assign(
-          new Error(
-            `GitHub API authentication/permission error (${status}): ${text.slice(0, 200)}`,
-          ),
-          { code: "auth_failure", status },
-        );
-      }
-      if (status >= 500) {
-        throw Object.assign(
-          new Error(`GitHub API server error (${status})`),
-          { code: "provider_error", status },
-        );
-      }
-      throw Object.assign(
-        new Error(
-          `GitHub API request failed (${status}): ${text.slice(0, 200)}`,
-        ),
-        { code: "api_error", status },
-      );
-    }
-
-    const data = await res.json();
+    const data = await fetchGitHubJson(url, token);
     return data.statuses ?? [];
   },
 };
@@ -3115,7 +3068,7 @@ export class RuntimeStore {
           this.markBlocked(
             subscription.taskId,
             subscription.createdByAttemptId,
-            `GitHub authentication/permission failure: ${error.message}`,
+            `GitHub authentication/permission failure: ${redactSecrets(error.message)}`,
           );
         }
         return {
@@ -3124,7 +3077,7 @@ export class RuntimeStore {
           classification: "blocked_on_user",
           error: {
             code: error.code || "auth_failure",
-            message: bounded(error.message, MAX_TASK_DETAIL_LENGTH),
+            message: bounded(redactSecrets(error.message), MAX_TASK_DETAIL_LENGTH),
           },
         };
       }
@@ -3171,9 +3124,9 @@ export class RuntimeStore {
       if (selector.startsWith("check_run:")) {
         const matching = checkRuns.filter(
           (run) =>
-            (run.head_sha == null ||
-              run.head_sha.toLowerCase() ===
-                subscription.revisionSha.toLowerCase()) &&
+            run.head_sha &&
+            run.head_sha.toLowerCase() ===
+              subscription.revisionSha.toLowerCase() &&
             matchCheckRun(selector, run),
         );
         if (matching.length > 0) {
