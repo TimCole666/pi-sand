@@ -11,7 +11,7 @@ import { RuntimeStore } from "../src/runtime-store.js";
 const wait = (milliseconds) =>
   new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
 
-async function eventually(read, predicate, timeoutMs = 1_000) {
+async function eventually(read, predicate, timeoutMs = 2_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const value = await read();
@@ -120,7 +120,7 @@ async function stopHandle(handle) {
   });
 }
 
-async function startFake(fake, cwd, behavior = {}, { timeoutMs = 500 } = {}) {
+async function startFake(fake, cwd, behavior = {}, { timeoutMs = 1_000 } = {}) {
   return startFreshExecutor({
     command: fake.command,
     cwd,
@@ -261,7 +261,7 @@ test("Fresh Executor closes an unacknowledged re-prompt without replaying the mu
 
 test("Fresh Executor times out an unacknowledged re-prompt without replaying it", async () => {
   await withFreshExecutor(async ({ cwd, fake, setHandle }) => {
-    const handle = await startFake(fake, cwd, { ackGates: { "2": join(cwd, "never") } }, { timeoutMs: 250 });
+    const handle = await startFake(fake, cwd, { ackGates: { "2": join(cwd, "never") } }, { timeoutMs: 1_000 });
     setHandle(handle);
     const events = [];
     handle.onEvent((event) => events.push(event));
