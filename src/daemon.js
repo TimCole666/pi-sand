@@ -78,6 +78,11 @@ async function handleRequest(request, store) {
     case "task.wait":
     case "wait.register":
       return await store.registerWaitSubscription(params);
+    case "wait.reconcile":
+      return await store.reconcileWaitSubscription(
+        params.id ?? params.subscriptionId ?? params.waitId,
+        params,
+      );
     case "result.claim": {
       const result = store.claimResult(
         params.clientInstanceId ?? params.client_instance_id,
@@ -174,6 +179,7 @@ export async function startRuntimeDaemon({
   // by a process that failed to become the runtime owner.
   ensureRuntimeDirectoryForSocket(socketPath);
   store.open();
+  await store.reconcileActiveWaits().catch(() => {});
   const connections = new Set();
   const server = createServer((socket) => {
     connections.add(socket);

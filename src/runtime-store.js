@@ -54,6 +54,10 @@ export const MAX_CHECK_SELECTOR_LENGTH = 1_024;
 export const CHECK_SELECTOR_REGEX =
   /^(check_run:[^/\0\s]+\/[^\0\s]+|commit_status:[^\0\s]+)$/;
 export const DEFAULT_CI_WAIT_TIMEOUT_MS = 60 * 60 * 1000;
+export const DEFAULT_CI_CHECK_APPEARANCE_GRACE_MS = 10 * 60 * 1000;
+export const CI_RECONCILE_INTERVAL_INITIAL_MS = 30_000;
+export const CI_RECONCILE_INTERVAL_MID_MS = 60_000;
+export const CI_RECONCILE_INTERVAL_LATE_MS = 300_000;
 const INITIAL_ATTEMPT_RUN_SEQUENCE = 1;
 const ACTIVE_ATTEMPT_STATES = new Set(["starting", "running"]);
 const ACTIVE_GATE_STATES = new Set(["running", "ambiguous"]);
@@ -848,6 +852,310 @@ function waitSubscriptionSnapshot(row) {
   };
 }
 
+export function matchCheckRun(selector, checkRun) {
+  if (
+    typeof selector !== "string" ||
+    !selector.startsWith("check_run:") ||
+    !checkRun
+  )
+    return false;
+  const rest = selector.slice("check_run:".length);
+  const slashIdx = rest.indexOf("/");
+  if (slashIdx === -1) return false;
+  const appSelector = rest.slice(0, slashIdx).trim();
+  const checkName = rest.slice(slashIdx + 1).trim();
+
+  if (checkRun.name !== checkName) return false;
+  if (appSelector === "*") return true;
+
+  const app = checkRun.app;
+  if (!app) return false;
+  if (app.slug && app.slug.toLowerCase() === appSelector.toLowerCase())
+    return true;
+  if (app.id != null && String(app.id) === appSelector) return true;
+  if (
+    app.name &&
+    (app.name.toLowerCase() === appSelector.toLowerCase() ||
+      app.name.toLowerCase().replace(/\s+/g, "-") ===
+        appSelector.toLowerCase())
+  )
+    return true;
+  return false;
+}
+
+export function matchCommitStatus(selector, status) {
+  if (
+    typeof selector !== "string" ||
+    !selector.startsWith("commit_status:") ||
+    !status
+  )
+    return false;
+  const targetContext = selector.slice("commit_status:".length).trim();
+  const context = status.context ?? "default";
+  return context === targetContext;
+}
+
+export function normalizeCheckRun(checkRun, acceptedConclusions = ["success"]) {
+  const status = String(checkRun?.status ?? "").toLowerCase();
+  const conclusion =
+    checkRun?.conclusion != null
+      ? String(checkRun.conclusion).toLowerCase()
+      : null;
+  const isTerminal = status === "completed" || conclusion != null;
+
+  if (!isTerminal) {
+    return {
+      normalizedState: "pending",
+      conclusion: null,
+      isTerminal: false,
+    };
+  }
+
+  const effectiveConclusion = conclusion ?? "unknown";
+  if (acceptedConclusions.includes(effectiveConclusion)) {
+    return {
+      normalizedState: "success",
+      conclusion: effectiveConclusion,
+      isTerminal: true,
+    };
+  }
+  return {
+    normalizedState: "failure",
+    conclusion: effectiveConclusion,
+    isTerminal: true,
+  };
+}
+
+export function normalizeCommitStatus(
+  status,
+  acceptedConclusions = ["success"],
+) {
+  const state = String(status?.state ?? "").toLowerCase();
+  const isTerminal =
+    state === "success" || state === "failure" || state === "error";
+
+  if (!isTerminal || state === "pending") {
+    return {
+      normalizedState: "pending",
+      conclusion: state,
+      isTerminal: false,
+    };
+  }
+
+  if (acceptedConclusions.includes(state)) {
+    return {
+      normalizedState: "success",
+      conclusion: state,
+      isTerminal: true,
+    };
+  }
+  return {
+    normalizedState: "failure",
+    conclusion: state,
+    isTerminal: true,
+  };
+}
+
+export function classifyOverallObservation(selectorResults) {
+  if (selectorResults.some((r) => r.normalizedState === "ci_not_observable"))
+    return "ci_not_observable";
+  if (selectorResults.some((r) => r.normalizedState === "failure"))
+    return "failure";
+  if (selectorResults.some((r) => r.normalizedState === "pending"))
+    return "pending";
+  if (
+    selectorResults.length > 0 &&
+    selectorResults.every((r) => r.normalizedState === "success")
+  )
+    return "success";
+  return "pending";
+}
+
+export function computeReconcileInterval(
+  createdAt,
+  currentTime = Date.now(),
+  subscriptionId = "",
+) {
+  const elapsedMs = Math.max(
+    0,
+    currentTime - new Date(createdAt).getTime(),
+  );
+  let interval = CI_RECONCILE_INTERVAL_LATE_MS;
+  if (elapsedMs < 10 * 60 * 1000) interval = CI_RECONCILE_INTERVAL_INITIAL_MS;
+  else if (elapsedMs < 60 * 60 * 1000) interval = CI_RECONCILE_INTERVAL_MID_MS;
+  const jitter = subscriptionId
+    ? createHash("sha256").update(subscriptionId).digest().readUInt16BE(0) %
+      1000
+    : 0;
+  return interval + jitter;
+}
+
+export async function callFetchCheckRuns(adapter, params) {
+  const fn = adapter?.fetchCheckRuns ?? adapter?.getCheckRuns;
+  if (typeof fn !== "function")
+    throw new Error(
+      "GitHub adapter must provide fetchCheckRuns or getCheckRuns.",
+    );
+  const res = await fn.call(adapter, params);
+  if (Array.isArray(res)) return res;
+  if (res && Array.isArray(res.check_runs)) return res.check_runs;
+  return [];
+}
+
+export async function callFetchCommitStatuses(adapter, params) {
+  const fn =
+    adapter?.fetchCommitStatuses ??
+    adapter?.getCommitStatuses ??
+    adapter?.fetchCommitStatus ??
+    adapter?.getCommitStatus;
+  if (typeof fn !== "function")
+    throw new Error(
+      "GitHub adapter must provide fetchCommitStatuses or getCommitStatus.",
+    );
+  const res = await fn.call(adapter, params);
+  if (Array.isArray(res)) return res;
+  if (res && Array.isArray(res.statuses)) return res.statuses;
+  return [];
+}
+
+export const defaultGitHubAdapter = {
+  async fetchCheckRuns({ repository, sha, githubHost = "github.com" }) {
+    const apiBase =
+      githubHost === "github.com"
+        ? "https://api.github.com"
+        : `https://${githubHost}/api/v3`;
+    const url = `${apiBase}/repos/${repository}/commits/${sha}/check-runs`;
+    const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+    const headers = {
+      Accept: "application/vnd.github+json",
+      "User-Agent": "pi-sand",
+      "X-GitHub-Api-Version": "2022-11-28",
+    };
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+
+    let res;
+    try {
+      res = await fetch(url, { headers });
+    } catch (err) {
+      throw Object.assign(new Error(`GitHub network error: ${err.message}`), {
+        code: "network_error",
+        cause: err,
+      });
+    }
+
+    if (!res.ok) {
+      const status = res.status;
+      const text = await res.text().catch(() => "");
+      if (status === 401 || status === 403) {
+        const remaining = res.headers.get("x-ratelimit-remaining");
+        const retryAfter = res.headers.get("retry-after");
+        const resetHeader = res.headers.get("x-ratelimit-reset");
+        if (remaining === "0" || status === 429 || retryAfter) {
+          const retryAfterMs = retryAfter
+            ? Number(retryAfter) * 1000
+            : resetHeader
+              ? Math.max(0, Number(resetHeader) * 1000 - Date.now())
+              : 60_000;
+          throw Object.assign(new Error("GitHub API rate limit exceeded"), {
+            code: "rate_limited",
+            retryAfterMs,
+            status,
+          });
+        }
+        throw Object.assign(
+          new Error(
+            `GitHub API authentication/permission error (${status}): ${text.slice(0, 200)}`,
+          ),
+          { code: "auth_failure", status },
+        );
+      }
+      if (status >= 500) {
+        throw Object.assign(
+          new Error(`GitHub API server error (${status})`),
+          { code: "provider_error", status },
+        );
+      }
+      throw Object.assign(
+        new Error(
+          `GitHub API request failed (${status}): ${text.slice(0, 200)}`,
+        ),
+        { code: "api_error", status },
+      );
+    }
+
+    const data = await res.json();
+    return data.check_runs ?? [];
+  },
+
+  async fetchCommitStatuses({ repository, sha, githubHost = "github.com" }) {
+    const apiBase =
+      githubHost === "github.com"
+        ? "https://api.github.com"
+        : `https://${githubHost}/api/v3`;
+    const url = `${apiBase}/repos/${repository}/commits/${sha}/status`;
+    const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+    const headers = {
+      Accept: "application/vnd.github+json",
+      "User-Agent": "pi-sand",
+      "X-GitHub-Api-Version": "2022-11-28",
+    };
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+
+    let res;
+    try {
+      res = await fetch(url, { headers });
+    } catch (err) {
+      throw Object.assign(new Error(`GitHub network error: ${err.message}`), {
+        code: "network_error",
+        cause: err,
+      });
+    }
+
+    if (!res.ok) {
+      const status = res.status;
+      const text = await res.text().catch(() => "");
+      if (status === 401 || status === 403) {
+        const remaining = res.headers.get("x-ratelimit-remaining");
+        const retryAfter = res.headers.get("retry-after");
+        const resetHeader = res.headers.get("x-ratelimit-reset");
+        if (remaining === "0" || status === 429 || retryAfter) {
+          const retryAfterMs = retryAfter
+            ? Number(retryAfter) * 1000
+            : resetHeader
+              ? Math.max(0, Number(resetHeader) * 1000 - Date.now())
+              : 60_000;
+          throw Object.assign(new Error("GitHub API rate limit exceeded"), {
+            code: "rate_limited",
+            retryAfterMs,
+            status,
+          });
+        }
+        throw Object.assign(
+          new Error(
+            `GitHub API authentication/permission error (${status}): ${text.slice(0, 200)}`,
+          ),
+          { code: "auth_failure", status },
+        );
+      }
+      if (status >= 500) {
+        throw Object.assign(
+          new Error(`GitHub API server error (${status})`),
+          { code: "provider_error", status },
+        );
+      }
+      throw Object.assign(
+        new Error(
+          `GitHub API request failed (${status}): ${text.slice(0, 200)}`,
+        ),
+        { code: "api_error", status },
+      );
+    }
+
+    const data = await res.json();
+    return data.statuses ?? [];
+  },
+};
+
 function taskSnapshot(row, attempts = [], evidence = [], remoteEffects = [], waitSubscriptions = []) {
   return {
     id: row.id,
@@ -955,6 +1263,8 @@ export class RuntimeStore {
     resultClock = () => Date.now(),
     remoteTransport,
     beforeRemotePush,
+    gitHubAdapter,
+    gitHubClient,
   } = {}) {
     this.dbPath = dbPath;
     this.piCommand = piCommand;
@@ -982,6 +1292,7 @@ export class RuntimeStore {
     )
       throw new Error("Remote publication transport must provide readRef and push.");
     this.beforeRemotePush = beforeRemotePush;
+    this.gitHubAdapter = gitHubAdapter ?? gitHubClient ?? defaultGitHubAdapter;
     this.databaseLock = null;
     this.db = null;
     this.active = null;
@@ -2697,6 +3008,378 @@ export class RuntimeStore {
       .prepare(`${WAIT_SUBSCRIPTION_SELECT} WHERE id = ?`)
       .get(id);
     return waitSubscriptionSnapshot(row);
+  }
+
+  getActiveWaitSubscriptions() {
+    this.open();
+    return this.db
+      .prepare(
+        `${WAIT_SUBSCRIPTION_SELECT} WHERE status = 'active' ORDER BY created_at, id`,
+      )
+      .all()
+      .map(waitSubscriptionSnapshot);
+  }
+
+  async reconcileWaitSubscription(
+    subscriptionId,
+    {
+      now: nowOverride,
+      gitHubAdapter,
+      gitHubClient,
+      markBlockedOnAuth = true,
+    } = {},
+  ) {
+    this.ensureSupported();
+    const id = String(subscriptionId ?? "").trim();
+    if (!id) throw new Error("Wait reconciliation requires a subscription id.");
+    this.open();
+
+    const subscription = this.getWaitSubscription(id);
+    if (!subscription)
+      throw new Error(`Wait subscription ${id} was not found.`);
+
+    if (subscription.status !== "active") {
+      return {
+        task: this.getTask(subscription.taskId),
+        waitSubscription: subscription,
+        classification: "inactive",
+      };
+    }
+
+    const taskRow = this.#taskRow(subscription.taskId);
+    if (!taskRow) throw new Error(`Task ${subscription.taskId} was not found.`);
+
+    const nowTime = nowOverride ? new Date(nowOverride).getTime() : Date.now();
+    const nowIso = new Date(nowTime).toISOString();
+
+    if (nowTime >= new Date(subscription.deadlineAt).getTime()) {
+      this.db
+        .prepare(
+          "UPDATE wait_subscriptions SET status = 'timed_out', last_reconciled_at = ?, next_reconcile_at = NULL WHERE id = ?",
+        )
+        .run(nowIso, id);
+      return {
+        task: this.getTask(subscription.taskId),
+        waitSubscription: this.getWaitSubscription(id),
+        classification: "timed_out",
+      };
+    }
+
+    const adapter = gitHubAdapter ?? gitHubClient ?? this.gitHubAdapter;
+    let checkRuns = [];
+    let commitStatuses = [];
+
+    try {
+      const [runsRes, statusesRes] = await Promise.all([
+        callFetchCheckRuns(adapter, {
+          repository: subscription.repositoryId,
+          sha: subscription.revisionSha,
+          githubHost: subscription.githubHost,
+        }),
+        callFetchCommitStatuses(adapter, {
+          repository: subscription.repositoryId,
+          sha: subscription.revisionSha,
+          githubHost: subscription.githubHost,
+        }),
+      ]);
+      checkRuns = runsRes;
+      commitStatuses = statusesRes;
+    } catch (error) {
+      const isRateLimit =
+        error.code === "rate_limited" ||
+        error.status === 429 ||
+        error.statusCode === 429;
+      const isAuth =
+        error.code === "auth_failure" ||
+        error.code === "permission_denied" ||
+        error.code === "github_auth_error" ||
+        error.status === 401 ||
+        error.statusCode === 401 ||
+        (error.status === 403 && !isRateLimit) ||
+        (error.statusCode === 403 && !isRateLimit);
+      const isNetwork =
+        error.code === "network_error" ||
+        error.code === "provider_error" ||
+        error.status >= 500 ||
+        error.statusCode >= 500 ||
+        ["ECONNREFUSED", "ETIMEDOUT", "ENOTFOUND"].includes(error.code) ||
+        ["ECONNREFUSED", "ETIMEDOUT", "ENOTFOUND"].includes(error.cause?.code);
+
+      if (isAuth) {
+        this.db
+          .prepare(
+            "UPDATE wait_subscriptions SET last_reconciled_at = ? WHERE id = ?",
+          )
+          .run(nowIso, id);
+        if (markBlockedOnAuth) {
+          this.markBlocked(
+            subscription.taskId,
+            subscription.createdByAttemptId,
+            `GitHub authentication/permission failure: ${error.message}`,
+          );
+        }
+        return {
+          task: this.getTask(subscription.taskId),
+          waitSubscription: this.getWaitSubscription(id),
+          classification: "blocked_on_user",
+          error: {
+            code: error.code || "auth_failure",
+            message: bounded(error.message, MAX_TASK_DETAIL_LENGTH),
+          },
+        };
+      }
+
+      if (isRateLimit || isNetwork) {
+        const retryDelay =
+          error.retryAfterMs ?? (isRateLimit ? 60_000 : 15_000);
+        const nextReconcileIso = new Date(nowTime + retryDelay).toISOString();
+        this.db
+          .prepare(
+            "UPDATE wait_subscriptions SET last_reconciled_at = ?, next_reconcile_at = ? WHERE id = ?",
+          )
+          .run(nowIso, nextReconcileIso, id);
+        return {
+          task: this.getTask(subscription.taskId),
+          waitSubscription: this.getWaitSubscription(id),
+          classification: "pending",
+          transientError: {
+            code:
+              error.code || (isRateLimit ? "rate_limited" : "network_error"),
+            message: bounded(error.message, MAX_TASK_DETAIL_LENGTH),
+          },
+        };
+      }
+
+      throw error;
+    }
+
+    const taskBudget = parsed(taskRow.budget, {});
+    const graceMs = Number(
+      taskBudget?.ciCheckAppearanceGraceMs ??
+        taskBudget?.requiredCheckGraceMs ??
+        DEFAULT_CI_CHECK_APPEARANCE_GRACE_MS,
+    );
+    const elapsedMs = nowTime - new Date(subscription.createdAt).getTime();
+    const graceExpired = elapsedMs >= graceMs;
+
+    const requiredChecks = subscription.requiredChecks;
+    const acceptedConclusions = subscription.acceptedConclusions;
+    const selectorResults = [];
+    const evidenceIds = [];
+
+    for (const selector of requiredChecks) {
+      if (selector.startsWith("check_run:")) {
+        const matching = checkRuns.filter(
+          (run) =>
+            (run.head_sha == null ||
+              run.head_sha.toLowerCase() ===
+                subscription.revisionSha.toLowerCase()) &&
+            matchCheckRun(selector, run),
+        );
+        if (matching.length > 0) {
+          matching.sort((a, b) => {
+            const aTime = a.completed_at
+              ? new Date(a.completed_at).getTime()
+              : a.started_at
+                ? new Date(a.started_at).getTime()
+                : 0;
+            const bTime = b.completed_at
+              ? new Date(b.completed_at).getTime()
+              : b.started_at
+                ? new Date(b.started_at).getTime()
+                : 0;
+            if (bTime !== aTime) return bTime - aTime;
+            return Number(b.id) - Number(a.id);
+          });
+          const latestRun = matching[0];
+          const { normalizedState, conclusion } = normalizeCheckRun(
+            latestRun,
+            acceptedConclusions,
+          );
+          const dedupeKey = `github_check_observation:${subscription.taskId}:${subscription.generation}:${subscription.revisionSha}:${selector}:${latestRun.id}:${normalizedState}:${conclusion ?? "null"}`;
+          const evidenceId = this.#appendEvidence({
+            taskId: subscription.taskId,
+            attemptId: subscription.createdByAttemptId,
+            attemptRunId: null,
+            kind: "github_check_observation",
+            source: "github_ci",
+            subject: subscription.revisionSha,
+            payload: {
+              waitSubscriptionId: subscription.id,
+              taskId: subscription.taskId,
+              generation: subscription.generation,
+              repository: subscription.repositoryId,
+              sha: subscription.revisionSha,
+              selector,
+              normalizedState,
+              conclusion,
+              status: latestRun.status ?? null,
+              runId: latestRun.id,
+              metadata: {
+                name: latestRun.name,
+                status: latestRun.status ?? null,
+                conclusion: latestRun.conclusion ?? null,
+                startedAt: latestRun.started_at ?? null,
+                completedAt: latestRun.completed_at ?? null,
+                htmlUrl: latestRun.html_url ?? null,
+                detailsUrl: latestRun.details_url ?? null,
+                app: latestRun.app
+                  ? {
+                      id: latestRun.app.id ?? null,
+                      slug: latestRun.app.slug ?? null,
+                      name: latestRun.app.name ?? null,
+                    }
+                  : null,
+              },
+              observedAt: nowIso,
+            },
+            dedupeKey,
+          });
+          evidenceIds.push(evidenceId);
+          selectorResults.push({
+            selector,
+            normalizedState,
+            conclusion,
+            matched: true,
+            item: latestRun,
+            evidenceId,
+          });
+        } else {
+          const normalizedState = graceExpired
+            ? "ci_not_observable"
+            : "pending";
+          selectorResults.push({
+            selector,
+            normalizedState,
+            matched: false,
+          });
+        }
+      } else if (selector.startsWith("commit_status:")) {
+        const matching = commitStatuses.filter((st) =>
+          matchCommitStatus(selector, st),
+        );
+        if (matching.length > 0) {
+          matching.sort((a, b) => {
+            const aTime = a.updated_at
+              ? new Date(a.updated_at).getTime()
+              : a.created_at
+                ? new Date(a.created_at).getTime()
+                : 0;
+            const bTime = b.updated_at
+              ? new Date(b.updated_at).getTime()
+              : b.created_at
+                ? new Date(b.created_at).getTime()
+                : 0;
+            if (bTime !== aTime) return bTime - aTime;
+            return Number(b.id) - Number(a.id);
+          });
+          const latestStatus = matching[0];
+          const { normalizedState, conclusion } = normalizeCommitStatus(
+            latestStatus,
+            acceptedConclusions,
+          );
+          const dedupeKey = `github_status_observation:${subscription.taskId}:${subscription.generation}:${subscription.revisionSha}:${selector}:${latestStatus.id}:${normalizedState}:${conclusion}`;
+          const evidenceId = this.#appendEvidence({
+            taskId: subscription.taskId,
+            attemptId: subscription.createdByAttemptId,
+            attemptRunId: null,
+            kind: "github_status_observation",
+            source: "github_ci",
+            subject: subscription.revisionSha,
+            payload: {
+              waitSubscriptionId: subscription.id,
+              taskId: subscription.taskId,
+              generation: subscription.generation,
+              repository: subscription.repositoryId,
+              sha: subscription.revisionSha,
+              selector,
+              normalizedState,
+              conclusion,
+              statusId: latestStatus.id,
+              metadata: {
+                context: latestStatus.context,
+                state: latestStatus.state,
+                description: latestStatus.description ?? null,
+                targetUrl: latestStatus.target_url ?? null,
+                createdAt: latestStatus.created_at ?? null,
+                updatedAt: latestStatus.updated_at ?? null,
+              },
+              observedAt: nowIso,
+            },
+            dedupeKey,
+          });
+          evidenceIds.push(evidenceId);
+          selectorResults.push({
+            selector,
+            normalizedState,
+            conclusion,
+            matched: true,
+            item: latestStatus,
+            evidenceId,
+          });
+        } else {
+          const normalizedState = graceExpired
+            ? "ci_not_observable"
+            : "pending";
+          selectorResults.push({
+            selector,
+            normalizedState,
+            matched: false,
+          });
+        }
+      }
+    }
+
+    const classification = classifyOverallObservation(selectorResults);
+
+    let nextReconcileIso = null;
+    if (classification === "pending") {
+      const nextInterval = computeReconcileInterval(
+        subscription.createdAt,
+        nowTime,
+        subscription.id,
+      );
+      nextReconcileIso = new Date(nowTime + nextInterval).toISOString();
+    }
+
+    this.db
+      .prepare(
+        "UPDATE wait_subscriptions SET last_reconciled_at = ?, next_reconcile_at = ? WHERE id = ?",
+      )
+      .run(nowIso, nextReconcileIso, id);
+
+    return {
+      task: this.getTask(subscription.taskId),
+      waitSubscription: this.getWaitSubscription(id),
+      classification,
+      selectorResults,
+      evidenceIds,
+    };
+  }
+
+  async reconcileActiveWaits(options = {}) {
+    this.open();
+    const rows = this.db
+      .prepare(
+        "SELECT id FROM wait_subscriptions WHERE status = 'active' ORDER BY created_at, id",
+      )
+      .all();
+    const results = [];
+    for (const row of rows) {
+      try {
+        const result = await this.reconcileWaitSubscription(row.id, options);
+        if (result) results.push(result);
+      } catch (error) {
+        results.push({
+          subscriptionId: row.id,
+          error: {
+            code: error.code || "reconciliation_failed",
+            message: bounded(error.message, MAX_TASK_DETAIL_LENGTH),
+          },
+        });
+      }
+    }
+    return results;
   }
 
   #insertResultDelivery({
