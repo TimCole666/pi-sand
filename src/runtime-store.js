@@ -5158,18 +5158,32 @@ export class RuntimeStore {
   #failActiveForBudget(active, detail, terminalReason = "budget_exhausted", failureContext = {}) {
     if (active.budgetFailurePromise) return active.budgetFailurePromise;
     active.budgetFailurePromise = (async () => {
+      const gateActive = Boolean(active.gateProcess || active.gateCancellation);
+      const gateTerminated = gateActive ? this.#cancelLocalGate(active) : true;
       let retired = false;
       try {
         retired = await this.retireWorker(active.worker, active.workerMetadata);
       } catch {}
       if (this.active !== active || active.stopRequested) return;
       if (active.runSettled) {
+        const safelyTerminal = gateTerminated && retired;
+        const task = this.#taskRow(active.taskId);
+        let failureReason = terminalReason;
+        let failureDetail = detail;
+        if (!safelyTerminal) {
+          failureReason = gateTerminated
+            ? "worker_retirement_ambiguous"
+            : "gate_termination_ambiguous";
+          failureDetail = `${detail} ${gateTerminated
+            ? "Fresh Executor could not be safely retired; executor capacity remains blocked."
+            : "Local gate could not be safely terminated; executor capacity remains blocked."}`;
+        }
         this.#verificationFailure(active, {
-          state: retired ? "failed" : "blocked",
-          reason: retired ? terminalReason : "worker_retirement_ambiguous",
-          detail: retired
-            ? detail
-            : `${detail} Fresh Executor could not be safely retired; executor capacity remains blocked.`,
+          state: safelyTerminal ? "failed" : "blocked",
+          reason: failureReason,
+          detail: failureDetail,
+          recordedCandidateSha: task?.finalRevision ?? null,
+          finalBranchHead: task?.finalRevision ?? null,
           ...failureContext,
           workerTerminated: retired,
         });
@@ -5181,9 +5195,6 @@ export class RuntimeStore {
           terminalReason,
           checkpoint: false,
         });
-      }
-      if (!retired && this.active === active) {
-        this.markBlocked(active.taskId, active.attemptId, detail);
       }
     })();
     return active.budgetFailurePromise;
@@ -5808,6 +5819,12 @@ export class RuntimeStore {
     }
     if (active.finalizing) {
       active.attemptWatchdogDue = true;
+      if (active.gateProcess || active.gateCancellation)
+        await this.#failActiveForBudget(
+          active,
+          "Task active Attempt duration expired.",
+          "external_timeout",
+        );
       return;
     }
     await this.#failActiveForBudget(
@@ -6841,7 +6858,12 @@ export class RuntimeStore {
         if (!resultId) throw new Error("Failed Task did not produce a Result delivery.");
       }
       this.db.exec("COMMIT");
-      if (this.active === active && !active.gateProcess) this.active = null;
+      if (
+        this.active === active &&
+        !active.gateProcess &&
+        workerTerminated === true
+      )
+        this.active = null;
       return true;
     } catch (error) {
       try {

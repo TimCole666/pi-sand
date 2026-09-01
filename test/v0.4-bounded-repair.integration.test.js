@@ -12,6 +12,7 @@ import {
   ciFailureFingerprint,
   normalizeBudget,
 } from "../src/runtime-store.js";
+import { processGroupStatus } from "../src/process.js";
 
 const wait = (milliseconds) =>
   new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
@@ -1552,7 +1553,7 @@ test("15. active Attempt watchdog durably fails a never-settling worker", async 
 // -----------------------------------------------------------------------------
 // Regression: an active Attempt deadline remains authoritative during a gate
 // -----------------------------------------------------------------------------
-test("active Attempt deadline expires during a passing local gate", async () => {
+test("active Attempt deadline terminates a never-ending local gate before terminalization", async () => {
   let watchdogCallback = null;
   let clock = Date.now();
   const timer = {
@@ -1569,8 +1570,8 @@ test("active Attempt deadline expires during a passing local gate", async () => 
     completionContract: {
       objective: "expire during local verification",
       localGates: [{
-        id: "slow-pass",
-        command: [process.execPath, "-e", "setTimeout(() => process.exit(0), 200)"],
+        id: "never-ending",
+        command: [process.execPath, "-e", "setInterval(() => {}, 1000)"],
       }],
     },
   });
@@ -1580,19 +1581,44 @@ test("active Attempt deadline expires during a passing local gate", async () => 
       () => value.runtime.db.prepare("SELECT gate_state AS gateState FROM attempts WHERE id = ?").get(value.task.latestAttemptId),
       (attempt) => attempt?.gateState === "running",
     );
-    const startedAt = value.runtime.db
-      .prepare("SELECT started_at AS startedAt FROM attempts WHERE id = ?")
-      .get(value.task.latestAttemptId).startedAt;
-    clock = Date.parse(startedAt) + 2;
+    const gate = value.runtime.db
+      .prepare("SELECT gate_pgid AS gatePgid, started_at AS startedAt FROM attempts WHERE id = ?")
+      .get(value.task.latestAttemptId);
+    clock = Date.parse(gate.startedAt) + 2;
+
     watchdogCallback();
+
     const failed = await eventually(
       () => value.runtime.getTask(value.task.id),
       (task) => ["failed", "blocked", "completed"].includes(task.state),
     );
     assert.equal(failed.state, "failed");
     assert.equal(failed.terminalReason, "external_timeout");
+    assert.equal(failed.attempts.length, 1);
+    assert.equal(failed.attempts[0].state, "failed");
+    assert.equal(failed.attempts[0].gateState, "terminated");
+    assert.equal(failed.attempts[0].gateTerminated, true);
     assert.equal(failed.attempts[0].workerTerminated, true);
-    assert.equal(value.runtime.db.prepare("SELECT COUNT(*) AS count FROM result_deliveries WHERE task_id = ?").get(value.task.id).count, 1);
+    assert.equal(processGroupStatus(gate.gatePgid), "gone");
+    assert.equal(value.runtime.active, null);
+    assert.equal(value.runtime.hasCapacityConflict(), false);
+    assert.equal(value.transport.pushCount, 0);
+    assert.equal(failed.publicationCount, 0);
+    assert.equal(failed.completionEvidenceRef, null);
+    assert.equal(
+      value.runtime.db
+        .prepare("SELECT COUNT(*) AS count FROM wait_subscriptions WHERE task_id = ?")
+        .get(value.task.id).count,
+      0,
+    );
+
+    await wait(100);
+    assert.equal(
+      value.runtime.db
+        .prepare("SELECT COUNT(*) AS count FROM result_deliveries WHERE task_id = ?")
+        .get(value.task.id).count,
+      1,
+    );
   } finally {
     await closeFixture(value);
   }
