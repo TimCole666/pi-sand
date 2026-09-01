@@ -49,13 +49,6 @@ export const MAX_REMOTE_EFFECT_DETAIL_LENGTH = 2 * 1_024;
 const INITIAL_ATTEMPT_RUN_SEQUENCE = 1;
 const ACTIVE_ATTEMPT_STATES = new Set(["starting", "running"]);
 const ACTIVE_GATE_STATES = new Set(["running", "ambiguous"]);
-const REMOTE_EFFECT_STATES = new Set([
-  "prepared",
-  "transmitted_unknown",
-  "confirmed",
-  "conflict",
-  "failed",
-]);
 const RETRYABLE_TASK_STATES = new Set(["failed", "stopped", "interrupted"]);
 const WORKER_RETIRE_TIMEOUT_MS = 2_000;
 const now = () => new Date().toISOString();
@@ -216,7 +209,10 @@ function remoteError(code, message, cause) {
 }
 
 function remoteDetail(error) {
-  const code = typeof error?.code === "string" ? error.code : "transport";
+  const candidate = typeof error?.code === "string" ? error.code : "";
+  const code = /^[A-Za-z0-9_.-]{1,64}$/.test(candidate)
+    ? candidate
+    : "transport";
   return `Remote Git ${code} failure.`;
 }
 
@@ -238,7 +234,7 @@ function assertNoRemoteCredentials(value, path = "authority") {
       throw new Error(`${path} contains a credential field.`);
     if (
       typeof entry === "string" &&
-      /:\/\/[^/\\s:@]+:[^@\\s]+@/.test(entry)
+      /:\/\/[^/\s:@]+:[^@\s]+@/.test(entry)
     )
       throw new Error(`${path}.${key} contains embedded credentials.`);
     assertNoRemoteCredentials(entry, `${path}.${key}`);
@@ -253,7 +249,7 @@ function boundedRemoteRepositoryId(value) {
     Buffer.byteLength(repository, "utf8") > MAX_REMOTE_REPOSITORY_ID_LENGTH
   )
     throw new Error("Remote publication repository identity is bounded.");
-  if (/:[^/\\s:@]+@/.test(repository))
+  if (/:[^/\s:@]+@/.test(repository))
     throw new Error("Remote publication repository identity cannot contain credentials.");
   return repository;
 }
@@ -335,16 +331,6 @@ function normalizeAuthority(authority) {
   return normalized;
 }
 
-function remotePublicationRequired(contract) {
-  if (!contract || typeof contract !== "object" || Array.isArray(contract))
-    return false;
-  const raw = contract.remotePublication ?? contract.remote_publication;
-  return contract.requiresRemotePublication === true ||
-    contract.remotePublicationRequired === true ||
-    raw?.required === true ||
-    raw?.publish === true;
-}
-
 function readExactRemoteRef({ cwd, remote, ref }) {
   let output;
   try {
@@ -359,9 +345,9 @@ function readExactRemoteRef({ cwd, remote, ref }) {
   }
   const rows = String(output)
     .trim()
-    .split("\\n")
+    .split("\n")
     .filter(Boolean)
-    .map((line) => line.split("\\t"));
+    .map((line) => line.split("\t"));
   if (rows.length === 0) return null;
   if (rows.length !== 1 || rows[0][1] !== ref || !exactOid(rows[0][0]))
     throw remoteError("read", "Remote ref read was not exact.");
@@ -379,6 +365,41 @@ function pushExactRemoteRef({ cwd, remote, ref, expectedOldOid, newOid }) {
       `--force-with-lease=${ref}:${expectedOldOid ?? ""}`,
     ],
     { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+  );
+}
+
+function normalizedRemoteOid(value) {
+  if (value == null || value === "") return null;
+  const oid = exactOid(value);
+  if (!oid) throw remoteError("read", "Remote ref read was not an exact object ID.");
+  return oid.toLowerCase();
+}
+
+function remoteActionDigest({
+  taskId,
+  controlVersion,
+  contractVersion,
+  remote,
+  repository,
+  remoteUrlDigest,
+  ref,
+  expectedOldOid,
+  newOid,
+}) {
+  return digest(
+    JSON.stringify(
+      sortedSnapshot({
+        taskId,
+        controlVersion,
+        contractVersion,
+        remote,
+        repository,
+        remoteUrlDigest: remoteUrlDigest ?? null,
+        ref,
+        expectedOldOid: expectedOldOid ?? null,
+        newOid,
+      }),
+    ),
   );
 }
 
@@ -1502,6 +1523,356 @@ export class RuntimeStore {
       .all(id)
       .map(remoteEffectSnapshot);
     return taskSnapshot(row, attempts, evidence, remoteEffects);
+  }
+
+  #remoteEffectRow(id) {
+    return this.db.prepare(`${REMOTE_EFFECT_SELECT} WHERE id = ?`).get(id);
+  }
+
+  #remoteEffectResult(taskId, id) {
+    const effect = this.#remoteEffectRow(id);
+    return {
+      task: this.getTask(taskId),
+      remoteEffect: effect ? remoteEffectSnapshot(effect) : null,
+    };
+  }
+
+  #updateRemoteEffect(
+    id,
+    state,
+    { detail = null, readback = undefined, transmitted = true } = {},
+  ) {
+    const timestamp = now();
+    const confirmedAt = state === "confirmed" ? timestamp : null;
+    const transmittedAt =
+      transmitted &&
+      ["transmitted_unknown", "confirmed", "conflict", "failed"].includes(state)
+        ? timestamp
+        : null;
+    const result = this.db
+      .prepare(`UPDATE remote_effects SET state = ?, detail = ?,
+        last_readback_oid = COALESCE(?, last_readback_oid),
+        transmitted_at = COALESCE(transmitted_at, ?),
+        confirmed_at = COALESCE(confirmed_at, ?), updated_at = ? WHERE id = ?`)
+      .run(
+        state,
+        detail == null ? null : bounded(detail, MAX_REMOTE_EFFECT_DETAIL_LENGTH),
+        readback === undefined ? null : readback,
+        transmittedAt,
+        confirmedAt,
+        timestamp,
+        id,
+      );
+    if (result.changes !== 1) throw new Error("Remote publication effect transition was not recorded.");
+    return this.#remoteEffectRow(id);
+  }
+
+  #remotePublicationFailure(effectId, code, message) {
+    const error = Object.assign(new Error(message), {
+      code,
+      remoteEffect: effectId ? remoteEffectSnapshot(this.#remoteEffectRow(effectId)) : null,
+    });
+    return error;
+  }
+
+  #assertRemoteCandidate(task, candidateSha) {
+    const candidate = exactOid(candidateSha);
+    if (!candidate) throw new Error("Remote publication requires an exact 40-character candidate SHA.");
+    assertTaskWorktreeIdentity(task);
+    const observed = this.currentBranchHead(task.taskWorktree);
+    if (observed !== candidate.toLowerCase())
+      throw new Error("Remote publication candidate SHA is not the exact Task worktree HEAD.");
+    if (
+      git(task.taskWorktree, ["status", "--porcelain=v1", "--untracked-files=all"])
+    )
+      throw new Error("Remote publication requires a clean Task worktree.");
+    try {
+      git(task.taskWorktree, ["cat-file", "-e", `${candidate}^{commit}`]);
+    } catch (error) {
+      throw new Error("Remote publication candidate is not a local commit.", { cause: error });
+    }
+    return candidate.toLowerCase();
+  }
+
+  async publishTask({ id, candidateSha }) {
+    this.ensureSupported();
+    if (typeof id !== "string" || !id.trim())
+      throw new Error("Remote publication requires a Task id.");
+    this.open();
+    const taskId = id.trim();
+    let taskRow = this.#taskRow(taskId);
+    if (!taskRow) throw new Error(`Task ${taskId} was not found.`);
+    const authority = remotePublicationAuthority(taskRow.authority);
+    if (!authority)
+      throw new Error("Task has no explicit remote publication authority.");
+    const task = taskSnapshot(taskRow);
+    if (authority.remoteUrlDigest) {
+      let remoteUrl;
+      try {
+        remoteUrl = git(task.sourceRepoRoot, ["remote", "get-url", authority.remote]);
+      } catch (error) {
+        throw new Error("Remote publication remote identity could not be read.", {
+          cause: error,
+        });
+      }
+      if (digest(remoteUrl) !== authority.remoteUrlDigest)
+        throw new Error("Remote publication remote identity does not match authority.");
+    }
+    const newOid = this.#assertRemoteCandidate(task, candidateSha);
+    const ref = `${REMOTE_REF_PREFIX}${taskId}`;
+    const transport = this.remoteTransport;
+    const readRemote = async () =>
+      normalizedRemoteOid(
+        await transport.readRef({
+          cwd: task.taskWorktree,
+          remote: authority.remote,
+          repository: authority.repositoryId,
+          ref,
+        }),
+      );
+    let remoteOid;
+    try {
+      remoteOid = await readRemote();
+    } catch (error) {
+      throw new Error("Remote publication ref could not be read.", { cause: error });
+    }
+
+    const latestConfirmed = this.db
+      .prepare(`${REMOTE_EFFECT_SELECT}
+        WHERE task_id = ? AND ref = ? AND state = 'confirmed'
+        ORDER BY confirmed_at DESC, created_at DESC, id DESC LIMIT 1`)
+      .get(taskId, ref);
+    const priorEffect = this.db
+      .prepare(`${REMOTE_EFFECT_SELECT}
+        WHERE task_id = ? AND ref = ? AND new_oid = ?
+          AND state IN ('prepared', 'transmitted_unknown')
+        ORDER BY created_at DESC, id DESC LIMIT 1`)
+      .get(taskId, ref, newOid);
+
+    if (latestConfirmed?.newOid?.toLowerCase() === newOid) {
+      if (remoteOid !== newOid) {
+        const error = this.#remotePublicationFailure(
+          latestConfirmed.id,
+          "remote_conflict",
+          "Remote publication no longer matches the last confirmed candidate.",
+        );
+        this.#updateRemoteEffect(latestConfirmed.id, "conflict", {
+          detail: "Remote ref drifted after confirmation.",
+          readback: remoteOid,
+        });
+        error.remoteEffect = remoteEffectSnapshot(this.#remoteEffectRow(latestConfirmed.id));
+        throw error;
+      }
+      return this.#remoteEffectResult(taskId, latestConfirmed.id);
+    }
+
+    let effect = priorEffect;
+    let expectedOldOid = effect?.expectedOldOid
+      ? effect.expectedOldOid.toLowerCase()
+      : null;
+    if (!effect) {
+      if (latestConfirmed) {
+        expectedOldOid = latestConfirmed.newOid.toLowerCase();
+        if (remoteOid !== expectedOldOid) {
+          throw this.#remotePublicationFailure(
+            latestConfirmed.id,
+            "remote_conflict",
+            "Remote ref drifted from the last confirmed candidate.",
+          );
+        }
+        let isAncestor = false;
+        try {
+          execFileSync(
+            "git",
+            ["merge-base", "--is-ancestor", expectedOldOid, newOid],
+            { cwd: task.taskWorktree, stdio: "ignore" },
+          );
+          isAncestor = true;
+        } catch {}
+        if (!isAncestor)
+          throw this.#remotePublicationFailure(
+            latestConfirmed.id,
+            "remote_non_fast_forward",
+            "Remote publication candidate is not a fast-forward from the confirmed candidate.",
+          );
+      } else if (remoteOid !== null) {
+        throw this.#remotePublicationFailure(
+          null,
+          "remote_conflict",
+          "The first remote publication cannot overwrite an existing ref.",
+        );
+      }
+      const actionDigest = remoteActionDigest({
+        taskId,
+        controlVersion: taskRow.controlVersion,
+        contractVersion: taskRow.contractVersion,
+        remote: authority.remote,
+        repository: authority.repositoryId,
+        remoteUrlDigest: authority.remoteUrlDigest,
+        ref,
+        expectedOldOid,
+        newOid,
+      });
+      const effectCount = this.db
+        .prepare("SELECT COUNT(*) AS count FROM remote_effects WHERE task_id = ?")
+        .get(taskId).count;
+      if (Number(effectCount) >= MAX_REMOTE_EFFECTS_PER_TASK)
+        throw new Error("Task remote publication effect history is bounded.");
+      const effectId = randomUUID();
+      const timestamp = now();
+      this.db
+        .prepare(`INSERT INTO remote_effects (
+          id, task_id, control_version, contract_version, remote, repository,
+          remote_url_digest, ref, expected_old_oid, new_oid, action_digest,
+          state, attempt_count, detail, created_at, prepared_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', 0, NULL, ?, ?, ?)`)
+        .run(
+          effectId,
+          taskId,
+          taskRow.controlVersion,
+          taskRow.contractVersion,
+          authority.remote,
+          authority.repositoryId,
+          authority.remoteUrlDigest,
+          ref,
+          expectedOldOid,
+          newOid,
+          actionDigest,
+          timestamp,
+          timestamp,
+          timestamp,
+        );
+      effect = this.#remoteEffectRow(effectId);
+    }
+
+    if (
+      effect.remote !== authority.remote ||
+      effect.repository !== authority.repositoryId ||
+      effect.ref !== ref ||
+      effect.newOid.toLowerCase() !== newOid ||
+      (effect.expectedOldOid?.toLowerCase() ?? null) !== expectedOldOid
+    ) {
+      throw this.#remotePublicationFailure(
+        effect.id,
+        "remote_conflict",
+        "Remote publication effect identity does not match the current Task authority.",
+      );
+    }
+    if (remoteOid === newOid) {
+      this.#updateRemoteEffect(effect.id, "confirmed", {
+        detail: "Exact remote readback confirmed the prepared candidate.",
+        readback: remoteOid,
+      });
+      return this.#remoteEffectResult(taskId, effect.id);
+    }
+    if (remoteOid !== expectedOldOid) {
+      this.#updateRemoteEffect(effect.id, "conflict", {
+        detail: "Remote ref drifted before the prepared effect could be transmitted.",
+        readback: remoteOid,
+        transmitted: false,
+      });
+      throw this.#remotePublicationFailure(
+        effect.id,
+        "remote_conflict",
+        "Remote ref drifted before remote publication.",
+      );
+    }
+    const budget = authority.maxPublications;
+    const attemptCount = Number(effect.attemptCount ?? 0);
+    if (attemptCount >= budget) {
+      this.#updateRemoteEffect(effect.id, "failed", {
+        detail: "Remote publication budget exhausted.",
+        readback: remoteOid,
+        transmitted: false,
+      });
+      throw this.#remotePublicationFailure(
+        effect.id,
+        "remote_budget_exhausted",
+        "Remote publication budget exhausted.",
+      );
+    }
+
+    if (typeof this.beforeRemotePush === "function")
+      await this.beforeRemotePush({
+        task: this.getTask(taskId),
+        effect: remoteEffectSnapshot(effect),
+      });
+    taskRow = this.#taskRow(taskId);
+    let currentAuthority = null;
+    try {
+      currentAuthority = remotePublicationAuthority(taskRow?.authority);
+    } catch {}
+    if (
+      !taskRow ||
+      !currentAuthority ||
+      !snapshotsEqual(currentAuthority, authority) ||
+      Number(taskRow.controlVersion) !== Number(effect.controlVersion) ||
+      Number(taskRow.contractVersion) !== Number(effect.contractVersion)
+    ) {
+      this.#updateRemoteEffect(effect.id, "failed", {
+        detail: "Task control or contract version changed before remote transmission.",
+        readback: remoteOid,
+        transmitted: false,
+      });
+      throw this.#remotePublicationFailure(
+        effect.id,
+        "stale_remote_publication",
+        "Task control or contract version changed before remote publication.",
+      );
+    }
+    this.db
+      .prepare(`UPDATE remote_effects SET attempt_count = attempt_count + 1,
+        updated_at = ? WHERE id = ? AND state IN ('prepared', 'transmitted_unknown')`)
+      .run(now(), effect.id);
+    try {
+      await transport.push({
+        cwd: task.taskWorktree,
+        remote: authority.remote,
+        repository: authority.repositoryId,
+        ref,
+        expectedOldOid,
+        newOid,
+      });
+    } catch (error) {
+      this.#updateRemoteEffect(effect.id, "transmitted_unknown", {
+        detail: remoteDetail(error),
+      });
+    }
+
+    let readback;
+    try {
+      readback = await readRemote();
+    } catch (error) {
+      this.#updateRemoteEffect(effect.id, "transmitted_unknown", {
+        detail: "Remote Git readback failure.",
+      });
+      throw new Error("Remote publication outcome is unknown; exact readback failed.", {
+        cause: error,
+      });
+    }
+    if (readback === newOid) {
+      this.#updateRemoteEffect(effect.id, "confirmed", {
+        detail: "Exact remote readback confirmed the published candidate.",
+        readback,
+      });
+      return this.#remoteEffectResult(taskId, effect.id);
+    }
+    if (readback === expectedOldOid) {
+      this.#updateRemoteEffect(effect.id, "transmitted_unknown", {
+        detail: "Remote readback still shows the expected old ref; the exact effect may be retried within budget.",
+        readback,
+      });
+      return this.#remoteEffectResult(taskId, effect.id);
+    }
+    this.#updateRemoteEffect(effect.id, "conflict", {
+      detail: "Remote readback found an unexpected ref value.",
+      readback,
+    });
+    throw this.#remotePublicationFailure(
+      effect.id,
+      "remote_conflict",
+      "Remote publication readback found an unexpected ref value.",
+    );
   }
 
   #insertResultDelivery({
