@@ -1068,8 +1068,16 @@ export class RuntimeStore {
         prepared_at = COALESCE(prepared_at, created_at),
         updated_at = COALESCE(updated_at, created_at)
       WHERE prepared_at IS NULL OR updated_at IS NULL;
-      UPDATE tasks SET publication_count = (
-        SELECT COUNT(*) FROM remote_effects WHERE remote_effects.task_id = tasks.id
+      UPDATE tasks SET publication_count = MIN(
+        ${MAX_REMOTE_PUBLICATIONS},
+        COALESCE((
+          SELECT SUM(CASE
+            WHEN attempt_count <= 0 THEN 0
+            WHEN attempt_count >= ${MAX_REMOTE_PUBLICATIONS} THEN ${MAX_REMOTE_PUBLICATIONS}
+            ELSE attempt_count
+          END)
+          FROM remote_effects WHERE remote_effects.task_id = tasks.id
+        ), 0)
       ) WHERE publication_count = 0;
       CREATE UNIQUE INDEX IF NOT EXISTS remote_effect_identity
         ON remote_effects(task_id, ref, new_oid, action_digest);
@@ -1625,6 +1633,8 @@ export class RuntimeStore {
     const authority = remotePublicationAuthority(taskRow.authority);
     if (!authority)
       throw new Error("Task has no explicit remote publication authority.");
+    const capturedControlVersion = Number(taskRow.controlVersion);
+    const capturedContractVersion = Number(taskRow.contractVersion);
     if (!REMOTE_PUBLICATION_TASK_STATES.has(taskRow.state)) {
       throw Object.assign(
         new Error("Remote publication requires an accepted or running Task."),
@@ -1730,8 +1740,8 @@ export class RuntimeStore {
       }
       const actionDigest = remoteActionDigest({
         taskId,
-        controlVersion: taskRow.controlVersion,
-        contractVersion: taskRow.contractVersion,
+        controlVersion: capturedControlVersion,
+        contractVersion: capturedContractVersion,
         remote: authority.remote,
         repository: authority.repositoryId,
         remoteUrlDigest: authority.remoteUrlDigest,
@@ -1755,8 +1765,8 @@ export class RuntimeStore {
         .run(
           effectId,
           taskId,
-          taskRow.controlVersion,
-          taskRow.contractVersion,
+          capturedControlVersion,
+          capturedContractVersion,
           authority.remote,
           authority.repositoryId,
           authority.remoteUrlDigest,
@@ -1771,12 +1781,27 @@ export class RuntimeStore {
       effect = this.#remoteEffectRow(effectId);
     }
 
+    const expectedActionDigest = remoteActionDigest({
+      taskId,
+      controlVersion: capturedControlVersion,
+      contractVersion: capturedContractVersion,
+      remote: authority.remote,
+      repository: authority.repositoryId,
+      remoteUrlDigest: authority.remoteUrlDigest,
+      ref,
+      expectedOldOid,
+      newOid,
+    });
     if (
+      Number(effect.controlVersion) !== capturedControlVersion ||
+      Number(effect.contractVersion) !== capturedContractVersion ||
       effect.remote !== authority.remote ||
       effect.repository !== authority.repositoryId ||
+      (effect.remoteUrlDigest ?? null) !== authority.remoteUrlDigest ||
       effect.ref !== ref ||
       effect.newOid.toLowerCase() !== newOid ||
-      (effect.expectedOldOid?.toLowerCase() ?? null) !== expectedOldOid
+      (effect.expectedOldOid?.toLowerCase() ?? null) !== expectedOldOid ||
+      effect.actionDigest !== expectedActionDigest
     ) {
       throw this.#remotePublicationFailure(
         effect.id,
@@ -1803,54 +1828,104 @@ export class RuntimeStore {
         "Remote ref drifted before remote publication.",
       );
     }
-    const budget = authority.maxPublications;
-    const attemptCount = Number(effect.attemptCount ?? 0);
-    if (attemptCount >= budget) {
-      this.#updateRemoteEffect(effect.id, "failed", {
-        detail: "Remote publication budget exhausted.",
-        readback: remoteOid,
-        transmitted: false,
-      });
-      throw this.#remotePublicationFailure(
-        effect.id,
-        "remote_budget_exhausted",
-        "Remote publication budget exhausted.",
-      );
-    }
-
     if (typeof this.beforeRemotePush === "function")
       await this.beforeRemotePush({
         task: this.getTask(taskId),
         effect: remoteEffectSnapshot(effect),
       });
-    taskRow = this.#taskRow(taskId);
-    let currentAuthority = null;
+
+    let reservationFailure = null;
+    this.db.exec("BEGIN IMMEDIATE");
     try {
-      currentAuthority = remotePublicationAuthority(taskRow?.authority);
-    } catch {}
-    if (
-      !taskRow ||
-      !REMOTE_PUBLICATION_TASK_STATES.has(taskRow.state) ||
-      !currentAuthority ||
-      !snapshotsEqual(currentAuthority, authority) ||
-      Number(taskRow.controlVersion) !== Number(effect.controlVersion) ||
-      Number(taskRow.contractVersion) !== Number(effect.contractVersion)
-    ) {
-      this.#updateRemoteEffect(effect.id, "failed", {
-        detail: "Task control or contract version changed before remote transmission.",
-        readback: remoteOid,
-        transmitted: false,
-      });
+      taskRow = this.#taskRow(taskId);
+      effect = this.#remoteEffectRow(effect.id);
+      let currentAuthority = null;
+      try {
+        currentAuthority = remotePublicationAuthority(taskRow?.authority);
+      } catch {}
+      const staleReservation =
+        !taskRow ||
+        !REMOTE_PUBLICATION_TASK_STATES.has(taskRow.state) ||
+        !currentAuthority ||
+        !snapshotsEqual(currentAuthority, authority) ||
+        Number(taskRow.controlVersion) !== capturedControlVersion ||
+        Number(taskRow.contractVersion) !== capturedContractVersion ||
+        !effect ||
+        !["prepared", "transmitted_unknown"].includes(effect.state) ||
+        Number(effect.controlVersion) !== capturedControlVersion ||
+        Number(effect.contractVersion) !== capturedContractVersion ||
+        effect.remote !== authority.remote ||
+        effect.repository !== authority.repositoryId ||
+        (effect.remoteUrlDigest ?? null) !== authority.remoteUrlDigest ||
+        effect.ref !== ref ||
+        effect.newOid.toLowerCase() !== newOid ||
+        (effect.expectedOldOid?.toLowerCase() ?? null) !== expectedOldOid ||
+        effect.actionDigest !== expectedActionDigest;
+      if (staleReservation) {
+        reservationFailure = {
+          code: "stale_remote_publication",
+          detail: "Task, authority, or prepared effect changed before remote transmission.",
+          message: "Task control, contract, authority, or effect changed before remote publication.",
+        };
+        throw new Error(reservationFailure.message);
+      }
+      if (Number(taskRow.publicationCount) >= authority.maxPublications) {
+        reservationFailure = {
+          code: "remote_budget_exhausted",
+          detail: "Task-wide remote publication budget exhausted.",
+          message: "Remote publication budget exhausted.",
+        };
+        throw new Error(reservationFailure.message);
+      }
+
+      const reservedAt = now();
+      const taskReservation = this.db
+        .prepare(`UPDATE tasks SET publication_count = publication_count + 1,
+          updated_at = ? WHERE id = ? AND state IN ('accepted', 'running')
+          AND control_version = ? AND contract_version = ?
+          AND publication_count < ?`)
+        .run(
+          reservedAt,
+          taskId,
+          capturedControlVersion,
+          capturedContractVersion,
+          authority.maxPublications,
+        );
+      if (taskReservation.changes !== 1)
+        throw new Error("Remote publication Task budget reservation was not recorded.");
+      const effectReservation = this.db
+        .prepare(`UPDATE remote_effects SET attempt_count = attempt_count + 1,
+          updated_at = ? WHERE id = ? AND state IN ('prepared', 'transmitted_unknown')
+          AND control_version = ? AND contract_version = ?`)
+        .run(
+          reservedAt,
+          effect.id,
+          capturedControlVersion,
+          capturedContractVersion,
+        );
+      if (effectReservation.changes !== 1)
+        throw new Error("Remote publication effect attempt reservation was not recorded.");
+      this.db.exec("COMMIT");
+      effect = this.#remoteEffectRow(effect.id);
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      if (!reservationFailure) throw error;
+      const currentEffect = this.#remoteEffectRow(effect?.id);
+      if (["prepared", "transmitted_unknown"].includes(currentEffect?.state)) {
+        this.#updateRemoteEffect(currentEffect.id, "failed", {
+          detail: reservationFailure.detail,
+          readback: remoteOid,
+          transmitted: false,
+        });
+      }
       throw this.#remotePublicationFailure(
-        effect.id,
-        "stale_remote_publication",
-        "Task control or contract version changed before remote publication.",
+        effect?.id,
+        reservationFailure.code,
+        reservationFailure.message,
       );
     }
-    this.db
-      .prepare(`UPDATE remote_effects SET attempt_count = attempt_count + 1,
-        updated_at = ? WHERE id = ? AND state IN ('prepared', 'transmitted_unknown')`)
-      .run(now(), effect.id);
     try {
       await transport.push({
         cwd: task.taskWorktree,
