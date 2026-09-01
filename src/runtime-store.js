@@ -8646,31 +8646,116 @@ export class RuntimeStore {
         "/task-retry requires an installed Pi 0.84.4 executable.",
       );
     const attemptId = randomUUID();
-    const number = prior.number + 1;
-    const retryTask = {
-      id: task.id,
-      sourceRepoRoot: task.sourceRepoRoot,
-      baseCommit: task.baseCommit,
-      taskBranch: task.taskBranch,
-      taskWorktree: task.taskWorktree,
-      goal: task.goal,
-      contractVersion: task.contractVersion ?? COMMITMENT_CONTRACT_VERSION,
-      controlVersion: task.controlVersion ?? COMMITMENT_CONTROL_VERSION,
-    };
-    const retryPacket = buildTaskPacket({
-      taskId: retryTask.id,
-      attemptNumber: number,
-      goal: retryTask.goal,
-      taskBranch: retryTask.taskBranch,
-      taskWorktree: retryTask.taskWorktree,
-      baseCommit: retryTask.baseCommit,
-      priorState: prior.state,
-      priorDetail: prior.terminalDetail,
-    });
+    let number;
+    let retryTask;
+    let retryPacket;
+    let nextControlVersion;
     const timestamp = now();
     try {
       this.db.exec("BEGIN IMMEDIATE");
+      const current = this.#taskRow(task.id);
+      const currentPrior = current
+        ? this.db
+            .prepare(`${ATTEMPT_SELECT} WHERE id = ? AND task_id = ?`)
+            .get(current.latestAttemptId, task.id)
+        : null;
+      if (
+        !current ||
+        !RETRYABLE_TASK_STATES.has(current.state) ||
+        current.latestAttemptId !== prior.id ||
+        !currentPrior ||
+        !RETRYABLE_TASK_STATES.has(currentPrior.state) ||
+        Number(current.controlVersion) !== Number(task.controlVersion) ||
+        Number(current.contractVersion) !== Number(task.contractVersion)
+      ) {
+        throw new Error(`Task ${id} changed before retry could commit.`);
+      }
+
       this.#assertFreshAttemptBudget(task.id, model, thinkingLevel);
+      nextControlVersion = Number(current.controlVersion) + 1;
+      number = Number(currentPrior.number) + 1;
+      retryTask = {
+        id: current.id,
+        sourceRepoRoot: current.sourceRepoRoot,
+        baseCommit: current.baseCommit,
+        taskBranch: current.taskBranch,
+        taskWorktree: current.taskWorktree,
+        goal: current.goal,
+        contractVersion: Number(current.contractVersion),
+        controlVersion: nextControlVersion,
+      };
+      retryPacket = buildTaskPacket({
+        taskId: retryTask.id,
+        attemptNumber: number,
+        goal: retryTask.goal,
+        taskBranch: retryTask.taskBranch,
+        taskWorktree: retryTask.taskWorktree,
+        baseCommit: retryTask.baseCommit,
+        priorState: currentPrior.state,
+        priorDetail: currentPrior.terminalDetail,
+      });
+
+      // Retry is an explicit control mutation, not a replay of the prior
+      // authority. Advance the Task fence in the same transaction as the new
+      // Attempt allocation, and retire any old rights without rewriting
+      // terminal Attempt history.
+      const taskUpdate = this.db
+        .prepare(
+          `UPDATE tasks SET state = 'accepted', control_version = ?, latest_attempt_id = ?,
+          terminal_detail = NULL, final_result = NULL, final_branch_head = NULL,
+          final_revision = NULL, completion_evidence_ref = NULL, terminal_reason = NULL,
+          updated_at = ?
+          WHERE id = ? AND latest_attempt_id = ? AND state IN ('failed', 'stopped', 'interrupted')
+            AND control_version = ? AND contract_version = ?`,
+        )
+        .run(
+          nextControlVersion,
+          attemptId,
+          timestamp,
+          task.id,
+          prior.id,
+          task.controlVersion,
+          task.contractVersion,
+        );
+      if (taskUpdate.changes !== 1)
+        throw new Error(`Task ${id} retry control fence was lost.`);
+
+      this.db
+        .prepare(`UPDATE attempts SET state = 'superseded', finished_at = COALESCE(finished_at, ?),
+          terminal_detail = ? WHERE task_id = ? AND state IN ('starting', 'running', 'parked_wait')
+          AND control_version = ? AND contract_version = ?`)
+        .run(
+          timestamp,
+          "Attempt superseded by an explicit Task retry.",
+          task.id,
+          task.controlVersion,
+          task.contractVersion,
+        );
+      this.db
+        .prepare(`UPDATE attempt_runs SET state = 'aborted', settled_outcome = COALESCE(settled_outcome, ?),
+          settled_at = COALESCE(settled_at, ?) WHERE attempt_id IN (
+            SELECT id FROM attempts WHERE task_id = ? AND control_version = ? AND contract_version = ?
+          ) AND state IN ('pending', 'accepted')`)
+        .run(
+          "Attempt superseded by an explicit Task retry.",
+          timestamp,
+          task.id,
+          task.controlVersion,
+          task.contractVersion,
+        );
+      this.db
+        .prepare("UPDATE wait_subscriptions SET status = 'superseded' WHERE task_id = ? AND status = 'active'")
+        .run(task.id);
+      this.db
+        .prepare(`UPDATE remote_effects SET state = 'failed', detail = ?, updated_at = ?
+          WHERE task_id = ? AND control_version = ? AND contract_version = ? AND state = 'prepared'`)
+        .run(
+          "Prepared remote publication was superseded by an explicit Task retry.",
+          timestamp,
+          task.id,
+          task.controlVersion,
+          task.contractVersion,
+        );
       this.db
         .prepare(
           "INSERT INTO attempts (id, task_id, number, provider, model_id, thinking_level, control_version, contract_version, state, started_at, worker_terminated, cause) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?, 'starting', ?, 0, 'retry')",
@@ -8679,7 +8764,7 @@ export class RuntimeStore {
           attemptId,
           task.id,
           number,
-          retryTask.controlVersion,
+          nextControlVersion,
           retryTask.contractVersion,
           timestamp,
         );
@@ -8691,19 +8776,11 @@ export class RuntimeStore {
         .run(
           attemptId,
           INITIAL_ATTEMPT_RUN_SEQUENCE,
-          retryTask.controlVersion,
+          nextControlVersion,
           retryTask.contractVersion,
           promptDigest(retryPacket),
           timestamp,
         );
-      this.db
-        .prepare(
-          `UPDATE tasks SET state = 'accepted', latest_attempt_id = ?, terminal_detail = NULL,
-          final_result = NULL, final_branch_head = NULL, final_revision = NULL,
-          completion_evidence_ref = NULL, terminal_reason = NULL, updated_at = ?
-          WHERE id = ? AND state IN ('failed', 'stopped', 'interrupted')`,
-        )
-        .run(attemptId, timestamp, task.id);
       this.db.exec("COMMIT");
     } catch (error) {
       try {

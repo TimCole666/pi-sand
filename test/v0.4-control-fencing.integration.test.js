@@ -2,10 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { RuntimeStore } from "../src/runtime-store.js";
+import { processGroupIsAlive } from "../src/process.js";
 
 const model = { provider: "provider", id: "model" };
 
@@ -179,6 +180,49 @@ test("restart preserves captured Attempt, AttemptRun, and Evidence versions afte
   }
 });
 
+test("explicit retry advances a stopped Task fence and captures version 3 across restart", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-control-retry-restart-"));
+  const source = await repository(parent);
+  const options = {
+    dbPath: join(parent, "runtime.sqlite"),
+    piCommand: await versionCommand(parent),
+    worktreeRoot: join(parent, "worktrees"),
+    workerFactory: async () => hangingWorker(),
+  };
+  let runtime = new RuntimeStore(options);
+  try {
+    const started = await runtime.createTask(taskOptions(source));
+    const stopped = await runtime.stopTask(started.id);
+    assert.equal(stopped.controlVersion, 2);
+    assert.equal(stopped.attempts[0].controlVersion, 1);
+    runtime.close();
+
+    runtime = new RuntimeStore({ ...options, workerFactory: async ({ onEvent }) => settledWorker(onEvent) });
+    const retried = await runtime.retryTask({
+      id: started.id,
+      trusted: true,
+      model,
+      thinkingLevel: "high",
+    });
+    assert.equal(retried.controlVersion, 3);
+    assert.equal(retried.attempts.length, 2);
+    assert.equal(retried.attempts[0].state, "stopped");
+    assert.equal(retried.attempts[0].controlVersion, 1);
+    assert.equal(retried.attempts[0].attemptRuns[0].controlVersion, 1);
+    assert.equal(retried.attempts[1].controlVersion, 3);
+    assert.equal(retried.attempts[1].attemptRuns[0].controlVersion, 3);
+    assert.equal(retried.latestAttemptId, retried.attempts[1].id);
+    assert.equal(
+      runtime.db.prepare("SELECT COUNT(*) AS count FROM result_deliveries WHERE task_id = ?").get(started.id).count,
+      1,
+      "retry preserves the stopped terminal delivery history",
+    );
+  } finally {
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
 test("restart preserves captured versions and Evidence after correction advances Task control and contract", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-control-correction-restart-"));
   const source = await repository(parent);
@@ -236,12 +280,18 @@ test("cancel after continuation acceptance retires the exact Attempt and rejects
   let emit;
   let resolvePrompt;
   let promptCalls = 0;
+  let workerProcess;
   const runtime = new RuntimeStore({
     dbPath: join(parent, "runtime.sqlite"),
     piCommand: await versionCommand(parent),
     worktreeRoot: join(parent, "worktrees"),
-    workerFactory: async ({ onEvent }) => {
+    workerFactory: async ({ onEvent, onWorkerSpawn }) => {
       emit = onEvent;
+      workerProcess = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+        detached: true,
+        stdio: "ignore",
+      });
+      onWorkerSpawn({ pid: workerProcess.pid, processGroupId: workerProcess.pid });
       onEvent({
         type: "message_end",
         message: { role: "assistant", content: "initial", stopReason: "stop" },
@@ -250,6 +300,8 @@ test("cancel after continuation acceptance retires the exact Attempt and rejects
       return {
         callbacksAttached: true,
         executionSnapshot: { sessionId: "session-1", capability: "fixed" },
+        pid: workerProcess.pid,
+        processGroupId: workerProcess.pid,
         prompt() {
           promptCalls += 1;
           return new Promise((resolvePromptResult) => {
@@ -285,8 +337,17 @@ test("cancel after continuation acceptance retires the exact Attempt and rejects
     assert.equal(stopped.state, "stopped");
     assert.equal(stopped.attempts[0].state, "stopped");
     assert.equal(stopped.attempts[0].attemptRuns[1].state, "aborted");
+    assert.equal(stopped.attempts[0].workerPid, workerProcess.pid);
+    assert.equal(stopped.attempts[0].workerPgid, workerProcess.pid);
+    assert.ok(stopped.attempts[0].workerStartIdentity);
+    assert.equal(stopped.attempts[0].workerBootId, runtime.bootId);
+    assert.equal(processGroupIsAlive(workerProcess.pid), false);
     assert.equal(runtime.getTask(started.id).state, "stopped");
   } finally {
+    try {
+      if (workerProcess?.pid && processGroupIsAlive(workerProcess.pid))
+        process.kill(-workerProcess.pid, "SIGKILL");
+    } catch {}
     runtime.close();
     await rm(parent, { recursive: true, force: true });
   }
@@ -385,7 +446,22 @@ test("a correction committed at the continuation boundary supersedes the pending
     },
     workerFactory: async ({ onEvent }) => {
       workerCount += 1;
-      return settledWorker(onEvent);
+      if (workerCount === 1) {
+        onEvent({
+          type: "message_end",
+          message: { role: "assistant", content: "initial", stopReason: "stop" },
+        });
+        onEvent({ type: "agent_settled" });
+      }
+      return {
+        callbacksAttached: true,
+        executionSnapshot: { sessionId: `session-${workerCount}`, capability: "fixed" },
+        prompt() {
+          promptCalls += 1;
+          return Promise.resolve({ accepted: true });
+        },
+        close() {},
+      };
     },
   });
   let taskId;

@@ -136,6 +136,7 @@ async function commitCandidate(worktree, file, content, message) {
 async function fixture({
   workerFactory,
   workerRetireTimeoutMs,
+  beforeAttemptLaunch,
   taskAuthority = authority,
   gitHubAdapter,
   completionContract,
@@ -162,6 +163,7 @@ async function fixture({
     workerFactory: workerFactory ?? defaultWorkerFactory,
     worktreeRoot,
     workerRetireTimeoutMs: workerRetireTimeoutMs ?? 50,
+    beforeAttemptLaunch,
     remoteTransport: transport,
     gitHubAdapter: fakeGitHub,
   });
@@ -421,6 +423,71 @@ test("2. Failure observation triggers wait, allocates exactly one fresh Attempt 
     assert.equal(workerSpawnCount, 1);
     assert.ok(spawnedPackets[0].includes("Attempt: 2"));
     assert.ok(spawnedPackets[0].includes("Previous attempt outcome: ci_failed"));
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("wake allocation followed by control cancellation before launch sends no prompt and supersedes the allocated Attempt", async () => {
+  let workerCount = 0;
+  let promptCalls = 0;
+  const value = await fixture({
+    workerFactory: async ({ onEvent }) => {
+      workerCount += 1;
+      if (workerCount === 1) {
+        onEvent({
+          type: "message_end",
+          message: { role: "assistant", content: "candidate ready", stopReason: "stop" },
+        });
+        onEvent({ type: "agent_settled" });
+      }
+      return {
+        callbacksAttached: true,
+        executionSnapshot: { sessionId: `session-${workerCount}` },
+        prompt() {
+          promptCalls += 1;
+          return Promise.resolve({ accepted: true });
+        },
+        close() {},
+      };
+    },
+  });
+  try {
+    const candidateR = await commitCandidate(
+      value.task.taskWorktree,
+      "app.js",
+      "console.log('wake-cancel');\\n",
+      "wake cancel",
+    );
+    await value.runtime.publishTask({ id: value.task.id, candidateSha: candidateR });
+    const registered = await value.runtime.registerWaitSubscription({
+      taskId: value.task.id,
+      revisionSha: candidateR,
+      requiredChecks: ["check_run:github-actions/ci"],
+    });
+
+    const wake = await triggerObserved(value.runtime, registered.waitSubscription.id, {
+      classification: "failure",
+      skipSpawn: true,
+    });
+    assert.equal(wake.triggered, true);
+    const allocatedAttemptId = wake.continuationAttemptId;
+    assert.ok(allocatedAttemptId);
+    assert.equal(promptCalls, 0);
+    assert.equal(workerCount, 1, "wake allocation must not start a worker before cancellation");
+
+    const corrected = await value.runtime.correctTask({
+      id: value.task.id,
+      objective: "cancelled wake replacement",
+      model: { provider: "anthropic", id: "claude-3-5-sonnet" },
+      thinkingLevel: "low",
+    });
+    const superseded = corrected.attempts.find(({ id }) => id === allocatedAttemptId);
+    assert.ok(superseded);
+    assert.equal(superseded.state, "superseded");
+    assert.equal(superseded.attemptRuns[0].state, "aborted");
+    assert.equal(promptCalls, 0, "the cancelled wake Attempt must never transmit a prompt");
+    assert.equal(corrected.controlVersion, 2);
   } finally {
     await closeFixture(value);
   }
