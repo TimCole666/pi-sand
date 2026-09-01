@@ -179,6 +179,36 @@ test("public JSONL IPC cannot turn a waiting Task into CI success", async () => 
   }
 });
 
+test("public wait reconciliation ignores caller future time and remains an observation", async () => {
+  const value = await fixture();
+  let daemon;
+  try {
+    const waiting = await eventually(() => value.runtime.getTask(value.task.id), (task) => task.state === "waiting");
+    const dbPath = value.runtime.dbPath;
+    const socketPath = join(value.parent, "runtime-future-now.sock");
+    value.runtime.close();
+    const restarted = new RuntimeStore({
+      dbPath,
+      piCommand: value.piCommand,
+      worktreeRoot: join(value.parent, "worktrees"),
+      gitHubAdapter: value.adapter,
+    });
+    daemon = await startRuntimeDaemon({ dbPath, socketPath, store: restarted });
+    const client = new RuntimeClient({ socketPath, dbPath });
+    const response = await client.requestSocket(
+      "wait.reconcile",
+      { id: waiting.waitSubscriptions[0].id, now: "2999-01-01T00:00:00.000Z" },
+      PROTOCOL_VERSION,
+    );
+    assert.equal(response.success, true);
+    assert.equal(restarted.getTask(value.task.id).state, "waiting");
+    assert.equal(restarted.getWaitSubscription(waiting.waitSubscriptions[0].id).status, "active");
+  } finally {
+    await daemon?.close();
+    await rm(value.parent, { recursive: true, force: true });
+  }
+});
+
 test("daemon-owned wait reactor reconciles a due CI change without a user request", async () => {
   const value = await fixture();
   let nowValue = Date.now();

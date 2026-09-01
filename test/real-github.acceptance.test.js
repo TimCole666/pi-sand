@@ -9,6 +9,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { RuntimeClient } from "../src/runtime-client.js";
+import { PROTOCOL_VERSION } from "../src/runtime-ipc.js";
 
 const enabled = process.env.PI_SAND_REAL_GITHUB === "1";
 const source = process.env.PI_SAND_REAL_GITHUB_SOURCE;
@@ -56,10 +57,14 @@ setInterval(() => {}, 1000);
   return command;
 }
 
-async function waitForReady(client) {
+async function waitForReady(client, child) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    try { return await client.status(); } catch { await new Promise((resolveWait) => setTimeout(resolveWait, 50)); }
+    try {
+      const response = await client.requestSocket("runtime.status", {}, PROTOCOL_VERSION, 250);
+      if (response.success && response.data?.daemonPid === child.pid) return response.data;
+    } catch {}
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
   }
   throw new Error("real GitHub proof daemon did not become ready");
 }
@@ -105,7 +110,7 @@ test("v0.4 opt-in real GitHub exact-SHA publication and CI proof", {
     stdio: "ignore",
   });
   try {
-    await waitForReady(client);
+    await waitForReady(client, daemon);
     assert.equal(git(["remote", "get-url", "--push", "origin"]), remote);
     const created = await client.createTask({
       goal: "publish and verify this real GitHub candidate",

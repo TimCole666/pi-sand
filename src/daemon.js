@@ -86,6 +86,7 @@ async function handleRequest(request, store) {
       const {
         trigger: _trigger,
         autoTrigger: _autoTrigger,
+        now: _now,
         classification: _classification,
         observation: _observation,
         evidenceId: _evidenceId,

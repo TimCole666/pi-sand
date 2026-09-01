@@ -145,6 +145,46 @@ test("existing v0.3 Task rows migrate to the Task-backed Commitment without a de
   }
 });
 
+test("expired total commitment fences explicit correction and retry without allocating an Attempt", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-commitment-expired-"));
+  const source = await repository(parent);
+  const piCommand = await versionCommand(parent);
+  let clock = Date.now();
+  const runtime = new RuntimeStore({
+    dbPath: join(parent, "runtime.sqlite"),
+    piCommand,
+    worktreeRoot: join(parent, "worktrees"),
+    attemptClock: () => clock,
+    workerFactory: async () => ({ callbacksAttached: true, close() {} }),
+  });
+  try {
+    const started = await runtime.createTask({
+      ...taskOptions(source),
+      budget: { totalCommitmentWallClockDeadlineMs: 1 },
+    });
+    const accepted = runtime.getTask(started.id);
+    clock = Date.parse(accepted.acceptedAt) + 2;
+    await assert.rejects(
+      () => runtime.correctTask({ id: started.id, objective: "late correction", model, thinkingLevel: "high" }),
+      (error) => error.code === "commitment_expired",
+    );
+    assert.equal(runtime.getTask(started.id).attempts.length, 1);
+    await runtime.stopTask(started.id);
+    const stopped = runtime.getTask(started.id);
+    await assert.rejects(
+      () => runtime.retryTask({ id: started.id, trusted: true, model, thinkingLevel: "high" }),
+      (error) => error.code === "commitment_expired",
+    );
+    const afterRetry = runtime.getTask(started.id);
+    assert.equal(afterRetry.attempts.length, 1);
+    assert.equal(afterRetry.controlVersion, stopped.controlVersion);
+    assert.equal(afterRetry.state, "stopped");
+  } finally {
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
 test("healthy initial settlement persists one AttemptRun without completing the Task", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-commitment-"));
   const source = await repository(parent);

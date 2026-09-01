@@ -329,6 +329,36 @@ test("post-transmit ambiguity keeps the authorized exact endpoint for readback",
   }
 });
 
+test("control mutation after transmission reconciles the exact ref without replay", async () => {
+  const value = await fixture();
+  let pushCount = 0;
+  value.runtime.remoteTransport = {
+    readRef: ({ endpoint, ref }) => {
+      assert.equal(endpoint, value.remote);
+      return remoteRef(endpoint, ref);
+    },
+    push: async ({ cwd, endpoint, ref, expectedOldOid, newOid }) => {
+      pushCount += 1;
+      execFileSync(
+        "git",
+        ["-C", cwd, "push", "--porcelain", endpoint, `${newOid}:${ref}`, `--force-with-lease=${ref}:${expectedOldOid ?? ""}`],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+      );
+      await value.runtime.stopTask(value.task.id);
+    },
+  };
+  try {
+    const candidate = await commitCandidate(value.task.taskWorktree, "after-control.txt", "after control\n", "after control");
+    const published = await value.runtime.publishTask({ id: value.task.id, candidateSha: candidate });
+    assert.equal(pushCount, 1);
+    assert.equal(published.remoteEffect.state, "confirmed");
+    assert.equal(value.runtime.getTask(value.task.id).state, "stopped");
+    assert.equal(remoteRef(value.remote, taskRef(value.task)), candidate);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
 test("unchanged ambiguous publication retries the same prepared effect within its budget", async () => {
   const value = await fixture();
   let pushCount = 0;

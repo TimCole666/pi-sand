@@ -1233,40 +1233,83 @@ function redactSecrets(message) {
     .replace(/Bearer\s+[A-Za-z0-9_\-\.]+/gi, "Bearer [REDACTED]");
 }
 
-async function fetchGitHubJson(url, token) {
+function headerValue(response, name) {
+  return response?.headers?.get?.(name) ?? null;
+}
+
+function delayHeaderMs(value, now = Date.now()) {
+  if (value == null || value === "") return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - now) : null;
+}
+
+function providerGuidanceMs(response) {
+  return Math.max(
+    0,
+    ...[
+      delayHeaderMs(headerValue(response, "retry-after")),
+      delayHeaderMs(headerValue(response, "x-poll-interval")),
+    ].filter((value) => value != null),
+  ) || null;
+}
+
+function decorateProviderItems(items, guidanceMs) {
+  if (guidanceMs == null) return items;
+  Object.defineProperty(items, "providerGuidanceMs", {
+    value: guidanceMs,
+    enumerable: false,
+    configurable: true,
+  });
+  return items;
+}
+
+async function fetchGitHubJson(url, token, { deadlineAt = Number.POSITIVE_INFINITY } = {}) {
   const headers = {
     Accept: "application/vnd.github+json",
     "User-Agent": "pi-sand",
     "X-GitHub-Api-Version": "2022-11-28",
   };
   if (token) headers["Authorization"] = `Bearer ${token}`;
+  const remaining = Number.isFinite(deadlineAt)
+    ? deadlineAt - Date.now()
+    : Number.POSITIVE_INFINITY;
+  const requestTimeoutMs = Math.min(30_000, Math.max(1, remaining));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
+  timer.unref?.();
 
   let res;
   try {
-    res = await fetch(url, { headers });
+    res = await fetch(url, { headers, signal: controller.signal });
   } catch (err) {
-    throw Object.assign(new Error(`GitHub network error: ${err.message}`), {
+    const timedOut = controller.signal.aborted;
+    throw Object.assign(new Error(
+      timedOut
+        ? "GitHub request timed out before the wait deadline."
+        : `GitHub network error: ${err.message}`,
+    ), {
       code: "network_error",
       cause: err,
+      timedOut,
     });
+  } finally {
+    clearTimeout(timer);
   }
 
   if (!res.ok) {
     const status = res.status;
     const text = await res.text().catch(() => "");
     if (status === 429 || status === 401 || status === 403) {
-      const remaining = res.headers.get("x-ratelimit-remaining");
-      const retryAfter = res.headers.get("retry-after");
-      const resetHeader = res.headers.get("x-ratelimit-reset");
-      if (status === 429 || remaining === "0" || retryAfter) {
-        const retryAfterMs = retryAfter
-          ? Number(retryAfter) * 1000
-          : resetHeader
-            ? Math.max(0, Number(resetHeader) * 1000 - Date.now())
-            : 60_000;
+      const remainingHeader = headerValue(res, "x-ratelimit-remaining");
+      const retryAfterMs = delayHeaderMs(headerValue(res, "retry-after"));
+      const resetHeader = headerValue(res, "x-ratelimit-reset");
+      const resetMs = Number(resetHeader) * 1000 - Date.now();
+      if (status === 429 || remainingHeader === "0" || retryAfterMs != null) {
         throw Object.assign(new Error("GitHub API rate limit exceeded"), {
           code: "rate_limited",
-          retryAfterMs,
+          retryAfterMs: retryAfterMs ?? (Number.isFinite(resetMs) ? Math.max(0, resetMs) : 60_000),
           status,
         });
       }
@@ -1291,24 +1334,53 @@ async function fetchGitHubJson(url, token) {
     );
   }
 
-  return await res.json();
+  return { data: await res.json(), guidanceMs: providerGuidanceMs(res), response: res };
 }
 
-async function fetchGitHubPages({ apiBase, repository, sha, path, key }) {
+function nextLink(response) {
+  const link = headerValue(response, "link");
+  if (!link) return null;
+  for (const value of link.split(",")) {
+    const match = value.match(/<([^>]+)>\s*;\s*rel="?([^";]+)"?/i);
+    if (match && match[2].split(/\s+/).includes("next")) return match[1];
+  }
+  return null;
+}
+
+async function fetchGitHubPages({ apiBase, repository, sha, path, key, deadlineAt }) {
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   const items = [];
-  for (let page = 1; page <= 20; page += 1) {
-    const url = `${apiBase}/repos/${repository}/commits/${sha}/${path}?per_page=100&page=${page}`;
-    const data = await fetchGitHubJson(url, token);
-    const pageItems = Array.isArray(data?.[key]) ? data[key] : [];
+  let url = `${apiBase}/repos/${repository}/commits/${sha}/${path}?per_page=100&page=1`;
+  let page = 0;
+  let guidanceMs = null;
+  while (url && page < 100) {
+    page += 1;
+    const result = await fetchGitHubJson(url, token, { deadlineAt });
+    const pageItems = Array.isArray(result.data?.[key]) ? result.data[key] : [];
     items.push(...pageItems);
-    if (pageItems.length < 100) break;
+    guidanceMs = Math.max(guidanceMs ?? 0, result.guidanceMs ?? 0) || null;
+    const linkedNext = nextLink(result.response);
+    if (linkedNext) {
+      if (!linkedNext.startsWith(`${apiBase}/`))
+        throw Object.assign(new Error("GitHub pagination link escaped the configured API host."), { code: "provider_error" });
+      url = linkedNext;
+    } else if (pageItems.length < 100) {
+      url = null;
+    } else {
+      url = `${apiBase}/repos/${repository}/commits/${sha}/${path}?per_page=100&page=${page + 1}`;
+    }
   }
-  return items;
+  if (url) {
+    throw Object.assign(new Error("GitHub pagination exceeded the bounded page safety limit."), {
+      code: "provider_error",
+      truncated: true,
+    });
+  }
+  return decorateProviderItems(items, guidanceMs);
 }
 
 export const defaultGitHubAdapter = {
-  async fetchCheckRuns({ repository, sha, githubHost = "github.com" }) {
+  async fetchCheckRuns({ repository, sha, githubHost = "github.com", deadlineAt }) {
     const apiBase =
       githubHost === "github.com"
         ? "https://api.github.com"
@@ -1319,10 +1391,11 @@ export const defaultGitHubAdapter = {
       sha,
       path: "check-runs",
       key: "check_runs",
+      deadlineAt,
     });
   },
 
-  async fetchCommitStatuses({ repository, sha, githubHost = "github.com" }) {
+  async fetchCommitStatuses({ repository, sha, githubHost = "github.com", deadlineAt }) {
     const apiBase =
       githubHost === "github.com"
         ? "https://api.github.com"
@@ -1333,6 +1406,7 @@ export const defaultGitHubAdapter = {
       sha,
       path: "status",
       key: "statuses",
+      deadlineAt,
     });
     // The commit-status endpoint identifies the commit in its URL, but the
     // documented status items do not normally repeat that SHA. Preserve an
@@ -2750,6 +2824,104 @@ export class RuntimeStore {
     return error;
   }
 
+  #hasUnknownRemoteEffects(taskId) {
+    return Number(this.db
+      .prepare("SELECT COUNT(*) AS count FROM remote_effects WHERE task_id = ? AND state = 'transmitted_unknown'")
+      .get(taskId)?.count ?? 0) > 0;
+  }
+
+  async #reconcileUnknownRemoteEffects(taskId) {
+    const taskRow = this.#taskRow(taskId);
+    if (!taskRow) return;
+    const task = taskSnapshot(taskRow);
+    const effects = this.db
+      .prepare(`${REMOTE_EFFECT_SELECT} WHERE task_id = ? AND state = 'transmitted_unknown' ORDER BY created_at, id`)
+      .all(taskId);
+    for (const effect of effects) {
+      let authority;
+      try {
+        authority = remotePublicationAuthority(taskRow.authority);
+      } catch (error) {
+        throw this.#remotePublicationFailure(
+          effect.id,
+          "remote_readback_unknown",
+          "The transmitted remote effect could not be reconciled at its exact endpoint.",
+        );
+      }
+      if (authority.remoteUrlDigest !== effect.remoteUrlDigest) {
+        this.#updateRemoteEffect(effect.id, "conflict", {
+          detail: "The transmitted remote effect endpoint changed before readback.",
+          transmitted: false,
+        });
+        throw this.#remotePublicationFailure(
+          effect.id,
+          "remote_conflict",
+          "The transmitted remote effect endpoint changed before readback.",
+        );
+      }
+      let endpoint;
+      try {
+        endpoint = resolveRemotePublicationEndpoint(task.sourceRepoRoot, {
+          ...authority,
+          remote: effect.remote,
+          repositoryId: effect.repository,
+        });
+      } catch (error) {
+        throw this.#remotePublicationFailure(
+          effect.id,
+          "remote_readback_unknown",
+          "The transmitted remote effect could not be reconciled at its exact endpoint.",
+        );
+      }
+      if (endpoint.repositoryId !== effect.repository) {
+        this.#updateRemoteEffect(effect.id, "conflict", {
+          detail: "The transmitted remote effect repository changed before readback.",
+          transmitted: false,
+        });
+        throw this.#remotePublicationFailure(
+          effect.id,
+          "remote_conflict",
+          "The transmitted remote effect repository changed before readback.",
+        );
+      }
+      let readback;
+      try {
+        readback = normalizedRemoteOid(await this.remoteTransport.readRef({
+          cwd: task.taskWorktree,
+          endpoint: endpoint.endpoint,
+          repository: effect.repository,
+          ref: effect.ref,
+        }));
+      } catch (error) {
+        throw Object.assign(
+          new Error("Remote publication outcome remains unknown; exact readback failed."),
+          { code: "remote_readback_unknown", cause: error, remoteEffect: remoteEffectSnapshot(effect) },
+        );
+      }
+      if (readback === effect.newOid.toLowerCase()) {
+        this.#updateRemoteEffect(effect.id, "confirmed", {
+          detail: "Exact endpoint/ref readback confirmed the transmitted candidate after control mutation.",
+          readback,
+        });
+      } else if (readback === (effect.expectedOldOid?.toLowerCase() ?? null) || readback === null) {
+        this.#updateRemoteEffect(effect.id, "failed", {
+          detail: "Exact endpoint/ref readback confirmed the transmitted candidate was not applied after control mutation.",
+          readback,
+        });
+      } else {
+        this.#updateRemoteEffect(effect.id, "conflict", {
+          detail: "Exact endpoint/ref readback found external drift after control mutation.",
+          readback,
+        });
+        throw this.#remotePublicationFailure(
+          effect.id,
+          "remote_conflict",
+          "Remote publication readback found an unexpected ref value after control mutation.",
+        );
+      }
+    }
+  }
+
   #assertRemoteCandidate(task, candidateSha) {
     const candidate = exactOid(candidateSha);
     if (!candidate) throw new Error("Remote publication requires an exact 40-character candidate SHA.");
@@ -3137,6 +3309,51 @@ export class RuntimeStore {
       throw new Error("Remote publication outcome is unknown; exact readback failed.", {
         cause: error,
       });
+    }
+
+    // A control mutation may commit while the transport is in flight. Never
+    // replay the push under the new control version; take one fresh exact
+    // endpoint/ref readback and classify that already-transmitted effect.
+    const postTransmissionTask = this.#taskRow(taskId);
+    const controlMutated =
+      !postTransmissionTask ||
+      Number(postTransmissionTask.controlVersion) !== capturedControlVersion ||
+      Number(postTransmissionTask.contractVersion) !== capturedContractVersion ||
+      !REMOTE_PUBLICATION_TASK_STATES.has(postTransmissionTask.state);
+    if (controlMutated) {
+      try {
+        readback = await readRemote();
+      } catch (error) {
+        this.#updateRemoteEffect(effect.id, "transmitted_unknown", {
+          detail: "Remote Git readback failed after a control mutation.",
+        });
+        throw new Error("Remote publication outcome remains unknown; exact readback failed after control mutation.", {
+          cause: error,
+        });
+      }
+      if (readback === newOid) {
+        this.#updateRemoteEffect(effect.id, "confirmed", {
+          detail: "Exact endpoint/ref readback confirmed the transmitted candidate after control mutation.",
+          readback,
+        });
+        return this.#remoteEffectResult(taskId, effect.id);
+      }
+      if (readback === expectedOldOid || readback === null) {
+        this.#updateRemoteEffect(effect.id, "failed", {
+          detail: "Exact endpoint/ref readback confirmed the transmitted candidate was not applied after control mutation.",
+          readback,
+        });
+        return this.#remoteEffectResult(taskId, effect.id);
+      }
+      this.#updateRemoteEffect(effect.id, "conflict", {
+        detail: "Exact endpoint/ref readback found external drift after control mutation.",
+        readback,
+      });
+      throw this.#remotePublicationFailure(
+        effect.id,
+        "remote_conflict",
+        "Remote publication readback found an unexpected ref value after control mutation.",
+      );
     }
     if (readback === newOid) {
       this.#updateRemoteEffect(effect.id, "confirmed", {
@@ -4177,11 +4394,13 @@ export class RuntimeStore {
           repository: subscription.repositoryId,
           sha: subscription.revisionSha,
           githubHost: subscription.githubHost,
+          deadlineAt: effectiveDeadline,
         }),
         callFetchCommitStatuses(adapter, {
           repository: subscription.repositoryId,
           sha: subscription.revisionSha,
           githubHost: subscription.githubHost,
+          deadlineAt: effectiveDeadline,
         }),
       ]);
       checkRuns = runsRes;
@@ -4275,9 +4494,13 @@ export class RuntimeStore {
             transientError,
           };
         }
-        const retryDelay =
-          error.retryAfterMs ?? (isRateLimit ? 60_000 : 15_000);
-        const nextReconcileIso = new Date(nowTime + retryDelay).toISOString();
+        const retryDelay = Math.max(
+          error.retryAfterMs ?? (isRateLimit ? 60_000 : 15_000),
+          isRateLimit && error.retryAfterMs != null ? 0 : 15_000,
+        );
+        const nextReconcileIso = new Date(
+          Math.min(nowTime + retryDelay, effectiveDeadline),
+        ).toISOString();
         this.db
           .prepare(
             "UPDATE wait_subscriptions SET last_reconciled_at = ?, next_reconcile_at = ?, deadline_at = MIN(deadline_at, ?) WHERE id = ?",
@@ -4502,10 +4725,10 @@ export class RuntimeStore {
 
     let nextReconcileIso = null;
     if (classification === "pending") {
-      const nextInterval = computeReconcileInterval(
-        subscription.createdAt,
-        nowTime,
-        subscription.id,
+      const nextInterval = Math.max(
+        computeReconcileInterval(subscription.createdAt, nowTime, subscription.id),
+        Number(checkRuns.providerGuidanceMs ?? 0),
+        Number(commitStatuses.providerGuidanceMs ?? 0),
       );
       nextReconcileIso = new Date(
         Math.min(nowTime + nextInterval, effectiveDeadline),
@@ -4608,12 +4831,12 @@ export class RuntimeStore {
       return null;
 
     const rows = this.db
-      .prepare(`SELECT id, attempt_id AS attemptId, kind, source, subject, payload,
+      .prepare(`SELECT id, rowid AS evidenceRowid, attempt_id AS attemptId, kind, source, subject, payload,
           observed_at AS observedAt
         FROM evidence
         WHERE task_id = ? AND attempt_id = ? AND source = 'github_ci'
           AND subject = ? AND kind IN ('github_check_observation', 'github_status_observation', 'github_ci_control_observation')
-        ORDER BY observed_at DESC, id DESC`)
+        ORDER BY observed_at DESC, evidenceRowid DESC`)
       .all(taskRow.id, waitRow.createdByAttemptId, waitRow.revisionSha);
     const latestBySelector = new Map();
     for (const row of rows) {
@@ -4630,10 +4853,7 @@ export class RuntimeStore {
       const isProviderObservation =
         row.kind === "github_check_observation" ||
         row.kind === "github_status_observation";
-      if (
-        !isProviderObservation && !isControlObservation
-      )
-        continue;
+      if (!isProviderObservation && !isControlObservation) continue;
       if (
         payload?.waitSubscriptionId !== waitRow.id ||
         payload?.taskId !== taskRow.id ||
@@ -4663,6 +4883,9 @@ export class RuntimeStore {
               !acceptedConclusions.includes(conclusion.toLowerCase()))))
       )
         continue;
+      // Rows are newest-first. Once a selector has one valid observation,
+      // older evidence must not overwrite the durable wake decision.
+      if (latestBySelector.has(selector)) continue;
       latestBySelector.set(selector, {
         selector,
         normalizedState,
@@ -5535,6 +5758,22 @@ export class RuntimeStore {
         applied_thinking_level AS thinkingLevel FROM attempts
         WHERE task_id = ? AND applied_provider IS NOT NULL ORDER BY number DESC, id DESC LIMIT 1`)
       .get(taskId) ?? null;
+  }
+
+  #assertCommitmentActive(task) {
+    const acceptedAt = new Date(task?.acceptedAt ?? task?.accepted_at ?? task?.createdAt).getTime();
+    const budget = normalizeBudget(task?.budget);
+    const currentTime = new Date(this.attemptClock()).getTime();
+    if (
+      Number.isFinite(acceptedAt) &&
+      Number.isFinite(currentTime) &&
+      currentTime - acceptedAt >= budget.totalCommitmentWallClockDeadlineMs
+    ) {
+      throw Object.assign(
+        new Error("Task total commitment wall-clock deadline has expired; no new Attempt may be launched."),
+        { code: "commitment_expired" },
+      );
+    }
   }
 
   #assertFreshAttemptBudget(taskId, model, thinkingLevel) {
@@ -9226,6 +9465,7 @@ export class RuntimeStore {
     if (!task) throw new Error(`Task ${targetId} was not found.`);
     if (!["accepted", "running", "waiting"].includes(task.state))
       throw new Error(`Task ${targetId} is already terminal (${task.state}); it cannot be corrected.`);
+    this.#assertCommitmentActive(task);
     const nextObjective = objective ?? goal ?? task.goal;
     if (typeof nextObjective !== "string" || !nextObjective.trim())
       throw new Error("Task correction requires an objective.");
@@ -9278,6 +9518,7 @@ export class RuntimeStore {
           Number(current.controlVersion) !== oldControlVersion ||
           Number(current.contractVersion) !== oldContractVersion)
         throw new Error(`Task ${targetId} changed before correction could commit.`);
+      this.#assertCommitmentActive(current);
       const taskUpdate = this.db
         .prepare(`UPDATE tasks SET goal = ?, completion_contract = ?, control_version = ?,
           contract_version = ?, state = 'accepted', latest_attempt_id = ?, final_result = NULL,
@@ -9362,6 +9603,13 @@ export class RuntimeStore {
     if (active) {
       this.#clearAttemptWatchdog(active);
       this.active = null;
+    }
+    try {
+      if (this.#hasUnknownRemoteEffects(targetId))
+        await this.#reconcileUnknownRemoteEffects(targetId);
+    } catch (error) {
+      this.markBlocked(targetId, newAttemptId, error.message);
+      throw error;
     }
     return this.launchAttempt({
       task: {
@@ -9502,6 +9750,7 @@ export class RuntimeStore {
       throw new Error(
         `Task ${id} is ${task.state} and cannot be retried in v0.3.`,
       );
+    this.#assertCommitmentActive(task);
     if (this.hasCapacityConflict())
       throw new Error(
         "A Fresh Executor is already active; v0.3 does not queue Tasks.",
@@ -9572,6 +9821,7 @@ export class RuntimeStore {
       ) {
         throw new Error(`Task ${id} changed before retry could commit.`);
       }
+      this.#assertCommitmentActive(current);
 
       this.#assertFreshAttemptBudget(task.id, model, thinkingLevel);
       nextControlVersion = Number(current.controlVersion) + 1;
@@ -9688,6 +9938,13 @@ export class RuntimeStore {
       try {
         this.db.exec("ROLLBACK");
       } catch {}
+      throw error;
+    }
+    try {
+      if (this.#hasUnknownRemoteEffects(task.id))
+        await this.#reconcileUnknownRemoteEffects(task.id);
+    } catch (error) {
+      this.markBlocked(task.id, attemptId, error.message);
       throw error;
     }
     return this.launchAttempt({

@@ -249,6 +249,88 @@ test("default GitHub status adapter annotates documented status items with the q
   }
 });
 
+test("default GitHub adapter follows Link pagination beyond the old page cap", async () => {
+  const originalFetch = globalThis.fetch;
+  const revisionSha = "0123456789abcdef0123456789abcdef01234567";
+  const requestedUrls = [];
+  globalThis.fetch = async (url) => {
+    const value = String(url);
+    requestedUrls.push(value);
+    const page = Number(new URL(value).searchParams.get("page"));
+    const statuses = page === 21
+      ? [{ id: 2101, context: "build", state: "success" }]
+      : Array.from({ length: 100 }, (_, index) => ({ id: page * 100 + index, context: `other-${index}`, state: "success" }));
+    return {
+      ok: true,
+      headers: { get(name) { return name.toLowerCase() === "link" && page === 1
+        ? '<https://api.github.com/repos/fixture/repository/commits/' + revisionSha + '/status?per_page=100&page=21>; rel="next"'
+        : null; } },
+      async json() { return { statuses }; },
+    };
+  };
+  try {
+    const statuses = await defaultGitHubAdapter.fetchCommitStatuses({
+      repository: "fixture/repository",
+      sha: revisionSha,
+    });
+    assert.equal(statuses.length, 101);
+    assert.equal(statuses.at(-1).id, 2101);
+    assert.deepEqual(requestedUrls.map((url) => new URL(url).searchParams.get("page")), ["1", "21"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("default GitHub requests abort at the effective wait deadline", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, { signal }) => await new Promise((_resolve, reject) => {
+    signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
+  });
+  try {
+    await assert.rejects(
+      () => defaultGitHubAdapter.fetchCheckRuns({
+        repository: "fixture/repository",
+        sha: "0123456789abcdef0123456789abcdef01234567",
+        deadlineAt: Date.now() + 20,
+      }),
+      (error) => error.code === "network_error" && error.timedOut === true,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("newest valid CI observation wins over an older failure for the same selector", async () => {
+  const value = await fixture();
+  try {
+    const candidate = await commitCandidate(value.task.taskWorktree, "latest.txt", "latest\n", "latest");
+    await value.runtime.publishTask({ id: value.task.id, candidateSha: candidate });
+    const registered = await value.runtime.registerWaitSubscription({
+      taskId: value.task.id,
+      revisionSha: candidate,
+      requiredChecks: ["check_run:github-actions/ci"],
+    });
+    value.gitHubAdapter.setCheckRuns([
+      { id: 301, name: "ci", head_sha: candidate, status: "completed", conclusion: "failure", app: { slug: "github-actions" } },
+    ]);
+    await value.runtime.reconcileWaitSubscription(registered.waitSubscription.id, { gitHubAdapter: value.gitHubAdapter });
+    value.gitHubAdapter.setCheckRuns([
+      { id: 302, name: "ci", head_sha: candidate, status: "completed", conclusion: "success", app: { slug: "github-actions" } },
+    ]);
+    await value.runtime.reconcileWaitSubscription(registered.waitSubscription.id, { gitHubAdapter: value.gitHubAdapter });
+    const triggered = await value.runtime.startWaitReactor({ observer: value.gitHubAdapter, skipSpawn: true });
+    assert.equal(triggered[0].classification, "success");
+    assert.equal(value.runtime.getTask(value.task.id).terminalReason, "verified_ci");
+    const evidence = value.runtime.getTask(value.task.id).evidence
+      .filter((item) => item.kind === "github_check_observation");
+    const latest = evidence.find((item) => item.payload.runId === 302);
+    assert.equal(latest.payload.normalizedState, "success");
+    assert.equal(latest.payload.sha, candidate);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
 test("1. exact R has all required checks success -> normalized success", async () => {
   const value = await fixture({
     completionContract: {

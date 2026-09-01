@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, watch } from "node:fs";
+import { existsSync, readFileSync, watch } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:https";
+import { DatabaseSync } from "node:sqlite";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { createExtensionHarness } from "./helpers/v0.2-extension-harness.js";
@@ -435,10 +436,21 @@ async function runJourney({ repair = false } = {}) {
     assert.deepEqual(managerB.surface().widget.lines, ["pi-sand activity: idle"]);
     assert.equal(resultNotification.outcome, "completed");
     assert.equal(resultNotification.payload.finalRevision, current.finalRevision);
+    const deliveryDb = new DatabaseSync(env.PI_SAND_RUNTIME_DB);
+    const deliveryState = deliveryDb
+      .prepare("SELECT state FROM result_deliveries WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1")
+      .get(current.id)?.state;
+    deliveryDb.close();
+    assert.equal(deliveryState, "acked");
     assert.equal(await client.claimResult("manager-c"), null);
     assert.equal(managerA.calls.length, managerACallCount);
     assert.equal(managerA.notifications.length, managerANotificationCount);
     assert.ok(resultNotification.id);
+    if (!repair) {
+      assert.equal(current.finalRevision, candidateR);
+      assert.equal(current.attempts.length, 1);
+      assert.equal(readFileSync(pi.counter, "utf8"), "1");
+    }
     await managerB.invoke("session_shutdown", { type: "session_shutdown" }, managerBContext);
     return { current, candidateR, parent, github, env };
   } finally {
