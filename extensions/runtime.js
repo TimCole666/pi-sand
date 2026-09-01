@@ -72,12 +72,47 @@ function modelSnapshot(ctx) {
   return { provider: ctx.model?.provider, id: ctx.model?.id };
 }
 
+function taskRequest(args) {
+  const text = String(args ?? "").trim();
+  if (!text.startsWith("{")) return { goal: text };
+  let request;
+  try {
+    request = JSON.parse(text);
+  } catch {
+    throw new Error("/task structured input must be valid JSON.");
+  }
+  if (!request || typeof request !== "object" || Array.isArray(request))
+    throw new Error("/task structured input must be a JSON object.");
+  return {
+    goal: request.goal,
+    completionContract: request.completionContract,
+    authority: request.authority,
+    budget: request.budget,
+    returnRoute: request.returnRoute,
+    userRequestedReview: request.userRequestedReview,
+    reviewRequested: request.reviewRequested,
+    policyRiskMarker: request.policyRiskMarker,
+    supervisorCoverageGap: request.supervisorCoverageGap,
+  };
+}
+
 async function createTask(client, args, ctx) {
   const trustError = trustedProject(ctx, "/task");
   if (trustError) return notifyResult(ctx, { ok: false, error: trustError });
   if (!configuredAuthAvailable(ctx)) return notifyResult(ctx, { ok: false, error: "/task requires configured authentication for the selected provider." });
-  try { return notifyResult(ctx, { ok: true, task: await client.createTask({ goal: args, cwd: ctx.cwd, trusted: true, model: modelSnapshot(ctx), thinkingLevel: ctx.thinkingLevel }) }); }
-  catch (error) { return notifyResult(ctx, { ok: false, error: error.message }); }
+  try {
+    const request = taskRequest(args);
+    return notifyResult(ctx, {
+      ok: true,
+      task: await client.createTask({
+        ...request,
+        cwd: ctx.cwd,
+        trusted: true,
+        model: modelSnapshot(ctx),
+        thinkingLevel: ctx.thinkingLevel,
+      }),
+    });
+  } catch (error) { return notifyResult(ctx, { ok: false, error: error.message }); }
 }
 
 async function retryTask(client, args, ctx) {

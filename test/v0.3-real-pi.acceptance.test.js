@@ -335,7 +335,20 @@ async function runAcceptance(t) {
       "Do not modify, create, or delete any other file. Do not create a commit; the daemon will checkpoint your change.",
       "After verifying the file, reply briefly and do not do anything else.",
     ].join(" ");
-    const started = await commandNotification(managerA.child, managerA.events, managerA.stderr, "manager-task", `/task ${goal}`);
+    const completionContract = {
+      objective: goal,
+      localGates: [{
+        id: "real-runtime-artifact",
+        command: [process.execPath, "-e", "const fs = require('node:fs'); process.exit(fs.readFileSync('real-runtime-artifact.txt', 'utf8') === 'PI_SAND_REAL_RUNTIME_OK\\n' ? 0 : 1)"],
+      }],
+    };
+    const started = await commandNotification(
+      managerA.child,
+      managerA.events,
+      managerA.stderr,
+      "manager-task",
+      `/task ${JSON.stringify({ goal, completionContract })}`,
+    );
     assert.equal(started.ok, true, JSON.stringify(started));
     assert.equal(started.task.goal, goal);
     assert.equal(started.task.state, "running");
@@ -438,7 +451,7 @@ const skipReason = enabled
     : `Pi 0.84.4 is required (${piVersionProbe?.error?.message ?? "version probe failed"})`
   : "set PI_SAND_REAL_RUNTIME=1 with Pi 0.84.4 and usable configured model credentials to run the opt-in persistent-runtime acceptance";
 
-test("v0.3 real Pi Manager A exit -> daemon completion -> Manager B reconnect", {
+test("v0.4 real Pi Manager A exit -> daemon verification -> Manager B reconnect", {
   skip: skipReason,
   timeout: timeoutMs + 15_000,
 }, async (t) => {
