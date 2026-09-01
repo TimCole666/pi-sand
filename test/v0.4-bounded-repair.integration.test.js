@@ -389,7 +389,14 @@ test("3. CI R fails -> fresh repair Attempt -> R2 -> fast-forward publish -> exa
     return { callbacksAttached: true, close() {} };
   };
 
-  const value = await fixture({ workerFactory });
+  const value = await fixture({
+    workerFactory,
+    completionContract: {
+      objective: "pass required CI checks",
+      requiredChecks: ["check_run:github-actions/ci"],
+      acceptedConclusions: ["success"],
+    },
+  });
   try {
     assert.equal(attemptSpawns.length, 1);
     const candidateR1 = await commitCandidate(
@@ -418,10 +425,8 @@ test("3. CI R fails -> fresh repair Attempt -> R2 -> fast-forward publish -> exa
       },
     ]);
 
-    const res1 = await value.runtime.reconcileWaitSubscription(
-      wait1.waitSubscription.id,
-      { trigger: true },
-    );
+    const [res1] = await value.runtime.startWaitReactor();
+    value.runtime.stopWaitReactor();
     assert.equal(res1.classification, "failure");
     assert.equal(res1.triggered, true);
 
@@ -458,10 +463,8 @@ test("3. CI R fails -> fresh repair Attempt -> R2 -> fast-forward publish -> exa
       },
     ]);
 
-    const res2 = await value.runtime.reconcileWaitSubscription(
-      wait2.waitSubscription.id,
-      { trigger: true },
-    );
+    const [res2] = await value.runtime.startWaitReactor();
+    value.runtime.stopWaitReactor();
     assert.equal(res2.classification, "success");
 
     const completed = value.runtime.getTask(value.task.id);
@@ -489,6 +492,11 @@ test("4. R1 fail -> R2 fail -> R3 fail reaches CI repair/publication budget and 
 
   const value = await fixture({
     workerFactory,
+    completionContract: {
+      objective: "pass required CI checks",
+      requiredChecks: ["check_run:github-actions/ci"],
+      acceptedConclusions: ["success"],
+    },
     budget: {
       maxCiRepairCycles: 2,
       maxRemotePublications: 3,
@@ -508,7 +516,8 @@ test("4. R1 fail -> R2 fail -> R3 fail reaches CI repair/publication budget and 
     value.gitHubAdapter.setCheckRuns([
       { id: 201, name: "ci", head_sha: r1, status: "completed", conclusion: "failure", app: { slug: "github-actions" } },
     ]);
-    await value.runtime.reconcileWaitSubscription(wait1.waitSubscription.id, { trigger: true });
+    await value.runtime.startWaitReactor();
+    value.runtime.stopWaitReactor();
 
     // Attempt 2 (CI Repair Cycle 1) -> Publish R2 -> Fail CI
     const r2 = await commitCandidate(value.task.taskWorktree, "app.js", "v2\n", "v2");
@@ -521,7 +530,8 @@ test("4. R1 fail -> R2 fail -> R3 fail reaches CI repair/publication budget and 
     value.gitHubAdapter.setCheckRuns([
       { id: 202, name: "ci", head_sha: r2, status: "completed", conclusion: "failure", app: { slug: "github-actions" } },
     ]);
-    await value.runtime.reconcileWaitSubscription(wait2.waitSubscription.id, { trigger: true });
+    await value.runtime.startWaitReactor();
+    value.runtime.stopWaitReactor();
 
     // Attempt 3 (CI Repair Cycle 2) -> Publish R3 -> Fail CI
     const r3 = await commitCandidate(value.task.taskWorktree, "app.js", "v3\n", "v3");
@@ -536,7 +546,8 @@ test("4. R1 fail -> R2 fail -> R3 fail reaches CI repair/publication budget and 
     ]);
 
     // Reconciling wait3 hits the budget ceiling (2 CI repair cycles done, 3 publications done)
-    const res3 = await value.runtime.reconcileWaitSubscription(wait3.waitSubscription.id, { trigger: true });
+    const [res3] = await value.runtime.startWaitReactor();
+    value.runtime.stopWaitReactor();
     assert.equal(res3.triggered, true);
 
     const taskFinal = value.runtime.getTask(value.task.id);
@@ -733,7 +744,13 @@ test("6. daemon restart preserves budget counters/fingerprints", async () => {
 // Scenario 7: wall-clock/CI deadline expiry performs final reconciliation first (if green offline, completes)
 // -----------------------------------------------------------------------------
 test("7. wall-clock/CI deadline expiry performs final reconciliation first (if green offline, completes)", async () => {
-  const value = await fixture();
+  const value = await fixture({
+    completionContract: {
+      objective: "pass required CI checks",
+      requiredChecks: ["check_run:github-actions/ci"],
+      acceptedConclusions: ["success"],
+    },
+  });
   try {
     const candidateR = await commitCandidate(
       value.task.taskWorktree,
@@ -768,10 +785,9 @@ test("7. wall-clock/CI deadline expiry performs final reconciliation first (if g
     ]);
 
     // Reconcile wait subscription after deadline
-    const res = await value.runtime.reconcileWaitSubscription(
-      registered.waitSubscription.id,
-      { now: afterDeadlineIso, trigger: true },
-    );
+    value.runtime.waitClock = () => afterDeadlineIso;
+    const [res] = await value.runtime.startWaitReactor();
+    value.runtime.stopWaitReactor();
 
     // Because GitHub CI was green, it completes the task instead of failing/timing out
     assert.equal(res.classification, "success");
@@ -791,9 +807,106 @@ test("7. wall-clock/CI deadline expiry performs final reconciliation first (if g
 });
 
 // -----------------------------------------------------------------------------
-// Scenario 8: worker/model cannot mutate/increase its own budget
+// Scenario 8: unsafe same-Attempt context gets a bounded fresh local repair
 // -----------------------------------------------------------------------------
-test("8. worker/model cannot mutate/increase its own budget", async () => {
+test("8. unsafe same-Attempt context allocates one fresh local repair Attempt", async () => {
+  let workerCount = 0;
+  const workerFactory = async ({ cwd, onEvent }) => {
+    workerCount += 1;
+    if (workerCount === 2) await writeFile(join(cwd, "pass.txt"), "pass\\n");
+    onEvent({
+      type: "message_end",
+      message: { role: "assistant", content: "candidate ready", stopReason: "stop" },
+    });
+    onEvent({ type: "agent_settled" });
+    return {
+      callbacksAttached: true,
+      sessionId: `fresh-local-repair-${workerCount}`,
+      executionSnapshot: { sessionId: `fresh-local-repair-${workerCount}` },
+      close() {},
+    };
+  };
+  const value = await fixture({
+    workerFactory,
+    completionContract: {
+      objective: "recover from an unsafe local repair context",
+      localGates: [{
+        id: "pass-after-fresh-repair",
+        command: [
+          process.execPath,
+          "-e",
+          "if (!require('node:fs').existsSync('pass.txt')) process.exit(1)",
+        ],
+      }],
+    },
+  });
+  try {
+    const completed = await eventually(
+      () => value.runtime.getTask(value.task.id),
+      (task) => task.state === "completed",
+    );
+    assert.equal(workerCount, 2);
+    assert.equal(completed.attempts.length, 2);
+    assert.equal(completed.attempts[1].cause, "repair");
+    assert.equal(completed.attempts[0].state, "failed");
+    assert.equal(completed.terminalReason, "verified_local");
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Scenario 9: expired CI wait fails only after the final exact reconciliation
+// -----------------------------------------------------------------------------
+test("9. expired CI wait produces one durable external-timeout Result after final reconciliation", async () => {
+  const value = await fixture({
+    completionContract: {
+      objective: "observe required CI",
+      requiredChecks: ["check_run:github-actions/ci"],
+      acceptedConclusions: ["success"],
+    },
+  });
+  try {
+    const candidate = await commitCandidate(
+      value.task.taskWorktree,
+      "app.js",
+      "console.log('timeout');\\n",
+      "feat: timeout",
+    );
+    await value.runtime.publishTask({ id: value.task.id, candidateSha: candidate });
+    const registered = await value.runtime.registerWaitSubscription({
+      taskId: value.task.id,
+      revisionSha: candidate,
+      requiredChecks: ["check_run:github-actions/ci"],
+      timeoutMs: 1,
+    });
+    const afterDeadline = new Date(
+      new Date(registered.waitSubscription.createdAt).getTime() + 2_000,
+    ).toISOString();
+    value.runtime.waitClock = () => afterDeadline;
+    const [result] = await value.runtime.startWaitReactor();
+    value.runtime.stopWaitReactor();
+
+    assert.equal(result.classification, "timed_out");
+    assert.equal(result.triggered, true);
+    const task = value.runtime.getTask(value.task.id);
+    assert.equal(task.state, "failed");
+    assert.equal(task.terminalReason, "external_timeout");
+    assert.equal(
+      value.runtime.db
+        .prepare("SELECT COUNT(*) AS count FROM result_deliveries WHERE task_id = ?")
+        .get(value.task.id).count,
+      1,
+    );
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Scenario 10: worker/model cannot mutate/increase its own budget
+// -----------------------------------------------------------------------------
+test("10. worker/model cannot mutate/increase its own budget", async () => {
   const initialBudget = {
     maxTotalAttempts: 2,
     maxCodeProducingAttempts: 2,
@@ -806,6 +919,7 @@ test("8. worker/model cannot mutate/increase its own budget", async () => {
   });
 
   try {
+    assert.equal(normalizeBudget({ maxTotalAttempts: 99 }).maxTotalAttempts, DEFAULT_BUDGET.maxTotalAttempts);
     const task = value.runtime.getTask(value.task.id);
     const storedBudget = normalizeBudget(task.budget);
     assert.equal(storedBudget.maxTotalAttempts, 2);

@@ -156,7 +156,7 @@ export function normalizeBudget(rawBudget) {
       if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
         throw new Error(`Task budget property '${key}' must be a non-negative number.`);
       }
-      normalized[key] = Math.floor(value);
+      normalized[key] = Math.min(DEFAULT_BUDGET[key], Math.floor(value));
     }
   }
   return normalized;
@@ -666,7 +666,10 @@ function snapshotsEqual(left, right) {
 
 function attemptRunLimit(task) {
   const budget = normalizeBudget(task?.budget);
-  return budget.maxPiRunsPerAttempt ?? MAX_ATTEMPT_RUNS_PER_ATTEMPT;
+  return Math.min(
+    MAX_ATTEMPT_RUNS_PER_ATTEMPT,
+    budget.maxPiRunsPerAttempt ?? MAX_ATTEMPT_RUNS_PER_ATTEMPT,
+  );
 }
 
 function continuationAcknowledgementStatus(acknowledgement) {
@@ -3406,6 +3409,15 @@ export class RuntimeStore {
       );
     }
 
+    const taskBudget = normalizeBudget(taskRow.budget);
+    const waitClockTime = new Date(this.waitClock()).getTime();
+    if (!Number.isFinite(waitClockTime)) {
+      throw Object.assign(
+        new Error("Wait reactor clock returned an invalid time."),
+        { code: "invalid_wait_clock" },
+      );
+    }
+    const maximumDeadline = waitClockTime + taskBudget.ciWaitDeadlineMs;
     const requestedDeadline = deadlineAt ?? deadline_at;
     let normalizedDeadlineAt;
     if (requestedDeadline) {
@@ -3416,29 +3428,20 @@ export class RuntimeStore {
           { code: "invalid_deadline" },
         );
       }
-      normalizedDeadlineAt = parsedDate.toISOString();
+      normalizedDeadlineAt = new Date(
+        Math.min(parsedDate.getTime(), maximumDeadline),
+      ).toISOString();
     } else {
-      const timeout = Number(
-        timeoutMs ??
-        timeout_ms ??
-        parsed(taskRow.budget, {})?.ciWaitTimeoutMs ??
-        parsed(taskRow.budget, {})?.ci_wait_timeout_ms ??
-        DEFAULT_CI_WAIT_TIMEOUT_MS,
-      );
-      if (!Number.isFinite(timeout) || timeout <= 0) {
+      const requestedTimeout = Number(timeoutMs ?? timeout_ms ?? taskBudget.ciWaitDeadlineMs);
+      if (!Number.isFinite(requestedTimeout) || requestedTimeout <= 0) {
         throw Object.assign(
           new Error("Wait registration timeout must be a positive number."),
           { code: "invalid_timeout" },
         );
       }
-      const clockTime = new Date(this.waitClock()).getTime();
-      if (!Number.isFinite(clockTime)) {
-        throw Object.assign(
-          new Error("Wait reactor clock returned an invalid time."),
-          { code: "invalid_wait_clock" },
-        );
-      }
-      normalizedDeadlineAt = new Date(clockTime + timeout).toISOString();
+      normalizedDeadlineAt = new Date(
+        waitClockTime + Math.min(requestedTimeout, taskBudget.ciWaitDeadlineMs),
+      ).toISOString();
     }
 
     const subscriptionId = randomUUID();
@@ -3881,12 +3884,8 @@ export class RuntimeStore {
       throw error;
     }
 
-    const taskBudget = parsed(taskRow.budget, {});
-    const graceMs = Number(
-      taskBudget?.ciCheckAppearanceGraceMs ??
-        taskBudget?.requiredCheckGraceMs ??
-        DEFAULT_CI_CHECK_APPEARANCE_GRACE_MS,
-    );
+    const taskBudget = normalizeBudget(taskRow.budget);
+    const graceMs = taskBudget.ciCheckAppearanceGraceMs;
     const elapsedMs = nowTime - new Date(subscription.createdAt).getTime();
     const graceExpired = elapsedMs >= graceMs;
 
@@ -4072,11 +4071,16 @@ export class RuntimeStore {
 
     if (classification !== "success" && nowTime >= new Date(subscription.deadlineAt).getTime()) {
       classification = "timed_out";
-      this.db
-        .prepare(
-          "UPDATE wait_subscriptions SET status = 'timed_out', last_reconciled_at = ?, next_reconcile_at = NULL WHERE id = ?",
-        )
-        .run(nowIso, id);
+      // Keep the row active until the runtime-owned trigger transaction when
+      // this is a wake. That transaction must atomically create the timeout
+      // Result; an intervening daemon crash must leave the wait replayable.
+      if (!(capability === WAIT_RECONCILE_CAPABILITY && (trigger || autoTrigger))) {
+        this.db
+          .prepare(
+            "UPDATE wait_subscriptions SET status = 'timed_out', last_reconciled_at = ?, next_reconcile_at = NULL WHERE id = ?",
+          )
+          .run(nowIso, id);
+      }
     }
 
     let nextReconcileIso = null;
@@ -4255,6 +4259,7 @@ export class RuntimeStore {
       thinkingLevel = null,
       now: nowOverride = null,
       skipSpawn = false,
+      timedOut = false,
     } = {},
     capability = null,
   ) {
@@ -4306,8 +4311,9 @@ export class RuntimeStore {
         };
       }
 
-      // If status is not active (superseded, cancelled, timed_out), no-op / stale
-      if (waitRow.status !== "active") {
+      // A timed-out row is admitted only when this invocation follows the
+      // final exact reconciliation that durably marked it timed out.
+      if (waitRow.status !== "active" && !(timedOut && waitRow.status === "timed_out")) {
         this.db.exec("COMMIT");
         return {
           task: this.getTask(waitRow.taskId),
@@ -4352,18 +4358,24 @@ export class RuntimeStore {
 
       const durableObservation = this.#validatedWaitObservation(waitRow, taskRow);
       if (!durableObservation || durableObservation.classification === "pending") {
-        this.db.exec("COMMIT");
-        return {
-          task: this.getTask(taskRow.id),
-          waitSubscription: waitSubscriptionSnapshot(waitRow),
-          triggered: false,
-          pending: true,
-          classification: durableObservation?.classification ?? "pending",
-        };
+        if (!timedOut) {
+          this.db.exec("COMMIT");
+          return {
+            task: this.getTask(taskRow.id),
+            waitSubscription: waitSubscriptionSnapshot(waitRow),
+            triggered: false,
+            pending: true,
+            classification: durableObservation?.classification ?? "pending",
+          };
+        }
+        classification = "timed_out";
+        selectorResults = durableObservation?.selectorResults ?? [];
+        evidenceIds = durableObservation?.evidenceIds ?? [];
+      } else {
+        classification = durableObservation.classification;
+        selectorResults = durableObservation.selectorResults;
+        evidenceIds = durableObservation.evidenceIds;
       }
-      classification = durableObservation.classification;
-      selectorResults = durableObservation.selectorResults;
-      evidenceIds = durableObservation.evidenceIds;
 
       // Insert/fetch immutable trigger Evidence from validated durable runtime
       // Evidence. Caller-provided classifications, observations, and ids never
@@ -5491,6 +5503,7 @@ export class RuntimeStore {
       pendingEvents: [],
       pendingClose: null,
       previousRun: null,
+      attemptNumber: number,
       stopRequested: false,
       workerMetadata: null,
       gateProcess: null,
@@ -5968,6 +5981,138 @@ export class RuntimeStore {
     }
   }
 
+  async #startFreshLocalRepair(active, task, gateResult, candidateSha, evidenceRefs = []) {
+    const budget = normalizeBudget(task.budget);
+    const attemptsCount = this.#getTaskAttemptsCount(task.id);
+    const codeAttemptsCount = this.#getTaskCodeAttemptsCount(task.id);
+    if (
+      attemptsCount >= budget.maxTotalAttempts ||
+      codeAttemptsCount >= budget.maxCodeProducingAttempts
+    )
+      return false;
+
+    const nextNumber = attemptsCount + 1;
+    const freshAttemptId = randomUUID();
+    const repairPrompt = buildRepairPrompt({
+      taskId: task.id,
+      attemptNumber: nextNumber,
+      goal: task.goal,
+      taskBranch: task.taskBranch,
+      taskWorktree: task.taskWorktree,
+      baseCommit: task.baseCommit,
+      candidateSha,
+      completionContract: parsed(task.completionContract),
+      failingGate: gateResult,
+      priorFailureDetail: `Local gate '${gateResult.criterion}' failed (${gateResult.exitCategory}, exit code ${gateResult.exitCode}).`,
+      remainingBudget: {
+        remainingAttempts: Math.max(0, budget.maxTotalAttempts - nextNumber),
+        remainingRunsInAttempt: budget.maxPiRunsPerAttempt,
+        remainingCiRepairCycles: Math.max(
+          0,
+          budget.maxCiRepairCycles - this.#getTaskCiRepairsCount(task.id),
+        ),
+        remainingPublications: Math.max(
+          0,
+          Math.min(
+            parsed(task.authority, {})?.maxPublications ?? budget.maxRemotePublications,
+            budget.maxRemotePublications,
+          ) - Number(task.publicationCount ?? 0),
+        ),
+      },
+    });
+    const timestamp = now();
+    const repairDetail = `Local gate '${gateResult.criterion}' failed; starting a fresh repair Attempt.`;
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const freshTask = this.#taskRow(task.id);
+      if (
+        !freshTask ||
+        freshTask.latestAttemptId !== active.attemptId ||
+        !["accepted", "running"].includes(freshTask.state) ||
+        Number(freshTask.controlVersion) !== Number(active.controlVersion) ||
+        Number(freshTask.contractVersion) !== Number(active.contractVersion)
+      )
+        throw new Error("Task changed before fresh local repair allocation.");
+
+      this.db
+        .prepare(`UPDATE attempts SET state = 'failed', finished_at = ?, worker_terminated = 1,
+          terminal_detail = ?, final_branch_head = ?
+          WHERE id = ? AND task_id = ? AND state = 'running'`)
+        .run(
+          timestamp,
+          repairDetail,
+          candidateSha,
+          active.attemptId,
+          task.id,
+        );
+      this.db
+        .prepare(`INSERT INTO attempts (
+          id, task_id, number, provider, model_id, thinking_level, state,
+          started_at, worker_terminated, cause
+        ) VALUES (?, ?, ?, NULL, NULL, NULL, 'starting', ?, 0, 'repair')`)
+        .run(freshAttemptId, task.id, nextNumber, timestamp);
+      this.db
+        .prepare(`INSERT INTO attempt_runs (
+          attempt_id, sequence, kind, control_version, contract_version,
+          prompt_digest, state, evidence_refs, started_at
+        ) VALUES (?, 1, 'local_repair', ?, ?, ?, 'pending', ?, ?)`)
+        .run(
+          freshAttemptId,
+          active.controlVersion,
+          active.contractVersion,
+          promptDigest(repairPrompt),
+          JSON.stringify(evidenceRefs),
+          timestamp,
+        );
+      const taskUpdate = this.db
+        .prepare(`UPDATE tasks SET state = 'running', latest_attempt_id = ?, updated_at = ?
+          WHERE id = ? AND latest_attempt_id = ? AND state IN ('accepted', 'running')
+          AND control_version = ? AND contract_version = ?`)
+        .run(
+          freshAttemptId,
+          timestamp,
+          task.id,
+          active.attemptId,
+          active.controlVersion,
+          active.contractVersion,
+        );
+      if (taskUpdate.changes !== 1)
+        throw new Error("Task fence rejected fresh local repair allocation.");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+
+    if (this.active === active) this.active = null;
+    await this.launchAttempt({
+      task: {
+        id: task.id,
+        sourceRepoRoot: task.sourceRepoRoot,
+        baseCommit: task.baseCommit,
+        taskBranch: task.taskBranch,
+        taskWorktree: task.taskWorktree,
+        goal: task.goal,
+        contractVersion: task.contractVersion,
+        controlVersion: task.controlVersion,
+      },
+      attemptId: freshAttemptId,
+      number: nextNumber,
+      model: {
+        provider: active.provider,
+        id: active.modelId,
+      },
+      thinkingLevel: active.thinkingLevel,
+      packet: repairPrompt,
+      priorState: "local_gate_failed",
+      priorDetail: repairDetail,
+    });
+    return true;
+  }
+
   #runLocalGate(active, task, candidateSha, gate) {
     const startedAt = now();
     return new Promise((resolve) => {
@@ -6382,6 +6527,24 @@ export class RuntimeStore {
       const current = this.#supervisorState(active);
       if (!current) return;
       const task = current.task;
+      const budget = normalizeBudget(task.budget);
+      const attemptStartedAt = new Date(current.attempt.startedAt).getTime();
+      if (
+        Number.isFinite(attemptStartedAt) &&
+        Date.now() - attemptStartedAt >= budget.maxActiveAttemptDurationMs
+      ) {
+        const retired = await this.retireWorker(active.worker, active.workerMetadata);
+        if (this.active !== active || active.stopRequested) return;
+        this.#verificationFailure(active, {
+          state: retired ? "failed" : "blocked",
+          reason: retired ? "external_timeout" : "worker_retirement_ambiguous",
+          detail: retired
+            ? "Task active Attempt duration expired."
+            : "Task active Attempt duration expired and the Fresh Executor could not be safely retired.",
+          workerTerminated: retired,
+        });
+        return;
+      }
       const completionContract = parsed(task.completionContract);
       const gates = localGatesFromContract(completionContract);
       // A contract without an explicit local criterion remains under the
@@ -6464,7 +6627,6 @@ export class RuntimeStore {
           }
 
           // Evaluate failure fingerprint against budget
-          const budget = normalizeBudget(task.budget);
           const fp = localGateFailureFingerprint({
             candidateSha: recordedCandidateSha,
             criterion: gateResult.criterion,
@@ -6558,7 +6720,7 @@ export class RuntimeStore {
 
             const repairPrompt = buildRepairPrompt({
               taskId: task.id,
-              attemptNumber: active.attemptId,
+              attemptNumber: active.attemptNumber,
               goal: task.goal,
               taskBranch: task.taskBranch,
               taskWorktree: task.taskWorktree,
@@ -6623,17 +6785,39 @@ export class RuntimeStore {
             });
             return;
           }
-          this.#verificationFailure(active, {
-            reason: active.runSequence >= budget.maxPiRunsPerAttempt ? "budget_exhausted" : "local_gate_failed",
-            detail: active.runSequence >= budget.maxPiRunsPerAttempt
-              ? `Task attempt run budget exhausted (${active.runSequence} runs) after local gate failed.`
-              : `Required local gate failed: ${gateResult.criterion} (${gateResult.exitCategory}).`,
-            observedCandidateSha,
+          const attemptsCount = this.#getTaskAttemptsCount(task.id);
+          const codeAttemptsCount = this.#getTaskCodeAttemptsCount(task.id);
+          const freshRepairEligible =
+            typeof active.sessionId === "string" &&
+            active.sessionId.length > 0 &&
+            !["working_tree_changed", "candidate_changed"].includes(
+              gateResult.exitCategory,
+            );
+          if (
+            !freshRepairEligible ||
+            attemptsCount >= budget.maxTotalAttempts ||
+            codeAttemptsCount >= budget.maxCodeProducingAttempts
+          ) {
+            this.#verificationFailure(active, {
+              reason: "budget_exhausted",
+              detail: attemptsCount >= budget.maxTotalAttempts
+                ? `Task total attempt budget (${budget.maxTotalAttempts}) exhausted.`
+                : `Task code-producing attempt budget (${budget.maxCodeProducingAttempts}) exhausted.`,
+              observedCandidateSha,
+              recordedCandidateSha,
+              finalBranchHead:
+                gateResult.postCandidateSha ?? recordedCandidateSha,
+              workerTerminated: true,
+            });
+            return;
+          }
+          await this.#startFreshLocalRepair(
+            active,
+            task,
+            gateResult,
             recordedCandidateSha,
-            finalBranchHead:
-              gateResult.postCandidateSha ?? recordedCandidateSha,
-            workerTerminated: true,
-          });
+            [...candidateEvidenceIds, ...localGateEvidenceIds],
+          );
           return;
         }
       }
@@ -6649,6 +6833,26 @@ export class RuntimeStore {
       ]);
       if (finalStatus)
         throw new Error("Task worktree changed during local verification.");
+
+      const acceptedAt = new Date(task.acceptedAt || task.createdAt).getTime();
+      if (
+        Number.isFinite(acceptedAt) &&
+        Date.now() - acceptedAt >= budget.totalCommitmentWallClockDeadlineMs
+      ) {
+        const retired = await this.retireWorker(active.worker, active.workerMetadata);
+        if (this.active !== active || active.stopRequested) return;
+        this.#verificationFailure(active, {
+          state: retired ? "failed" : "blocked",
+          reason: retired ? "external_timeout" : "worker_retirement_ambiguous",
+          detail: retired
+            ? "Task total commitment wall-clock deadline expired."
+            : "Task total commitment wall-clock deadline expired and the Fresh Executor could not be safely retired.",
+          observedCandidateSha,
+          recordedCandidateSha,
+          workerTerminated: retired,
+        });
+        return;
+      }
 
       // A local pass is only a rung in the ladder when the accepted contract
       // also requires remote CI. Publish this exact candidate and park the
