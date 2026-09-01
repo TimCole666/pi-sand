@@ -45,6 +45,7 @@ export const REMOTE_REF_PREFIX = "refs/heads/pi-sand/";
 export const MAX_REMOTE_PUBLICATIONS = 3;
 export const MAX_REMOTE_EFFECTS_PER_TASK = 32;
 export const MAX_REMOTE_REPOSITORY_ID_LENGTH = 1_024;
+const REMOTE_PUBLICATION_TASK_STATES = new Set(["accepted", "running"]);
 export const MAX_REMOTE_EFFECT_DETAIL_LENGTH = 2 * 1_024;
 const INITIAL_ATTEMPT_RUN_SEQUENCE = 1;
 const ACTIVE_ATTEMPT_STATES = new Set(["starting", "running"]);
@@ -121,7 +122,7 @@ const TASK_SELECT = `SELECT id, source_repo_root AS sourceRepoRoot, base_commit 
   contract_version AS contractVersion, control_version AS controlVersion, authority,
   budget, return_route AS returnRoute, accepted_at AS acceptedAt,
   final_revision AS finalRevision, completion_evidence_ref AS completionEvidenceRef,
-  terminal_reason AS terminalReason
+  terminal_reason AS terminalReason, publication_count AS publicationCount
   FROM tasks`;
 const ATTEMPT_SELECT = `SELECT id, task_id AS taskId, number, applied_provider AS provider, applied_model_id AS modelId,
   applied_thinking_level AS thinkingLevel, state, started_at AS startedAt, finished_at AS finishedAt,
@@ -322,12 +323,25 @@ function remotePublicationAuthority(authority) {
 
 function normalizeAuthority(authority) {
   if (authority == null) return DEFAULT_AUTHORITY;
-  if (typeof authority !== "object" || Array.isArray(authority)) return authority;
-  const rawRemote = authority.remotePublication ?? authority.remote_publication;
-  if (rawRemote == null) return authority;
-  const remote = remotePublicationAuthority(authority);
-  const normalized = { ...authority, remotePublication: remote };
-  delete normalized.remote_publication;
+  const parsedAuthority =
+    typeof authority === "string" ? parsed(authority, null) : authority;
+  if (
+    !parsedAuthority ||
+    typeof parsedAuthority !== "object" ||
+    Array.isArray(parsedAuthority)
+  )
+    throw new Error("Task authority must be a JSON object.");
+
+  const normalized = {};
+  if (Object.hasOwn(parsedAuthority, "owner")) {
+    if (typeof parsedAuthority.owner !== "string" || !parsedAuthority.owner.trim())
+      throw new Error("Task authority owner must be a non-empty string.");
+    normalized.owner = parsedAuthority.owner.trim();
+  }
+  const rawRemote =
+    parsedAuthority.remotePublication ?? parsedAuthority.remote_publication;
+  if (rawRemote != null)
+    normalized.remotePublication = remotePublicationAuthority(parsedAuthority);
   return normalized;
 }
 
@@ -685,6 +699,7 @@ function taskSnapshot(row, attempts = [], evidence = [], remoteEffects = []) {
     finalRevision: row.finalRevision ?? null,
     completionEvidenceRef: row.completionEvidenceRef ?? null,
     terminalReason: row.terminalReason ?? null,
+    publicationCount: Number(row.publicationCount ?? 0),
     evidence,
     remoteEffects,
     attempts,
@@ -923,6 +938,7 @@ export class RuntimeStore {
       ["final_revision", "TEXT"],
       ["completion_evidence_ref", "TEXT"],
       ["terminal_reason", "TEXT"],
+      ["publication_count", "INTEGER NOT NULL DEFAULT 0"],
     ]) {
       if (!columns.has(name))
         this.db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${type}`);
@@ -1052,6 +1068,9 @@ export class RuntimeStore {
         prepared_at = COALESCE(prepared_at, created_at),
         updated_at = COALESCE(updated_at, created_at)
       WHERE prepared_at IS NULL OR updated_at IS NULL;
+      UPDATE tasks SET publication_count = (
+        SELECT COUNT(*) FROM remote_effects WHERE remote_effects.task_id = tasks.id
+      ) WHERE publication_count = 0;
       CREATE UNIQUE INDEX IF NOT EXISTS remote_effect_identity
         ON remote_effects(task_id, ref, new_oid, action_digest);
     `);
@@ -1076,7 +1095,8 @@ export class RuntimeStore {
           completion_contract TEXT, contract_version INTEGER NOT NULL DEFAULT 1,
           control_version INTEGER NOT NULL DEFAULT 1, authority TEXT, budget TEXT,
           return_route TEXT, accepted_at TEXT, final_revision TEXT,
-          completion_evidence_ref TEXT, terminal_reason TEXT
+          completion_evidence_ref TEXT, terminal_reason TEXT,
+          publication_count INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS attempts (
           id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), number INTEGER NOT NULL,
@@ -1605,6 +1625,12 @@ export class RuntimeStore {
     const authority = remotePublicationAuthority(taskRow.authority);
     if (!authority)
       throw new Error("Task has no explicit remote publication authority.");
+    if (!REMOTE_PUBLICATION_TASK_STATES.has(taskRow.state)) {
+      throw Object.assign(
+        new Error("Remote publication requires an accepted or running Task."),
+        { code: "remote_task_ineligible" },
+      );
+    }
     const task = taskSnapshot(taskRow);
     if (authority.remoteUrlDigest) {
       let remoteUrl;
@@ -1804,6 +1830,7 @@ export class RuntimeStore {
     } catch {}
     if (
       !taskRow ||
+      !REMOTE_PUBLICATION_TASK_STATES.has(taskRow.state) ||
       !currentAuthority ||
       !snapshotsEqual(currentAuthority, authority) ||
       Number(taskRow.controlVersion) !== Number(effect.controlVersion) ||
