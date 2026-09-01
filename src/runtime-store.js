@@ -46,12 +46,13 @@ export const REMOTE_REF_PREFIX = "refs/heads/pi-sand/";
 export const MAX_REMOTE_PUBLICATIONS = 3;
 export const MAX_REMOTE_EFFECTS_PER_TASK = 32;
 export const MAX_REMOTE_REPOSITORY_ID_LENGTH = 1_024;
-const REMOTE_PUBLICATION_TASK_STATES = new Set(["accepted", "running", "waiting"]);
+const REMOTE_PUBLICATION_TASK_STATES = new Set(["accepted", "running"]);
 export const MAX_REMOTE_EFFECT_DETAIL_LENGTH = 2 * 1_024;
 export const MAX_WAIT_SUBSCRIPTIONS_PER_TASK = 32;
 export const MAX_REQUIRED_CHECKS = 64;
 export const MAX_CHECK_SELECTOR_LENGTH = 1_024;
-export const CHECK_SELECTOR_REGEX = /^(check_run|commit_status):.+/;
+export const CHECK_SELECTOR_REGEX =
+  /^(check_run:[^/\0\s]+\/[^\0\s]+|commit_status:[^\0\s]+)$/;
 export const DEFAULT_CI_WAIT_TIMEOUT_MS = 60 * 60 * 1000;
 const INITIAL_ATTEMPT_RUN_SEQUENCE = 1;
 const ACTIVE_ATTEMPT_STATES = new Set(["starting", "running"]);
@@ -2439,7 +2440,7 @@ export class RuntimeStore {
       ) {
         throw Object.assign(
           new Error(
-            `Invalid CI check selector: "${selector}". Check selectors must match ^(check_run|commit_status):.+`,
+            `Invalid CI check selector: "${selector}". Check selectors must match ^(check_run:<app-id-or-slug>/<check-name>|commit_status:<context>).`,
           ),
           { code: "invalid_check_selector" },
         );
@@ -2504,26 +2505,12 @@ export class RuntimeStore {
       normalizedDeadlineAt = new Date(Date.now() + timeout).toISOString();
     }
 
-    const existingWaitCount = this.db
-      .prepare("SELECT COUNT(*) AS count FROM wait_subscriptions WHERE task_id = ?")
-      .get(targetTaskId).count;
-    if (Number(existingWaitCount) >= MAX_WAIT_SUBSCRIPTIONS_PER_TASK) {
-      throw Object.assign(
-        new Error("Task wait subscription history is bounded."),
-        { code: "too_many_wait_subscriptions" },
-      );
-    }
-
-    const generationRow = this.db
-      .prepare("SELECT COALESCE(MAX(generation), 0) + 1 AS nextGeneration FROM wait_subscriptions WHERE task_id = ?")
-      .get(targetTaskId);
-    const generation = Number(generationRow.nextGeneration);
-
     const subscriptionId = randomUUID();
     const timestamp = now();
     const capturedControlVersion = Number(taskRow.controlVersion);
     const capturedContractVersion = Number(taskRow.contractVersion);
 
+    let generation;
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const freshTask = this.#taskRow(targetTaskId);
@@ -2549,14 +2536,29 @@ export class RuntimeStore {
         );
       }
 
+      const existingWaitCount = this.db
+        .prepare("SELECT COUNT(*) AS count FROM wait_subscriptions WHERE task_id = ?")
+        .get(targetTaskId).count;
+      if (Number(existingWaitCount) >= MAX_WAIT_SUBSCRIPTIONS_PER_TASK) {
+        throw Object.assign(
+          new Error("Task wait subscription history is bounded."),
+          { code: "too_many_wait_subscriptions" },
+        );
+      }
+
+      const generationRow = this.db
+        .prepare("SELECT COALESCE(MAX(generation), 0) + 1 AS nextGeneration FROM wait_subscriptions WHERE task_id = ?")
+        .get(targetTaskId);
+      generation = Number(generationRow.nextGeneration);
+
       // Mark any existing active wait subscription for this task as superseded
       this.db
         .prepare("UPDATE wait_subscriptions SET status = 'superseded' WHERE task_id = ? AND status = 'active'")
         .run(targetTaskId);
 
-      // Update current Attempt: state = 'parked_wait'
+      // Update current Attempt: state = 'parked_wait', cancel gate if present
       this.db
-        .prepare("UPDATE attempts SET state = 'parked_wait' WHERE id = ?")
+        .prepare("UPDATE attempts SET state = 'parked_wait', gate_state = 'terminated', gate_terminated = 1 WHERE id = ?")
         .run(latestAttemptId);
 
       // Update Task: state = 'waiting', updated_at = timestamp

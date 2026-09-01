@@ -253,7 +253,7 @@ test("3. wrong/missing confirmed remote SHA cannot register the wait", async () 
       () => value.runtime.registerWaitSubscription({
         taskId: value.task.id,
         revisionSha: candidateR,
-        requiredChecks: ["check_run:ci"],
+        requiredChecks: ["check_run:ci/test"],
       }),
       (error) => error.code === "unconfirmed_remote_publication",
     );
@@ -263,7 +263,7 @@ test("3. wrong/missing confirmed remote SHA cannot register the wait", async () 
       () => value.runtime.registerWaitSubscription({
         taskId: value.task.id,
         revisionSha: "HEAD",
-        requiredChecks: ["check_run:ci"],
+        requiredChecks: ["check_run:ci/test"],
       }),
       (error) => error.code === "invalid_revision_sha",
     );
@@ -277,6 +277,16 @@ test("3. wrong/missing confirmed remote SHA cannot register the wait", async () 
         taskId: value.task.id,
         revisionSha: candidateR,
         requiredChecks: ["bare-check-name"],
+      }),
+      (error) => error.code === "invalid_check_selector",
+    );
+
+    // Invalid check selector format without app-slug slash
+    await assert.rejects(
+      () => value.runtime.registerWaitSubscription({
+        taskId: value.task.id,
+        revisionSha: candidateR,
+        requiredChecks: ["check_run:bare_name_without_slash"],
       }),
       (error) => error.code === "invalid_check_selector",
     );
@@ -305,6 +315,9 @@ test("4. registering generation N+1 supersedes N atomically; only N+1 remains ac
     const firstCandidate = await commitCandidate(value.task.taskWorktree, "one.txt", "one\n", "one");
     await value.runtime.publishTask({ id: value.task.id, candidateSha: firstCandidate });
 
+    const secondCandidate = await commitCandidate(value.task.taskWorktree, "two.txt", "two\n", "two");
+    await value.runtime.publishTask({ id: value.task.id, candidateSha: secondCandidate });
+
     const gen1 = await value.runtime.registerWaitSubscription({
       taskId: value.task.id,
       revisionSha: firstCandidate,
@@ -313,9 +326,6 @@ test("4. registering generation N+1 supersedes N atomically; only N+1 remains ac
 
     assert.equal(gen1.waitSubscription.generation, 1);
     assert.equal(gen1.waitSubscription.status, "active");
-
-    const secondCandidate = await commitCandidate(value.task.taskWorktree, "two.txt", "two\n", "two");
-    await value.runtime.publishTask({ id: value.task.id, candidateSha: secondCandidate });
 
     const gen2 = await value.runtime.registerWaitSubscription({
       taskId: value.task.id,
