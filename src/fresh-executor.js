@@ -201,6 +201,9 @@ class FreshExecutorClient {
         ...this.#executionSnapshot,
         sessionId: this.#sessionId,
       });
+      // This is a synchronous final launch fence. Do not await or yield after
+      // it: the next operation writes the initial prompt request immediately.
+      this.#options.beforeInitialPrompt?.();
       const promptGeneration = this.#promptGeneration + 1;
       this.#pendingPromptGeneration = promptGeneration;
       this.#promptStatus = "pending";

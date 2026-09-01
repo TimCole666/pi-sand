@@ -1,13 +1,93 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { RuntimeStore } from "../src/runtime-store.js";
+import { startFreshExecutor } from "../src/fresh-executor.js";
+import { processGroupIsAlive } from "../src/process.js";
 
 const wait = (milliseconds) =>
   new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
+
+const FRESH_WAKE_PI_SOURCE = `#!/usr/bin/env node
+const fs = require("node:fs");
+const logPath = process.env.FAKE_PI_LOG;
+const record = (value) => fs.appendFileSync(logPath, JSON.stringify(value) + "\\n");
+if (process.argv.includes("--version")) {
+  process.stdout.write("0.84.4\\n");
+  process.exit(0);
+}
+record({ type: "spawn", pid: process.pid, args: process.argv.slice(2), cwd: process.cwd() });
+let model = null;
+let thinkingLevel = null;
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) >= 0) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    if (!line) continue;
+    const command = JSON.parse(line);
+    record({ ...command, workerPid: process.pid });
+    if (command.type === "set_model") {
+      model = { provider: command.provider, id: command.modelId };
+      process.stdout.write(JSON.stringify({ type: "response", command: "set_model", success: true, id: command.id, data: model }) + "\\n");
+    } else if (command.type === "set_thinking_level") {
+      thinkingLevel = command.level;
+      process.stdout.write(JSON.stringify({ type: "response", command: "set_thinking_level", success: true, id: command.id }) + "\\n");
+    } else if (command.type === "get_state") {
+      process.stdout.write(JSON.stringify({ type: "response", command: "get_state", success: true, id: command.id, data: { model, thinkingLevel, sessionId: "fresh-wake-session" } }) + "\\n");
+    } else if (command.type === "prompt") {
+      process.stdout.write(JSON.stringify({ type: "response", command: "prompt", success: true, id: command.id }) + "\\n");
+      process.stdout.write(JSON.stringify({ type: "agent_start" }) + "\\n");
+      process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: "fresh wake", stopReason: "stop" } }) + "\\n");
+      process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+    }
+  }
+});
+process.on("SIGTERM", () => process.exit(0));
+setInterval(() => {}, 1000);
+`;
+
+async function freshWakePi(parent) {
+  const command = join(parent, "fresh-wake-pi.cjs");
+  const log = join(parent, "fresh-wake-rpc.jsonl");
+  await writeFile(command, FRESH_WAKE_PI_SOURCE);
+  await chmod(command, 0o755);
+  return { command, log, env: { FAKE_PI_LOG: log } };
+}
+
+async function loggedCommands(log) {
+  try {
+    const content = await readFile(log, "utf8");
+    return content.trim().split("\n").filter(Boolean).map(JSON.parse);
+  } catch {
+    return [];
+  }
+}
+
+async function waitForLoggedCommand(log, type, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if ((await loggedCommands(log)).some((command) => command.type === type)) return;
+    await wait(10);
+  }
+  throw new Error(`timed out waiting for Fresh Executor ${type}`);
+}
+
+async function waitFor(predicate, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = await predicate();
+    if (value) return value;
+    await wait(10);
+  }
+  throw new Error("timed out waiting for runtime state");
+}
 
 const git = (cwd, args) =>
   execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
@@ -141,11 +221,13 @@ async function fixture({
   gitHubAdapter,
   completionContract,
   budget,
+  freshExecutor = false,
 } = {}) {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-wake-"));
   const { source, remote, base } = await repository(parent);
   const dbPath = join(parent, "runtime.sqlite");
-  const piCommand = await versionCommand(parent);
+  const freshPi = freshExecutor ? await freshWakePi(parent) : null;
+  const piCommand = freshPi?.command ?? await versionCommand(parent);
   const worktreeRoot = join(parent, "worktrees");
   const defaultWorkerFactory = async ({ onEvent }) => {
     onEvent({
@@ -160,6 +242,7 @@ async function fixture({
   const runtime = new RuntimeStore({
     dbPath,
     piCommand,
+    workerEnv: freshPi ? { ...process.env, ...freshPi.env } : process.env,
     workerFactory: workerFactory ?? defaultWorkerFactory,
     worktreeRoot,
     workerRetireTimeoutMs: workerRetireTimeoutMs ?? 50,
@@ -189,6 +272,7 @@ async function fixture({
     piCommand,
     worktreeRoot,
     runtime,
+    freshPi,
     transport,
     gitHubAdapter: fakeGitHub,
     task,
@@ -490,6 +574,95 @@ test("wake allocation followed by control cancellation before launch sends no pr
     assert.equal(corrected.controlVersion, 2);
   } finally {
     await closeFixture(value);
+  }
+});
+
+test("launched wake cancellation and correction fence startup before Fresh Executor prompt transmission", async () => {
+  for (const action of ["cancel", "correct"]) {
+    let value;
+    let workerCount = 0;
+    let actionPromise;
+    const workerFactory = async (options) => {
+      workerCount += 1;
+      if (workerCount === 2) {
+        return startFreshExecutor({
+          ...options,
+          beforeInitialPrompt: () => {
+            if (action === "cancel") {
+              actionPromise = value.runtime.stopTask(value.task.id);
+            } else {
+              actionPromise = value.runtime.correctTask({
+                id: value.task.id,
+                objective: "corrected during wake startup",
+              });
+            }
+            options.beforeInitialPrompt?.();
+          },
+        });
+      }
+      options.onEvent({
+        type: "message_end",
+        message: { role: "assistant", content: "candidate ready", stopReason: "stop" },
+      });
+      options.onEvent({ type: "agent_settled" });
+      return { callbacksAttached: true, close() {} };
+    };
+
+    value = await fixture({ workerFactory, freshExecutor: true });
+    try {
+      const candidateR = await commitCandidate(
+        value.task.taskWorktree,
+        `app-${action}.js`,
+        `console.log('${action}');\\n`,
+        `${action} wake startup`,
+      );
+      await value.runtime.publishTask({ id: value.task.id, candidateSha: candidateR });
+      const registered = await value.runtime.registerWaitSubscription({
+        taskId: value.task.id,
+        revisionSha: candidateR,
+        requiredChecks: ["check_run:github-actions/ci"],
+      });
+
+      const wake = triggerObserved(value.runtime, registered.waitSubscription.id, {
+        classification: "failure",
+      }).catch(() => null);
+      await waitForLoggedCommand(value.freshPi.log, "get_state");
+      await waitFor(() => actionPromise, 2_000);
+      await actionPromise;
+      await wake;
+
+      const commands = await loggedCommands(value.freshPi.log);
+      const spawns = commands.filter(({ type }) => type === "spawn");
+      assert.equal(spawns.length >= 1, true);
+      const wakePid = spawns[0].pid;
+      assert.equal(
+        commands.some(({ type, workerPid }) => type === "prompt" && workerPid === wakePid),
+        false,
+        `${action} must not transmit the stale launched-wake prompt`,
+      );
+      assert.equal(processGroupIsAlive(wakePid), false, "stale wake worker must be retired");
+      const taskAfter = value.runtime.getTask(value.task.id);
+      assert.equal(taskAfter.attempts.some(({ state }) => state === "orphaned"), false);
+      const staleWakeAttempt = taskAfter.attempts.find(({ number }) => number === 2);
+      assert.notEqual(
+        value.runtime.active?.attemptId,
+        staleWakeAttempt?.id,
+        "stale wake startup must not retain the superseded Attempt as active",
+      );
+      if (action === "cancel") {
+        assert.equal(taskAfter.state, "stopped");
+        assert.equal(taskAfter.controlVersion, 2);
+        assert.equal(staleWakeAttempt.state, "stopped");
+        assert.equal(staleWakeAttempt.attemptRuns[0].state, "aborted");
+      } else {
+        assert.equal(taskAfter.goal, "corrected during wake startup");
+        assert.equal(taskAfter.controlVersion, 2);
+        assert.equal(staleWakeAttempt.state, "superseded");
+        assert.equal(staleWakeAttempt.attemptRuns[0].state, "aborted");
+      }
+    } finally {
+      await closeFixture(value);
+    }
   }
 });
 

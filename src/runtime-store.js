@@ -5938,6 +5938,123 @@ export class RuntimeStore {
     if (!row) throw new Error("Fresh Executor Attempt is stale before launch.");
   }
 
+  #reconcileInitialPromptStale(active, detail, { workerUnsafe = false } = {}) {
+    const task = this.#taskRow(active.taskId);
+    const attempt = this.db
+      .prepare(`${ATTEMPT_SELECT} WHERE id = ? AND task_id = ?`)
+      .get(active.attemptId, active.taskId);
+    const exactAttempt = attempt &&
+      attempt.state === "starting" &&
+      Number(attempt.controlVersion) === Number(active.controlVersion) &&
+      Number(attempt.contractVersion) === Number(active.contractVersion);
+    const currentTask = task &&
+      task.latestAttemptId === active.attemptId &&
+      Number(task.controlVersion) === Number(active.controlVersion) &&
+      Number(task.contractVersion) === Number(active.contractVersion) &&
+      ["accepted", "running"].includes(task.state);
+    if (exactAttempt) {
+      const timestamp = now();
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        if (workerUnsafe && currentTask) {
+          this.db
+            .prepare(`UPDATE attempts SET state = 'orphaned', finished_at = COALESCE(finished_at, ?),
+              terminal_detail = ?, worker_terminated = 0
+              WHERE id = ? AND task_id = ? AND state = 'starting'
+                AND control_version = ? AND contract_version = ?`)
+            .run(timestamp, boundedDetail(detail), active.attemptId, active.taskId,
+              active.controlVersion, active.contractVersion);
+          this.db
+            .prepare(`UPDATE tasks SET state = 'blocked', updated_at = ?, terminal_detail = ?,
+              terminal_reason = ? WHERE id = ? AND latest_attempt_id = ?
+              AND state IN ('accepted', 'running') AND control_version = ?
+              AND contract_version = ?`)
+            .run(timestamp, boundedDetail(detail), boundedDetail(detail), active.taskId,
+              active.attemptId, active.controlVersion, active.contractVersion);
+          this.db
+            .prepare(`UPDATE attempt_runs SET state = 'ambiguous',
+              settled_outcome = COALESCE(settled_outcome, ?), settled_at = COALESCE(settled_at, ?)
+              WHERE attempt_id = ? AND state = 'pending'
+                AND control_version = ? AND contract_version = ?`)
+            .run(boundedDetail(detail), timestamp, active.attemptId,
+              active.controlVersion, active.contractVersion);
+        } else {
+          this.db
+            .prepare(`UPDATE attempts SET state = 'superseded', finished_at = COALESCE(finished_at, ?),
+              terminal_detail = ? WHERE id = ? AND task_id = ? AND state = 'starting'
+                AND control_version = ? AND contract_version = ?`)
+            .run(timestamp, boundedDetail(detail), active.attemptId, active.taskId,
+              active.controlVersion, active.contractVersion);
+          this.db
+            .prepare(`UPDATE attempt_runs SET state = 'aborted',
+              settled_outcome = COALESCE(settled_outcome, ?), settled_at = COALESCE(settled_at, ?)
+              WHERE attempt_id = ? AND state = 'pending'
+                AND control_version = ? AND contract_version = ?`)
+            .run(boundedDetail(detail), timestamp, active.attemptId,
+              active.controlVersion, active.contractVersion);
+        }
+        this.db.exec("COMMIT");
+      } catch (error) {
+        try { this.db.exec("ROLLBACK"); } catch {}
+        throw error;
+      }
+    }
+    active.stopRequested = true;
+    this.#clearAttemptWatchdog(active);
+    if (this.active === active) this.active = null;
+  }
+
+  #assertInitialPromptCurrent(active) {
+    const task = this.#taskRow(active.taskId);
+    const attempt = this.db
+      .prepare(`${ATTEMPT_SELECT} WHERE id = ? AND task_id = ?`)
+      .get(active.attemptId, active.taskId);
+    let detail = null;
+    let workerUnsafe = false;
+    if (
+      this.active !== active ||
+      active.stopRequested ||
+      !task ||
+      !["accepted", "running"].includes(task.state) ||
+      task.latestAttemptId !== active.attemptId ||
+      Number(task.controlVersion) !== Number(active.controlVersion) ||
+      Number(task.contractVersion) !== Number(active.contractVersion) ||
+      !attempt ||
+      attempt.state !== "starting" ||
+      Number(attempt.controlVersion) !== Number(active.controlVersion) ||
+      Number(attempt.contractVersion) !== Number(active.contractVersion)
+    ) {
+      detail = "Fresh Executor initial prompt was superseded before transmission.";
+    }
+    if (!detail && active.workerMetadata) {
+      const recorded = active.workerMetadata;
+      if (
+        attempt.workerPid !== recorded.workerPid ||
+        attempt.workerPgid !== recorded.workerPgid ||
+        attempt.workerStartIdentity !== recorded.workerStartIdentity ||
+        attempt.workerBootId !== recorded.workerBootId ||
+        processGroupStatus(recorded.workerPgid) !== "alive" ||
+        !recordedWorkerIsOwned(recorded, this.bootId)
+      ) {
+        detail = "Fresh Executor initial prompt worker identity or ownership was not proven.";
+        workerUnsafe = true;
+      }
+    }
+    if (!detail) {
+      try {
+        assertTaskWorktreeIdentity(task);
+        return;
+      } catch (error) {
+        detail = `Fresh Executor initial prompt Task identity changed: ${commandError(error)}`;
+      }
+    }
+    this.#reconcileInitialPromptStale(active, detail, { workerUnsafe });
+    const stale = new Error(detail);
+    stale.code = "STALE_ATTEMPT";
+    stale.phase = "prompt";
+    throw stale;
+  }
+
   async launchAttempt({
     task,
     attemptId,
@@ -6032,6 +6149,7 @@ export class RuntimeStore {
         onWorkerSpawn: (worker) => {
           active.workerMetadata = this.#recordAttemptWorker(attemptId, worker);
         },
+        beforeInitialPrompt: () => this.#assertInitialPromptCurrent(active),
       });
       if (this.active !== active) {
         await this.retireWorker(worker, workerMetadata(worker));

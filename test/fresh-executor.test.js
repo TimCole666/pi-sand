@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startFreshExecutor, FRESH_EXECUTOR_ARGS } from "../src/fresh-executor.js";
@@ -160,6 +160,45 @@ test("Fresh Executor callback failure after spawn is captured and safely retires
       return /RPC startup failed/.test(error.message);
     });
     assert.equal(processGroupStatus(spawned.processGroupId), "gone");
+  });
+});
+
+test("Fresh Executor runs the synchronous initial-prompt fence after setup and before prompt transmission", async () => {
+  await withExecutor({}, async ({ fake, taskCwd }) => {
+    let commandsAtFence;
+    const handle = await start(fake, taskCwd, {
+      beforeInitialPrompt: () => {
+        commandsAtFence = readFileSync(fake.log, "utf8")
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map(JSON.parse);
+      },
+    });
+    assert.deepEqual(commandsAtFence.slice(1).map(({ type }) => type), [
+      "set_model",
+      "set_thinking_level",
+      "get_state",
+    ]);
+    assert.equal(commandsAtFence.some(({ type }) => type === "prompt"), false);
+    assert.equal((await readCommands(fake.log)).filter(({ type }) => type === "prompt").length, 1);
+    return handle;
+  });
+});
+
+test("Fresh Executor refuses a stale initial prompt without transmitting it", async () => {
+  await withExecutor({}, async ({ fake, taskCwd }) => {
+    await assert.rejects(
+      start(fake, taskCwd, {
+        beforeInitialPrompt: () => {
+          const stale = new Error("stale launch");
+          stale.code = "STALE_ATTEMPT";
+          throw stale;
+        },
+      }),
+      (error) => error.code === "RPC_STARTUP_FAILED" && error.cause?.code === "STALE_ATTEMPT",
+    );
+    assert.equal((await readCommands(fake.log)).filter(({ type }) => type === "prompt").length, 0);
   });
 });
 
