@@ -116,7 +116,8 @@ test("supervisor keeps exact candidate R waiting when local gates pass but CI is
 
     value.checks.push({ id: 101, name: "ci", head_sha: candidate, status: "completed", conclusion: "success", app: { slug: "github-actions" } });
     value.statuses.push({ id: 201, context: "build", sha: candidate, state: "success" });
-    const triggered = await value.runtime.reconcileWaitSubscription(waiting.waitSubscriptions[0].id, { trigger: true });
+    const triggeredResults = await value.runtime.startWaitReactor({ observer: value.adapter });
+    const triggered = triggeredResults.find((result) => result.waitSubscription?.id === waiting.waitSubscriptions[0].id);
     assert.equal(triggered.classification, "success");
     assert.equal(value.runtime.getTask(value.task.id).terminalReason, "verified_ci");
   } finally {

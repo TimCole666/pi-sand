@@ -206,6 +206,51 @@ async function closeFixture(value) {
   } catch {}
 }
 
+async function triggerObserved(runtime, subscriptionId, {
+classification = "success",
+skipSpawn = false,
+} = {}) {
+const waitSubscription = runtime.getWaitSubscription(subscriptionId);
+const checkRuns = [];
+const commitStatuses = [];
+for (const [index, selector] of waitSubscription.requiredChecks.entries()) {
+const isFailure = classification === "failure" && index === 0;
+if (selector.startsWith("check_run:")) {
+const target = selector.slice("check_run:".length);
+const slash = target.indexOf("/");
+checkRuns.push({
+id: 10000 + index,
+name: target.slice(slash + 1),
+head_sha: waitSubscription.revisionSha,
+status: "completed",
+conclusion: isFailure ? "failure" : "success",
+app: { slug: target.slice(0, slash) },
+});
+} else {
+commitStatuses.push({
+id: 20000 + index,
+context: selector.slice("commit_status:".length),
+sha: waitSubscription.revisionSha,
+state: isFailure ? "failure" : "success",
+});
+}
+}
+const observer = {
+async fetchCheckRuns() { return checkRuns; },
+async fetchCommitStatuses() { return commitStatuses; },
+};
+const results = await runtime.startWaitReactor({ observer, skipSpawn });
+runtime.stopWaitReactor();
+if (results[0]?.error) throw new Error(JSON.stringify(results[0].error));
+return results.find((result) => result.waitSubscription?.id === subscriptionId) ?? {
+  task: runtime.getTask(waitSubscription.taskId),
+  waitSubscription: runtime.getWaitSubscription(subscriptionId),
+  triggered: false,
+  alreadyTriggered: runtime.getWaitSubscription(subscriptionId)?.status === "triggered",
+  stale: runtime.getWaitSubscription(subscriptionId)?.status !== "active",
+};
+}
+
 test("1. Success observation completes Task deterministically, marks wait triggered, creates pending ResultDelivery without starting Pi", async () => {
   let workerSpawnCount = 0;
   const workerFactory = async ({ onEvent }) => {
@@ -256,10 +301,7 @@ test("1. Success observation completes Task deterministically, marks wait trigge
     ]);
 
     // Reconcile and trigger wait
-    const result = await value.runtime.reconcileWaitSubscription(
-      registered.waitSubscription.id,
-      { trigger: true },
-    );
+    const result = await triggerObserved(value.runtime, registered.waitSubscription.id);
 
     assert.equal(result.classification, "success");
     assert.equal(result.triggered, true);
@@ -344,10 +386,7 @@ test("2. Failure observation triggers wait, allocates exactly one fresh Attempt 
       },
     ]);
 
-    const result = await value.runtime.reconcileWaitSubscription(
-      registered.waitSubscription.id,
-      { trigger: true },
-    );
+    const result = await triggerObserved(value.runtime, registered.waitSubscription.id, { classification: "failure" });
 
     assert.equal(result.classification, "failure");
     assert.equal(result.triggered, true);
@@ -412,7 +451,7 @@ test("3. Duplicate observation is idempotent: second trigger on same wait/observ
     ]);
 
     // First trigger
-    const res1 = await value.runtime.triggerWaitSubscription(
+    const res1 = await triggerObserved(value.runtime,
       registered.waitSubscription.id,
       { classification: "failure" },
     );
@@ -422,7 +461,7 @@ test("3. Duplicate observation is idempotent: second trigger on same wait/observ
     const attemptCount1 = task1.attempts.length;
 
     // Second trigger on same wait
-    const res2 = await value.runtime.triggerWaitSubscription(
+    const res2 = await triggerObserved(value.runtime,
       registered.waitSubscription.id,
       { classification: "failure" },
     );
@@ -469,7 +508,7 @@ test("4. Stale observation for old SHA / old generation / cancelled / completed 
 
     // 4a. Wrong SHA observation
     const wrongSha = "0123456789abcdef0123456789abcdef01234567";
-    const resWrongSha = await value.runtime.triggerWaitSubscription(
+    const resWrongSha = await triggerObserved(value.runtime,
       registered.waitSubscription.id,
       {
         classification: "failure",
@@ -491,7 +530,7 @@ test("4. Stale observation for old SHA / old generation / cancelled / completed 
     assert.equal(value.runtime.getWaitSubscription(registered.waitSubscription.id).status, "superseded");
 
     // Trigger on superseded wait 1
-    const resSuperseded = await value.runtime.triggerWaitSubscription(
+    const resSuperseded = await triggerObserved(value.runtime,
       registered.waitSubscription.id,
       { classification: "failure" },
     );
@@ -503,7 +542,7 @@ test("4. Stale observation for old SHA / old generation / cancelled / completed 
     const stoppedTask = value.runtime.getTask(value.task.id);
     assert.equal(stoppedTask.state, "stopped");
 
-    const resStopped = await value.runtime.triggerWaitSubscription(
+    const resStopped = await triggerObserved(value.runtime,
       registered2.waitSubscription.id,
       { classification: "failure" },
     );
@@ -544,7 +583,7 @@ test("5. Crash during transaction: all-or-nothing rollback; wait is not half-tri
 
     await assert.rejects(
       async () => {
-        await value.runtime.triggerWaitSubscription(
+        await triggerObserved(value.runtime,
           registered.waitSubscription.id,
           { classification: "failure" },
         );
@@ -588,7 +627,7 @@ test("6. Crash after transaction commit before worker spawn: persisted Attempt w
     });
 
     // Trigger with skipSpawn = true (simulating crash before worker launch)
-    const result = await value.runtime.triggerWaitSubscription(
+    const result = await triggerObserved(value.runtime,
       registered.waitSubscription.id,
       { classification: "failure", skipSpawn: true },
     );
@@ -623,7 +662,7 @@ test("6. Crash after transaction commit before worker spawn: persisted Attempt w
     assert.equal(waitSub.continuationAttemptId, attempt2.id);
 
     // Second trigger is a no-op
-    const secondTrigger = await restarted.triggerWaitSubscription(
+    const secondTrigger = await triggerObserved(restarted,
       registered.waitSubscription.id,
       { classification: "failure" },
     );
@@ -654,7 +693,7 @@ test("7. Crash after process start before prompt: reconciles process group; no s
     });
 
     // Trigger with skipSpawn: true to get Attempt 2 allocated
-    const triggerRes = await value.runtime.triggerWaitSubscription(
+    const triggerRes = await triggerObserved(value.runtime,
       registered.waitSubscription.id,
       { classification: "failure", skipSpawn: true },
     );
@@ -714,7 +753,7 @@ test("8. Ambiguous prompt transmission: marked ambiguous, no blind prompt replay
       requiredChecks: ["check_run:github-actions/ci"],
     });
 
-    const triggerRes = await value.runtime.triggerWaitSubscription(
+    const triggerRes = await triggerObserved(value.runtime,
       registered.waitSubscription.id,
       { classification: "failure", skipSpawn: true },
     );
@@ -754,7 +793,7 @@ test("9. Attempt uniqueness constraint: UNIQUE(resume_wait_id) prevents two Atte
       requiredChecks: ["check_run:github-actions/ci"],
     });
 
-    const triggerRes = await value.runtime.triggerWaitSubscription(
+    const triggerRes = await triggerObserved(value.runtime,
       registered.waitSubscription.id,
       { classification: "failure", skipSpawn: true },
     );
@@ -837,11 +876,8 @@ test("10. Crash history A: observation seen, crash before DB transaction -> star
     const recon = await restarted.reconcileWaitSubscription(registered.waitSubscription.id);
     assert.equal(recon.classification, "success");
 
-    const triggered = await restarted.triggerWaitSubscription(registered.waitSubscription.id, {
-      classification: recon.classification,
-      selectorResults: recon.selectorResults,
-      evidenceIds: recon.evidenceIds,
-    });
+    const triggeredResults = await restarted.startWaitReactor({ observer: fake });
+    const triggered = triggeredResults.find((result) => result.waitSubscription?.id === registered.waitSubscription.id);
     assert.equal(triggered.triggered, true);
 
     const task = restarted.getTask(value.task.id);

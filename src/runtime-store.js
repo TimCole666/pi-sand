@@ -62,6 +62,8 @@ export const WAIT_REACTOR_IDLE_INTERVAL_MS = 60_000;
 const INITIAL_ATTEMPT_RUN_SEQUENCE = 1;
 const ACTIVE_ATTEMPT_STATES = new Set(["starting", "running"]);
 const ACTIVE_GATE_STATES = new Set(["running", "ambiguous"]);
+const WAIT_RECONCILE_CAPABILITY = Symbol("runtime-owned-wait-reconcile");
+const WAIT_TRIGGER_CAPABILITY = Symbol("runtime-owned-wait-trigger");
 const RETRYABLE_TASK_STATES = new Set(["failed", "stopped", "interrupted"]);
 const WORKER_RETIRE_TIMEOUT_MS = 2_000;
 const now = () => new Date().toISOString();
@@ -2916,6 +2918,50 @@ export class RuntimeStore {
     const capturedControlVersion = Number(taskRow.controlVersion);
     const capturedContractVersion = Number(taskRow.contractVersion);
 
+    // Do not publish a parked/waiting state until both ownership barriers have
+    // been proven. In particular, a live local gate must remain unresolved in
+    // durable state when cancellation is ambiguous.
+    const active = this.active?.attemptId === latestAttemptId ? this.active : null;
+    let gateRetired = true;
+    if (active) gateRetired = this.#cancelLocalGate(active);
+    if (!gateRetired) {
+      const gateAttempt = this.db
+        .prepare(`${ATTEMPT_SELECT} WHERE id = ? AND task_id = ?`)
+        .get(latestAttemptId, targetTaskId);
+      gateRetired = this.#reconcileGate(gateAttempt) === "terminated";
+    }
+    if (!gateRetired) {
+      this.markBlocked(
+        targetTaskId,
+        latestAttemptId,
+        "Local gate could not be safely retired when parking Task on wait; executor capacity remains blocked.",
+      );
+      throw Object.assign(
+        new Error("Local gate could not be safely retired when parking Task on wait."),
+        { code: "gate_retirement_unproven" },
+      );
+    }
+
+    const workerToRetire = active?.worker ?? attemptRow;
+    const metadataToRetire = active?.workerMetadata ?? workerMetadata(attemptRow);
+    let workerRetired = false;
+    try {
+      workerRetired = await this.retireWorker(workerToRetire, metadataToRetire);
+    } catch {
+      workerRetired = false;
+    }
+    if (!workerRetired) {
+      this.markBlocked(
+        targetTaskId,
+        latestAttemptId,
+        "Fresh Executor could not be safely retired when parking Task on wait; executor capacity remains blocked.",
+      );
+      throw Object.assign(
+        new Error("Fresh Executor could not be safely retired when parking Task on wait."),
+        { code: "worker_retirement_unproven" },
+      );
+    }
+
     let generation;
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -2962,17 +3008,22 @@ export class RuntimeStore {
         .prepare("UPDATE wait_subscriptions SET status = 'superseded' WHERE task_id = ? AND status = 'active'")
         .run(targetTaskId);
 
-      // Update current Attempt: state = 'parked_wait', cancel gate if present
-      this.db
-        .prepare("UPDATE attempts SET state = 'parked_wait', gate_state = 'terminated', gate_terminated = 1 WHERE id = ?")
+      // Both barriers were proven before this transaction. Retain that proof in
+      // the same transition that exposes Task waiting and parks the Attempt.
+      const attemptUpdate = this.db
+        .prepare("UPDATE attempts SET state = 'parked_wait', gate_state = 'terminated', gate_terminated = 1, worker_terminated = 1 WHERE id = ? AND gate_terminated = 1")
         .run(latestAttemptId);
+      if (attemptUpdate.changes !== 1)
+        throw new Error("Attempt gate/worker retirement fence rejected wait registration.");
 
       // Update Task: state = 'waiting', updated_at = timestamp
-      this.db
+      const taskUpdate = this.db
         .prepare(`UPDATE tasks SET state = 'waiting', updated_at = ?
           WHERE id = ? AND state IN ('accepted', 'running', 'waiting')
           AND control_version = ? AND contract_version = ?`)
         .run(timestamp, targetTaskId, capturedControlVersion, capturedContractVersion);
+      if (taskUpdate.changes !== 1)
+        throw new Error("Task state fence rejected wait registration.");
 
       // Insert new wait_subscriptions row with status 'active'
       this.db
@@ -3036,39 +3087,8 @@ export class RuntimeStore {
       throw error;
     }
 
-    // After COMMIT: retire live Fresh Executor
-    const active = this.active?.attemptId === latestAttemptId ? this.active : null;
-    if (active) {
-      this.#cancelLocalGate(active);
-    }
-    const workerToRetire = active?.worker ?? attemptRow;
-    const metadataToRetire = active?.workerMetadata ?? workerMetadata(attemptRow);
-
-    let retired = false;
-    try {
-      retired = await this.retireWorker(workerToRetire, metadataToRetire);
-    } catch {
-      retired = false;
-    }
-
-    if (retired) {
-      this.db
-        .prepare("UPDATE attempts SET worker_terminated = 1 WHERE id = ?")
-        .run(latestAttemptId);
-      if (this.active?.attemptId === latestAttemptId) {
-        this.active = null;
-      }
-    } else {
-      // Unproven / unsafe worker retirement fails closed
-      this.markBlocked(
-        targetTaskId,
-        latestAttemptId,
-        "Task wait registration succeeded in DB but Fresh Executor could not be safely retired; executor capacity remains blocked.",
-      );
-      throw Object.assign(
-        new Error("Fresh Executor could not be safely retired when parking Task on wait."),
-        { code: "worker_retirement_unproven" },
-      );
+    if (this.active?.attemptId === latestAttemptId) {
+      this.active = null;
     }
 
     if (this.waitReactorEnabled) {
@@ -3076,8 +3096,7 @@ export class RuntimeStore {
         now: this.waitClock(),
         gitHubAdapter: this.waitObserver ?? this.gitHubAdapter,
         trigger: true,
-        internal: true,
-      });
+      }, WAIT_RECONCILE_CAPABILITY);
       this.#scheduleWaitReactor();
     }
 
@@ -3128,6 +3147,7 @@ export class RuntimeStore {
   async reconcileWaitSubscription(
     subscriptionId,
     options = {},
+    capability = null,
   ) {
     const {
       now: nowOverride,
@@ -3450,20 +3470,23 @@ export class RuntimeStore {
       nextReconcileIso = new Date(nowTime + nextInterval).toISOString();
     }
 
-    if (options.trigger === true || options.autoTrigger === true) {
-      if (
-        classification === "success" ||
+    if (
+      capability === WAIT_RECONCILE_CAPABILITY &&
+      (options.trigger === true || options.autoTrigger === true) &&
+      (classification === "success" ||
         classification === "failure" ||
-        classification === "ci_not_observable"
-      ) {
-        return await this.triggerWaitSubscription(id, {
-          classification,
-          selectorResults,
-          evidenceIds,
+        classification === "ci_not_observable")
+    ) {
+      return await this.#triggerWaitSubscription(
+        id,
+        {
+          model: options.model,
+          thinkingLevel: options.thinkingLevel,
           now: nowOverride,
-          ...options,
-        });
-      }
+          skipSpawn: options.skipSpawn === true,
+        },
+        WAIT_TRIGGER_CAPABILITY,
+      );
     }
 
     this.db
@@ -3481,26 +3504,130 @@ export class RuntimeStore {
     };
   }
 
-  async triggerWaitSubscription(
+  async triggerWaitSubscription() {
+    throw Object.assign(
+      new Error("Wait triggering is runtime-internal; use wait reconciliation."),
+      { code: "wait_trigger_internal_only" },
+    );
+  }
+
+  #validatedWaitObservation(waitRow, taskRow) {
+    const expectedRef = `${REMOTE_REF_PREFIX}${taskRow.id}`;
+    const requiredChecks = parsed(waitRow.requiredChecks, []);
+    const acceptedConclusions = parsed(waitRow.acceptedConclusions, []);
+    if (
+      waitRow.taskId !== taskRow.id ||
+      waitRow.publishedRef !== expectedRef ||
+      Number(waitRow.controlVersion) !== Number(taskRow.controlVersion) ||
+      Number(waitRow.contractVersion) !== Number(taskRow.contractVersion)
+    )
+      return null;
+
+    const confirmedPublication = this.db
+      .prepare(`${REMOTE_EFFECT_SELECT}
+        WHERE task_id = ? AND control_version = ? AND contract_version = ?
+          AND remote = 'origin' AND repository = ? AND ref = ? AND new_oid = ?
+          AND state = 'confirmed'
+        ORDER BY confirmed_at DESC, created_at DESC, id DESC LIMIT 1`)
+      .get(
+        taskRow.id,
+        taskRow.controlVersion,
+        taskRow.contractVersion,
+        waitRow.repositoryId,
+        expectedRef,
+        waitRow.revisionSha,
+      );
+    if (!confirmedPublication) return null;
+
+    const contract = parsed(taskRow.completionContract, {});
+    const contractChecks = requiredChecksFromContract(contract)
+      .map((selector) => typeof selector === "string" ? selector.trim() : selector);
+    const contractConclusions = acceptedConclusionsFromContract(contract)
+      .map((conclusion) => typeof conclusion === "string" ? conclusion.trim().toLowerCase() : conclusion);
+    if (
+      !sameStringSet(requiredChecks, contractChecks) ||
+      !sameStringSet(acceptedConclusions, contractConclusions)
+    )
+      return null;
+
+    const rows = this.db
+      .prepare(`SELECT id, attempt_id AS attemptId, kind, source, subject, payload,
+          observed_at AS observedAt
+        FROM evidence
+        WHERE task_id = ? AND attempt_id = ? AND source = 'github_ci'
+          AND subject = ? AND kind IN ('github_check_observation', 'github_status_observation')
+        ORDER BY observed_at DESC, id DESC`)
+      .all(taskRow.id, waitRow.createdByAttemptId, waitRow.revisionSha);
+    const latestBySelector = new Map();
+    for (const row of rows) {
+      let payload;
+      try {
+        payload = parsed(row.payload, null);
+      } catch {
+        continue;
+      }
+      const selector = payload?.selector;
+      const normalizedState = payload?.normalizedState;
+      const conclusion = payload?.conclusion;
+      if (
+        payload?.waitSubscriptionId !== waitRow.id ||
+        payload?.taskId !== taskRow.id ||
+        Number(payload?.generation) !== Number(waitRow.generation) ||
+        payload?.repository !== waitRow.repositoryId ||
+        payload?.sha !== waitRow.revisionSha ||
+        !requiredChecks.includes(selector) ||
+        !["success", "failure"].includes(normalizedState) ||
+        typeof conclusion !== "string" ||
+        !conclusion.trim() ||
+        (normalizedState === "success" &&
+          !acceptedConclusions.includes(conclusion.toLowerCase()))
+      )
+        continue;
+      latestBySelector.set(selector, {
+        selector,
+        normalizedState,
+        conclusion: conclusion.toLowerCase(),
+        matched: true,
+        evidenceId: row.id,
+        observedAt: row.observedAt,
+      });
+    }
+
+    const selectorResults = requiredChecks.map((selector) =>
+      latestBySelector.get(selector) ?? {
+        selector,
+        normalizedState: "pending",
+        matched: false,
+      },
+    );
+    return {
+      classification: classifyOverallObservation(selectorResults),
+      selectorResults,
+      evidenceIds: selectorResults
+        .map((result) => result.evidenceId)
+        .filter(Boolean),
+    };
+  }
+
+  async #triggerWaitSubscription(
     subscriptionId,
     {
-      classification,
-      observation = null,
-      evidenceId = null,
-      evidenceIds = [],
-      selectorResults = [],
       model = null,
       thinkingLevel = null,
       now: nowOverride = null,
       skipSpawn = false,
     } = {},
+    capability = null,
   ) {
     this.ensureSupported();
+    if (capability !== WAIT_TRIGGER_CAPABILITY)
+      throw Object.assign(
+        new Error("Wait triggering requires the runtime-owned reconciliation capability."),
+        { code: "wait_trigger_internal_only" },
+      );
     const id = String(subscriptionId ?? "").trim();
     if (!id)
       throw new Error("Triggering wait subscription requires a subscription id.");
-    if (!classification)
-      throw new Error("Triggering wait subscription requires a classification.");
     this.open();
 
     const timestamp = nowOverride ? resultTimestamp(nowOverride) : now();
@@ -3533,7 +3660,7 @@ export class RuntimeStore {
           waitSubscription: waitSubscriptionSnapshot(waitRow),
           triggered: false,
           alreadyTriggered: true,
-          classification,
+          classification: null,
         };
       }
 
@@ -3545,7 +3672,7 @@ export class RuntimeStore {
           waitSubscription: waitSubscriptionSnapshot(waitRow),
           triggered: false,
           stale: true,
-          classification,
+          classification: null,
         };
       }
 
@@ -3562,7 +3689,7 @@ export class RuntimeStore {
           waitSubscription: waitSubscriptionSnapshot(waitRow),
           triggered: false,
           stale: true,
-          classification,
+          classification: null,
         };
       }
 
@@ -3577,79 +3704,51 @@ export class RuntimeStore {
           waitSubscription: waitSubscriptionSnapshot(waitRow),
           triggered: false,
           stale: true,
-          classification,
+          classification: null,
         };
       }
 
-      // Require exact repository + SHA match if observation specifies them
-      if (
-        observation?.sha &&
-        observation.sha.toLowerCase() !== waitRow.revisionSha.toLowerCase()
-      ) {
+      const durableObservation = this.#validatedWaitObservation(waitRow, taskRow);
+      if (!durableObservation || durableObservation.classification === "pending") {
         this.db.exec("COMMIT");
         return {
           task: this.getTask(taskRow.id),
           waitSubscription: waitSubscriptionSnapshot(waitRow),
           triggered: false,
-          stale: true,
-          classification,
+          pending: true,
+          classification: durableObservation?.classification ?? "pending",
         };
       }
-      if (
-        observation?.repository &&
-        observation.repository.toLowerCase() !== waitRow.repositoryId.toLowerCase()
-      ) {
-        this.db.exec("COMMIT");
-        return {
-          task: this.getTask(taskRow.id),
-          waitSubscription: waitSubscriptionSnapshot(waitRow),
-          triggered: false,
-          stale: true,
-          classification,
-        };
-      }
-      if (
-        observation?.generation != null &&
-        Number(observation.generation) !== Number(waitRow.generation)
-      ) {
-        this.db.exec("COMMIT");
-        return {
-          task: this.getTask(taskRow.id),
-          waitSubscription: waitSubscriptionSnapshot(waitRow),
-          triggered: false,
-          stale: true,
-          classification,
-        };
-      }
+      const classification = durableObservation.classification;
+      const selectorResults = durableObservation.selectorResults;
+      const evidenceIds = durableObservation.evidenceIds;
 
-      // Insert/fetch immutable trigger Evidence using stable dedupe identity
-      let triggerEvidenceId = evidenceId;
-      if (!triggerEvidenceId) {
-        const dedupeKey = `wait_trigger:${taskRow.id}:${waitRow.generation}:${waitRow.revisionSha}:${classification}`;
-        triggerEvidenceId = this.#appendEvidence({
+      // Insert/fetch immutable trigger Evidence from validated durable runtime
+      // Evidence. Caller-provided classifications, observations, and ids never
+      // participate in the completion authority.
+      const dedupeKey = `wait_trigger:${taskRow.id}:${waitRow.generation}:${waitRow.revisionSha}:${classification}`;
+      const triggerEvidenceId = this.#appendEvidence({
+        taskId: taskRow.id,
+        attemptId: waitRow.createdByAttemptId,
+        attemptRunId: null,
+        kind: "wait_trigger",
+        source: "github_ci",
+        subject: waitRow.revisionSha,
+        payload: {
+          waitSubscriptionId: waitRow.id,
           taskId: taskRow.id,
-          attemptId: waitRow.createdByAttemptId,
-          attemptRunId: null,
-          kind: "wait_trigger",
-          source: "github_ci",
-          subject: waitRow.revisionSha,
-          payload: {
-            waitSubscriptionId: waitRow.id,
-            taskId: taskRow.id,
-            generation: waitRow.generation,
-            classification,
-            revisionSha: waitRow.revisionSha,
-            repositoryId: waitRow.repositoryId,
-            selectorResults,
-            observation,
-            triggeredAt: timestamp,
-          },
-          dedupeKey,
-        });
-      }
+          generation: waitRow.generation,
+          classification,
+          revisionSha: waitRow.revisionSha,
+          repositoryId: waitRow.repositoryId,
+          selectorResults,
+          triggeredAt: timestamp,
+        },
+        dedupeKey,
+      });
 
       const allEvidenceIds = Array.from(
-        new Set([triggerEvidenceId, ...(evidenceIds || [])].filter(Boolean)),
+        new Set([triggerEvidenceId, ...evidenceIds].filter(Boolean)),
       );
       const evidenceRefsJson = JSON.stringify(allEvidenceIds);
 
@@ -3896,7 +3995,7 @@ export class RuntimeStore {
       subscriptionIdOrOptions !== null
         ? { ...subscriptionIdOrOptions, ...options }
         : options;
-    return this.triggerWaitSubscription(id, opts);
+    return this.reconcileWaitSubscription(id, opts);
   }
 
   #scheduleWaitReactor() {
@@ -3934,8 +4033,7 @@ export class RuntimeStore {
           now: this.waitClock(),
           gitHubAdapter: this.waitObserver ?? this.gitHubAdapter,
           trigger: true,
-          internal: true,
-        });
+        }, WAIT_RECONCILE_CAPABILITY);
       } while (this.waitReactorRequested);
     } finally {
       this.waitReactorRunning = false;
@@ -3943,7 +4041,7 @@ export class RuntimeStore {
     }
   }
 
-  async startWaitReactor({ observer } = {}) {
+  async startWaitReactor({ observer, skipSpawn = false } = {}) {
     this.open();
     if (observer) this.waitObserver = observer;
     this.waitReactorEnabled = true;
@@ -3952,8 +4050,8 @@ export class RuntimeStore {
         now: this.waitClock(),
         gitHubAdapter: this.waitObserver ?? this.gitHubAdapter,
         trigger: true,
-        internal: true,
-      });
+        skipSpawn,
+      }, WAIT_RECONCILE_CAPABILITY);
     } finally {
       this.#scheduleWaitReactor();
     }
@@ -3966,7 +4064,7 @@ export class RuntimeStore {
     this.waitReactorTimer = null;
   }
 
-  async reconcileActiveWaits(options = {}) {
+  async reconcileActiveWaits(options = {}, capability = null) {
     this.open();
     const dueOnly = options.dueOnly === true;
     const nowValue = options.now ?? this.waitClock();
@@ -3986,7 +4084,7 @@ export class RuntimeStore {
     const results = [];
     for (const row of rows) {
       try {
-        const result = await this.reconcileWaitSubscription(row.id, options);
+        const result = await this.reconcileWaitSubscription(row.id, options, capability);
         if (result) results.push(result);
       } catch (error) {
         results.push({
