@@ -75,6 +75,24 @@ async function handleRequest(request, store) {
       return { task: await store.stopTask(params.id) };
     case "task.retry":
       return { task: await store.retryTask(params) };
+    case "result.claim": {
+      const result = store.claimResult(
+        params.clientInstanceId ?? params.client_instance_id,
+      );
+      return {
+        result,
+        resultId: result?.id ?? null,
+        claimHandle: result?.claimHandle ?? null,
+        claimExpiresAt: result?.claimExpiresAt ?? null,
+      };
+    }
+    case "result.ack": {
+      const result = store.ackResult(
+        params.resultId ?? params.result_id,
+        params.claimHandle ?? params.claim_handle,
+      );
+      return { result, acknowledged: true, resultId: result.id };
+    }
     default:
       throw Object.assign(new Error(`unknown protocol method: ${request.method}`), { code: "unknown_method" });
   }

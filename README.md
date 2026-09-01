@@ -6,7 +6,7 @@
 Pi Manager (foreground conversation)
     ↓ /task, /tasks, /task-show, /task-stop, /task-retry
 pi-sand Extension (first-party client)
-    ↓ protocol-v1 Unix-domain IPC
+    ↓ protocol-v2 Unix-domain IPC
 pi-sandd (durable Task Runtime)
     ↓ owns Task/Attempt and one Fresh Executor
 Fresh Pi 0.84.4 Executor (fresh process/context)
@@ -56,7 +56,7 @@ The two release invariants are:
 
 Pi/Manager owns the foreground Session, transcript, model context and compaction, normal prompts, tools, Skills, provider/model selection, ordinary retries, and session navigation. The Extension is a client of the runtime. It does not open the v0.3 Task database, own a Fresh Executor, copy the Manager transcript into a Task Packet, or turn the daemon into a conversation server.
 
-`pi-sandd` owns the v0.3 Task database, durable Task and Attempt state, Fresh Executor process lifecycle, Git task worktree/branch, bounded result and checkpoint, explicit Stop/Retry, and Linux crash reconciliation. A Task and its Attempts are distinct from both the Manager Conversation and the disposable Fresh Executor process.
+`pi-sandd` owns the v0.4 Task database, durable Task and Attempt state, Fresh Executor process lifecycle, Git task worktree/branch, bounded result and checkpoint, explicit Stop/Retry, durable Result delivery, and Linux crash reconciliation. A Task and its Attempts are distinct from both the Manager Conversation and the disposable Fresh Executor process.
 
 Quitting Pi, reloading the Extension, `/new`, `/resume`, `/fork`, replacing a Session, closing the TUI, or losing an IPC connection does **not** stop, fail, interrupt, retry, or otherwise transition an accepted Task. `/task-stop <task-id>` is the explicit user operation that stops an active Task. A daemon shutdown is a different lifecycle boundary: `pi-sandd` safely handles its owned worker before recording the appropriate interrupted or blocked outcome.
 
@@ -64,7 +64,7 @@ The daemon never stores ordinary foreground transcript, a Pi Session tree, or cu
 
 ## Runtime and commands
 
-The first Task command automatically starts the matching detached `pi-sandd` package entrypoint when the socket is absent or unreachable, then waits for a protocol-v1 status response. The daemon is independent of the Pi client process: it remains alive with zero connected clients, and a later Pi Manager reconnects to the same runtime and database. Concurrent autostart attempts converge on one owner.
+The first Task command automatically starts the matching detached `pi-sandd` package entrypoint when the socket is absent or unreachable, then waits for a protocol-v2 status response. The daemon is independent of the Pi client process: it remains alive with zero connected clients, and a later Pi Manager reconnects to the same runtime and database. Concurrent autostart attempts converge on one owner.
 
 The owner-only Unix socket is:
 
@@ -72,9 +72,9 @@ The owner-only Unix socket is:
 $XDG_RUNTIME_DIR/pi-sand/pi-sand.sock
 ```
 
-When `XDG_RUNTIME_DIR` is unavailable, pi-sand uses an owner-specific temporary runtime directory containing the numeric user id. The runtime directory is mode `0700` and the socket is mode `0600`; the runtime database is separate from historical v0.1 Agent/Turn SQLite and is owner-only. IPC is newline-delimited JSON with request ids and protocol version `1`, not HTTP/TCP.
+When `XDG_RUNTIME_DIR` is unavailable, pi-sand uses an owner-specific temporary runtime directory containing the numeric user id. The runtime directory is mode `0700` and the socket is mode `0600`; the runtime database is separate from historical v0.1 Agent/Turn SQLite and is owner-only. IPC is newline-delimited JSON with request ids and protocol version `2`, not HTTP/TCP.
 
-The public runtime method set is exactly `runtime.status`, `task.create`, `task.list`, `task.get`, `task.stop`, and `task.retry`. Mutating requests are not automatically replayed after an ambiguous disconnect. The client reports that the outcome is unknown and directs the user to inspect durable state before trying again. Protocol mismatches fail clearly rather than silently downgrading.
+The public runtime method set is exactly `runtime.status`, `task.create`, `task.list`, `task.get`, `task.stop`, `task.retry`, `result.claim`, and `result.ack`. Result delivery uses a durable expiring claim and at-least-once render-before-ack presentation. Mutating requests are not automatically replayed after an ambiguous disconnect. The client reports that the outcome is unknown and directs the user to inspect durable state before trying again. Protocol mismatches fail clearly rather than silently downgrading.
 
 In the foreground Manager, the Extension commands are:
 
@@ -88,7 +88,7 @@ The Fresh Executor uses the acknowledged startup sequence `set_model` → `set_t
 
 Terminal states retain the Task artifact for inspection:
 
-- `completed`: settled result and final task-branch head are durable;
+- `completed`: settled result, final task-branch head, and one pending durable Result delivery are durable;
 - `failed`: execution, setup, prompt, settled outcome, or finalization failed;
 - `stopped`: the explicit Stop operation completed;
 - `interrupted`: daemon lifecycle or a proven prior-boot/gone worker ended the Attempt without replay or adoption; and

@@ -33,6 +33,9 @@ export const MAX_EVIDENCE_PAYLOAD_LENGTH = 64 * 1024;
 export const MAX_LOCAL_GATE_COUNT = 16;
 export const MAX_LOCAL_GATE_COMMAND_LENGTH = 4 * 1024;
 export const MAX_LOCAL_GATE_TIMEOUT_MS = 60_000;
+export const MAX_RESULT_PAYLOAD_LENGTH = 64 * 1024;
+export const RESULT_CLAIM_LEASE_MS = 30_000;
+export const MAX_RESULT_CLAIM_LEASE_MS = 24 * 60 * 60 * 1000;
 export const WORKER_STOP_TIMEOUT_MS = 2_000;
 export const MAX_ATTEMPT_RUNS_PER_ATTEMPT = 4;
 export const MAX_CONTINUATION_PROMPT_LENGTH = MAX_TASK_PACKET_LENGTH;
@@ -44,6 +47,11 @@ const ACTIVE_GATE_STATES = new Set(["running", "ambiguous"]);
 const RETRYABLE_TASK_STATES = new Set(["failed", "stopped", "interrupted"]);
 const WORKER_RETIRE_TIMEOUT_MS = 2_000;
 const now = () => new Date().toISOString();
+const resultTimestamp = (clock) => {
+  const value = typeof clock === "function" ? clock() : Date.now();
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? now() : date.toISOString();
+};
 const commandError = (error) =>
   String(error?.stderr || error?.message || "command failed").trim();
 const git = (cwd, args, options = {}) =>
@@ -128,6 +136,12 @@ const EVIDENCE_SELECT = `SELECT id, task_id AS taskId, attempt_id AS attemptId,
   attempt_run_id AS attemptRunId, kind, source, subject, subject_digest AS subjectDigest,
   payload, payload_digest AS payloadDigest, dedupe_key AS dedupeKey,
   observed_at AS observedAt FROM evidence`;
+const RESULT_SELECT = `SELECT id, task_id AS taskId,
+  control_version AS controlVersion, contract_version AS contractVersion,
+  kind, outcome, payload, payload_digest AS payloadDigest, state,
+  claim_owner AS claimOwner, claim_handle AS claimHandle,
+  claim_expires_at AS claimExpiresAt, created_at AS createdAt,
+  acked_at AS ackedAt FROM result_deliveries`;
 
 function assistantText(message) {
   if (typeof message?.content === "string") return message.content;
@@ -350,6 +364,26 @@ function evidenceSnapshot(row) {
   };
 }
 
+function resultSnapshot(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    taskId: row.taskId,
+    controlVersion: row.controlVersion,
+    contractVersion: row.contractVersion,
+    kind: row.kind,
+    outcome: row.outcome,
+    payload: parsed(row.payload, row.payload),
+    payloadDigest: row.payloadDigest,
+    state: row.state,
+    claimOwner: row.claimOwner ?? null,
+    claimHandle: row.claimHandle ?? null,
+    claimExpiresAt: row.claimExpiresAt ?? null,
+    createdAt: row.createdAt,
+    ackedAt: row.ackedAt ?? null,
+  };
+}
+
 function attemptSnapshot(row, attemptRuns = []) {
   return {
     id: row.id,
@@ -481,6 +515,8 @@ export class RuntimeStore {
     workerRetireTimeoutMs = WORKER_RETIRE_TIMEOUT_MS,
     workerStopTimeoutMs = WORKER_STOP_TIMEOUT_MS,
     bootId = linuxBootIdentity(),
+    resultClaimLeaseMs = process.env.PI_SAND_RESULT_CLAIM_LEASE_MS ?? RESULT_CLAIM_LEASE_MS,
+    resultClock = () => Date.now(),
   } = {}) {
     this.dbPath = dbPath;
     this.piCommand = piCommand;
@@ -493,6 +529,11 @@ export class RuntimeStore {
     );
     this.workerStopTimeoutMs = Math.max(0, Number(workerStopTimeoutMs) || 0);
     this.bootId = bootId;
+    const configuredResultClaimLeaseMs = Number(resultClaimLeaseMs);
+    this.resultClaimLeaseMs = Number.isFinite(configuredResultClaimLeaseMs)
+      ? Math.min(Math.max(1, Math.floor(configuredResultClaimLeaseMs)), MAX_RESULT_CLAIM_LEASE_MS)
+      : RESULT_CLAIM_LEASE_MS;
+    this.resultClock = resultClock;
     this.databaseLock = null;
     this.db = null;
     this.active = null;
@@ -787,7 +828,27 @@ export class RuntimeStore {
       CREATE TRIGGER IF NOT EXISTS evidence_immutable_delete
       BEFORE DELETE ON evidence BEGIN
         SELECT RAISE(ABORT, 'Evidence is immutable');
-      END;`);
+      END;
+      CREATE TABLE IF NOT EXISTS result_deliveries (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        control_version INTEGER NOT NULL,
+        contract_version INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK(kind = 'final_result'),
+        outcome TEXT NOT NULL CHECK(outcome IN ('completed', 'failed', 'cancelled')),
+        payload TEXT NOT NULL,
+        payload_digest TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('pending', 'claimed', 'acked')),
+        claim_owner TEXT,
+        claim_handle TEXT,
+        claim_expires_at TEXT,
+        created_at TEXT NOT NULL,
+        acked_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS result_deliveries_claimable
+        ON result_deliveries(state, created_at, id);
+      CREATE INDEX IF NOT EXISTS result_deliveries_task
+        ON result_deliveries(task_id, created_at, id);`);
       this.reconcilePriorGates();
       this.reconcilePriorAttempts();
       return this;
@@ -945,7 +1006,7 @@ export class RuntimeStore {
           state === "interrupted" ? 1 : 0,
           attempt.id,
         );
-      this.db
+      const taskUpdate = this.db
         .prepare(`UPDATE tasks SET state = ?, updated_at = ?, terminal_detail = ?,
       terminal_reason = ?, shutdown_reason = COALESCE(?, shutdown_reason)
       WHERE id = ? AND latest_attempt_id = ?`)
@@ -967,6 +1028,18 @@ export class RuntimeStore {
           timestamp,
           attempt.id,
         );
+      if (taskUpdate.changes === 1 && state === "interrupted") {
+        const resultId = this.#insertResultDelivery({
+          task: this.#taskRow(attempt.taskId),
+          outcome: "failed",
+          finalResult: attempt.finalResult ?? null,
+          terminalDetail: boundedDetail(detail),
+          terminalReason: "interrupted",
+          finalRevision: attempt.finalBranchHead ?? null,
+          finalBranchHead: attempt.finalBranchHead ?? null,
+        });
+        if (!resultId) throw new Error("Interrupted Task did not produce a Result delivery.");
+      }
       this.db.exec("COMMIT");
     } catch (error) {
       try {
@@ -1116,6 +1189,181 @@ export class RuntimeStore {
       .all(id)
       .map(evidenceSnapshot);
     return taskSnapshot(row, attempts, evidence);
+  }
+
+  #insertResultDelivery({
+    task,
+    outcome,
+    finalResult = null,
+    terminalDetail = null,
+    terminalReason = null,
+    finalRevision = null,
+    finalBranchHead = null,
+    evidenceRefs = [],
+  }) {
+    if (!new Set(["completed", "failed", "cancelled"]).has(outcome))
+      return null;
+    const boundedResult = finalResult == null
+      ? null
+      : bounded(finalResult, MAX_TASK_RESULT_LENGTH);
+    const boundedDetailValue = terminalDetail == null
+      ? null
+      : bounded(terminalDetail, MAX_TASK_DETAIL_LENGTH);
+    const payload = {
+      taskId: task.id,
+      objective: task.goal,
+      result: boundedResult,
+      outcome,
+      taskBranch: task.taskBranch,
+      finalRevision: finalRevision ?? null,
+      finalBranchHead: finalBranchHead ?? null,
+      evidenceRefs: Array.isArray(evidenceRefs) ? evidenceRefs : [],
+      terminalReason: terminalReason ?? null,
+      terminalDetail: boundedDetailValue,
+    };
+    const payloadText = JSON.stringify(payload);
+    if (Buffer.byteLength(payloadText, "utf8") > MAX_RESULT_PAYLOAD_LENGTH)
+      throw new Error("Result payload exceeds its bounded size limit.");
+    const payloadDigest = digest(payloadText);
+    const id = randomUUID();
+    const result = this.db
+      .prepare(`INSERT INTO result_deliveries (
+        id, task_id, control_version, contract_version, kind, outcome,
+        payload, payload_digest, state, created_at
+      ) VALUES (?, ?, ?, ?, 'final_result', ?, ?, ?, 'pending', ?)`)
+      .run(
+        id,
+        task.id,
+        task.controlVersion ?? COMMITMENT_CONTROL_VERSION,
+        task.contractVersion ?? COMMITMENT_CONTRACT_VERSION,
+        outcome,
+        payloadText,
+        payloadDigest,
+        now(),
+      );
+    if (result.changes !== 1)
+      throw new Error("Result delivery could not be persisted.");
+    return id;
+  }
+
+  claimResult(clientInstanceId) {
+    this.open();
+    const requestedOwner =
+      clientInstanceId && typeof clientInstanceId === "object"
+        ? clientInstanceId.clientInstanceId ?? clientInstanceId.client_instance_id
+        : clientInstanceId;
+    if (
+      typeof requestedOwner !== "string" ||
+      !requestedOwner.trim() ||
+      Buffer.byteLength(requestedOwner.trim(), "utf8") > 256 ||
+      requestedOwner.includes("\0")
+    ) {
+      throw Object.assign(
+        new Error("result.claim requires a bounded clientInstanceId."),
+        { code: "invalid_result_claim" },
+      );
+    }
+    const owner = requestedOwner.trim();
+    const claimedAt = resultTimestamp(this.resultClock);
+    const claimExpiresAt = new Date(
+      Date.parse(claimedAt) + this.resultClaimLeaseMs,
+    ).toISOString();
+    const claimHandle = randomUUID();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const candidate = this.db
+        .prepare(`${RESULT_SELECT}
+          WHERE state = 'pending'
+             OR (state = 'claimed' AND claim_expires_at IS NOT NULL AND claim_expires_at <= ?)
+          ORDER BY created_at, id LIMIT 1`)
+        .get(claimedAt);
+      if (!candidate) {
+        this.db.exec("COMMIT");
+        return null;
+      }
+      const update = this.db
+        .prepare(`UPDATE result_deliveries SET state = 'claimed',
+          claim_owner = ?, claim_handle = ?, claim_expires_at = ?
+          WHERE id = ? AND (
+            state = 'pending'
+            OR (state = 'claimed' AND claim_expires_at IS NOT NULL AND claim_expires_at <= ?)
+          )`)
+        .run(owner, claimHandle, claimExpiresAt, candidate.id, claimedAt);
+      if (update.changes !== 1)
+        throw new Error("Result claim was lost before it could be recorded.");
+      const claimed = this.db
+        .prepare(`${RESULT_SELECT} WHERE id = ?`)
+        .get(candidate.id);
+      this.db.exec("COMMIT");
+      return resultSnapshot(claimed);
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+  }
+
+  ackResult(resultId, claimHandle) {
+    this.open();
+    const requestedAck =
+      resultId && typeof resultId === "object"
+        ? resultId
+        : { resultId, claimHandle };
+    const requestedResultId = requestedAck.resultId ?? requestedAck.result_id;
+    const requestedClaimHandle = requestedAck.claimHandle ?? requestedAck.claim_handle;
+    if (
+      typeof requestedResultId !== "string" ||
+      !requestedResultId.trim() ||
+      Buffer.byteLength(requestedResultId.trim(), "utf8") > 256 ||
+      requestedResultId.includes("\0") ||
+      typeof requestedClaimHandle !== "string" ||
+      !requestedClaimHandle.trim() ||
+      Buffer.byteLength(requestedClaimHandle.trim(), "utf8") > 256 ||
+      requestedClaimHandle.includes("\0")
+    ) {
+      throw Object.assign(
+        new Error("result.ack requires a bounded resultId and claimHandle."),
+        { code: "invalid_result_ack" },
+      );
+    }
+    const id = requestedResultId.trim();
+    const handle = requestedClaimHandle.trim();
+    const ackedAt = resultTimestamp(this.resultClock);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const update = this.db
+        .prepare(`UPDATE result_deliveries SET state = 'acked', acked_at = ?,
+          claim_owner = NULL, claim_handle = NULL, claim_expires_at = NULL
+          WHERE id = ? AND state = 'claimed' AND claim_handle = ?
+            AND claim_expires_at IS NOT NULL AND claim_expires_at > ?`)
+        .run(ackedAt, id, handle, ackedAt);
+      if (update.changes !== 1) {
+        const row = this.db
+          .prepare("SELECT state, claim_expires_at AS claimExpiresAt FROM result_deliveries WHERE id = ?")
+          .get(id);
+        if (!row)
+          throw Object.assign(new Error("Result was not found."), { code: "result_not_found" });
+        throw Object.assign(
+          new Error(
+            row.state === "acked"
+              ? "Result has already been acknowledged."
+              : "Result claim is missing, expired, or does not match.",
+          ),
+          { code: row.state === "acked" ? "result_already_acked" : "result_claim_invalid" },
+        );
+      }
+      const acknowledged = this.db
+        .prepare(`${RESULT_SELECT} WHERE id = ?`)
+        .get(id);
+      this.db.exec("COMMIT");
+      return resultSnapshot(acknowledged);
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
   }
 
   createWorktree({ repoRoot, baseCommit, taskId }) {
@@ -2155,6 +2403,7 @@ export class RuntimeStore {
       recordedCandidateSha = null,
       finalBranchHead = observedCandidateSha,
       workerTerminated,
+      evidenceRefs = null,
     },
   ) {
     const timestamp = now();
@@ -2205,6 +2454,27 @@ export class RuntimeStore {
           active.taskId,
         );
       if (attemptUpdate.changes !== 1) throw new Error("Attempt completion fence rejected verification outcome.");
+      if (state === "failed") {
+        const taskRow = this.#taskRow(active.taskId);
+        const runEvidenceRefs = this.db
+          .prepare(`SELECT evidence_refs AS evidenceRefs FROM attempt_runs
+            WHERE attempt_id = ? AND sequence = ?`)
+          .get(active.attemptId, active.runSequence);
+        const deliveryEvidenceRefs = Array.isArray(evidenceRefs)
+          ? evidenceRefs
+          : parsed(runEvidenceRefs?.evidenceRefs, []);
+        const resultId = this.#insertResultDelivery({
+          task: taskRow,
+          outcome: "failed",
+          finalResult,
+          terminalDetail: bounded(detail, MAX_TASK_DETAIL_LENGTH),
+          terminalReason: reason,
+          finalRevision: taskRow?.finalRevision ?? recordedCandidateSha,
+          finalBranchHead,
+          evidenceRefs: deliveryEvidenceRefs,
+        });
+        if (!resultId) throw new Error("Failed Task did not produce a Result delivery.");
+      }
       this.db.exec("COMMIT");
       if (this.active === active && !active.gateProcess) this.active = null;
       return true;
@@ -2271,6 +2541,17 @@ export class RuntimeStore {
           active.contractVersion,
         );
       if (runUpdate.changes !== 1) throw new Error("AttemptRun completion fence rejected verified outcome.");
+      const resultId = this.#insertResultDelivery({
+        task: this.#taskRow(active.taskId),
+        outcome: "completed",
+        finalResult,
+        terminalDetail: "Task completed after all required local gates passed.",
+        terminalReason: "verified_local",
+        finalRevision: candidateSha,
+        finalBranchHead: candidateSha,
+        evidenceRefs: evidenceIds,
+      });
+      if (!resultId) throw new Error("Completed Task did not produce a Result delivery.");
       this.db.exec("COMMIT");
       if (this.active === active) this.active = null;
       return true;
@@ -2429,14 +2710,29 @@ export class RuntimeStore {
         retired = await this.retireWorker(active.worker, active.workerMetadata);
       } catch {}
       if (this.active !== active || active.stopRequested) return;
-      this.#verificationFailure(active, {
-        state: retired ? "failed" : "blocked",
-        reason: retired ? "local_verification_failed" : "worker_retirement_ambiguous",
-        detail: `Task local verification failed: ${commandError(error)}`,
-        observedCandidateSha,
-        recordedCandidateSha,
-        workerTerminated: retired,
-      });
+      try {
+        this.#verificationFailure(active, {
+          state: retired ? "failed" : "blocked",
+          reason: retired ? "local_verification_failed" : "worker_retirement_ambiguous",
+          detail: `Task local verification failed: ${commandError(error)}`,
+          observedCandidateSha,
+          recordedCandidateSha,
+          workerTerminated: retired,
+        });
+      } catch (failureError) {
+        // If the terminal Result write itself fails, keep completion and
+        // delivery all-or-nothing and fence the retained worktree closed.
+        if (this.active === active && !active.stopRequested) {
+          try {
+            this.markBlocked(
+              active.taskId,
+              active.attemptId,
+              `Task terminal Result could not be persisted: ${commandError(failureError)}`,
+            );
+          } catch {}
+          this.active = null;
+        }
+      }
     } finally {
       active.finalizing = false;
     }
@@ -2752,7 +3048,7 @@ export class RuntimeStore {
             active.attemptId,
             active.taskId,
           );
-        this.db
+        const taskUpdate = this.db
           .prepare(`UPDATE tasks SET state = ?, updated_at = ?, final_result = ?, terminal_detail = ?, terminal_reason = ?
             WHERE id = ? AND latest_attempt_id = ? AND state IN ('accepted', 'running')
               AND control_version = ? AND contract_version = ?`)
@@ -2767,6 +3063,16 @@ export class RuntimeStore {
             active.controlVersion,
             active.contractVersion,
           );
+        if (taskUpdate.changes === 1 && retired) {
+          const resultId = this.#insertResultDelivery({
+            task: this.#taskRow(active.taskId),
+            outcome: "failed",
+            finalResult,
+            terminalDetail: detail,
+            terminalReason: "continuation_prompt_ambiguous",
+          });
+          if (!resultId) throw new Error("Failed Task did not produce a Result delivery.");
+        }
         this.db.exec("COMMIT");
       } catch (transactionError) {
         try {
@@ -3016,6 +3322,21 @@ export class RuntimeStore {
           active.attemptId,
           active.runSequence,
         );
+      const outcome = ["completed", "failed"].includes(terminalState)
+        ? terminalState
+        : null;
+      if (outcome) {
+        const resultId = this.#insertResultDelivery({
+          task: this.#taskRow(active.taskId),
+          outcome,
+          finalResult,
+          terminalDetail: finalDetail,
+          terminalReason: finalDetail,
+          finalRevision: finalBranchHead,
+          finalBranchHead,
+        });
+        if (!resultId) throw new Error("Terminal Task did not produce a Result delivery.");
+      }
       this.db.exec("COMMIT");
     } catch (error) {
       try {
@@ -3129,6 +3450,13 @@ export class RuntimeStore {
           timestamp,
           attempt.id,
         );
+      const resultId = this.#insertResultDelivery({
+        task: this.#taskRow(task.id),
+        outcome: "cancelled",
+        terminalDetail: "The Task was intentionally stopped by the user.",
+        terminalReason: "user_stopped",
+      });
+      if (!resultId) throw new Error("Stopped Task did not produce a Result delivery.");
       this.db.exec("COMMIT");
     } catch (error) {
       try {

@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { RuntimeClient } from "../src/runtime-client.js";
 import { resolveGitRepositoryRoot } from "../src/runtime-store.js";
 
@@ -9,6 +11,7 @@ const getSessionId = (ctx) => ctx.sessionManager.getSessionId();
 
 class SessionRuntime {
   #sessionId; #activity = ACTIVITY.IDLE; #agentWorkActive = false; #closed = false;
+  #resultPollTimer = null; #resultPollInFlight = false;
   constructor(ctx) { this.#sessionId = getSessionId(ctx); }
   get activity() { return this.#activity; }
   matches(ctx) { return !this.#closed && this.#sessionId === getSessionId(ctx); }
@@ -17,7 +20,40 @@ class SessionRuntime {
   beginUserPrompt(ctx) { this.setActivity(ctx, ACTIVITY.WAITING_FOR_USER); }
   endUserPrompt(ctx) { if (!this.#closed && this.matches(ctx)) this.setActivity(ctx, this.#agentWorkActive ? ACTIVITY.RUNNING : ACTIVITY.IDLE); }
   setAgentWorkActive(ctx, active) { if (!this.#closed && this.matches(ctx)) this.#agentWorkActive = active; }
-  close(ctx) { if (!this.#closed) { this.#closed = true; ctx.ui.setStatus(STATUS_KEY, undefined); ctx.ui.setWidget(WIDGET_KEY, undefined); } }
+  async #pollResult(ctx, client, clientInstanceId) {
+    if (this.#closed || !this.matches(ctx) || this.#resultPollInFlight) return;
+    // Result polling must not make an ordinary Pi session start a brand-new
+    // runtime. If a durable database already exists, however, reconnecting
+    // Manager A/B may restart the daemon in order to claim its pending Result.
+    if (client.socketPath && !existsSync(client.socketPath) &&
+        client.dbPath && !existsSync(client.dbPath)) return;
+    this.#resultPollInFlight = true;
+    try {
+      const result = await client.claimResult(clientInstanceId);
+      if (!result || !this.matches(ctx)) return;
+      try {
+        ctx.ui.notify(JSON.stringify(result), result.outcome === "completed" ? "info" : "error");
+      } catch { return; }
+      if (!this.matches(ctx)) return;
+      await client.ackResult(result.id, result.claimHandle);
+    } catch { /* The next deterministic poll retries after an unavailable daemon or lease expiry. */ }
+    finally { this.#resultPollInFlight = false; }
+  }
+  async startResultPolling(ctx, client, clientInstanceId) {
+    if (typeof client?.claimResult !== "function" || typeof client?.ackResult !== "function") return;
+    const initialPoll = this.#pollResult(ctx, client, clientInstanceId);
+    this.#resultPollTimer = setInterval(() => void this.#pollResult(ctx, client, clientInstanceId), 5_000);
+    this.#resultPollTimer.unref?.();
+    await initialPoll;
+  }
+  close(ctx) {
+    if (this.#closed) return;
+    this.#closed = true;
+    if (this.#resultPollTimer) clearInterval(this.#resultPollTimer);
+    this.#resultPollTimer = null;
+    ctx.ui.setStatus(STATUS_KEY, undefined);
+    ctx.ui.setWidget(WIDGET_KEY, undefined);
+  }
 }
 
 function notifyResult(ctx, result) { ctx.ui.notify(JSON.stringify(result), result.ok ? "info" : "error"); return result; }
@@ -65,12 +101,14 @@ export function registerPiSandExtension(pi, { runtimeClientFactory } = {}) {
   let runtime;
   const injectedClient = runtimeClientFactory ? runtimeClientFactory() : undefined;
   let runtimeClient = injectedClient;
+  const resultClientInstanceId = randomUUID();
   const currentRuntime = (ctx) => (runtime?.matches(ctx) ? runtime : undefined);
   const currentRuntimeClient = () => (runtimeClient ??= (runtimeClientFactory ?? defaultRuntimeClientFactory)());
 
   pi.registerCommand("tasks", { description: "List durable background Tasks", handler: async (_args, ctx) => ipcResult(ctx, "tasks", () => currentRuntimeClient().listTasks()) });
   const supportsTaskMutations = !runtimeClientFactory || typeof injectedClient?.createTask === "function";
   const supportsTaskControls = !runtimeClientFactory || (typeof injectedClient?.stopTask === "function" && typeof injectedClient?.retryTask === "function");
+  const supportsResultDelivery = !runtimeClientFactory || (typeof injectedClient?.claimResult === "function" && typeof injectedClient?.ackResult === "function");
   if (supportsTaskMutations) {
     pi.registerCommand("task", { description: "Start one durable background Task in an isolated Fresh Executor", handler: async (args, ctx) => createTask(currentRuntimeClient(), args, ctx) });
     pi.registerCommand("task-show", { description: "Show one durable background Task", handler: async (args, ctx) => ipcResult(ctx, "task", () => currentRuntimeClient().getTask(String(args ?? "").trim())) });
@@ -80,7 +118,12 @@ export function registerPiSandExtension(pi, { runtimeClientFactory } = {}) {
     }
   }
   pi.on("project_trust", async () => ({ trusted: "undecided" }));
-  pi.on("session_start", async (_event, ctx) => { runtime = new SessionRuntime(ctx); runtime.render(ctx); });
+  pi.on("session_start", async (_event, ctx) => {
+    runtime = new SessionRuntime(ctx);
+    runtime.render(ctx);
+    if (supportsResultDelivery)
+      await runtime.startResultPolling(ctx, currentRuntimeClient(), resultClientInstanceId);
+  });
   pi.on("session_shutdown", async (_event, ctx) => { const current = currentRuntime(ctx); if (current) { current.close(ctx); runtime = undefined; } });
   pi.on("agent_start", async (_event, ctx) => { currentRuntime(ctx)?.setAgentWorkActive(ctx, true); currentRuntime(ctx)?.setActivity(ctx, ACTIVITY.RUNNING); });
   pi.on("agent_end", async (_event, ctx) => currentRuntime(ctx)?.render(ctx));
