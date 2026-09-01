@@ -75,6 +75,9 @@ async function handleRequest(request, store) {
       return { task: await store.stopTask(params.id) };
     case "task.retry":
       return { task: await store.retryTask(params) };
+    case "task.wait":
+    case "wait.register":
+      return await store.registerWaitSubscription(params);
     case "result.claim": {
       const result = store.claimResult(
         params.clientInstanceId ?? params.client_instance_id,

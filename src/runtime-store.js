@@ -46,8 +46,13 @@ export const REMOTE_REF_PREFIX = "refs/heads/pi-sand/";
 export const MAX_REMOTE_PUBLICATIONS = 3;
 export const MAX_REMOTE_EFFECTS_PER_TASK = 32;
 export const MAX_REMOTE_REPOSITORY_ID_LENGTH = 1_024;
-const REMOTE_PUBLICATION_TASK_STATES = new Set(["accepted", "running"]);
+const REMOTE_PUBLICATION_TASK_STATES = new Set(["accepted", "running", "waiting"]);
 export const MAX_REMOTE_EFFECT_DETAIL_LENGTH = 2 * 1_024;
+export const MAX_WAIT_SUBSCRIPTIONS_PER_TASK = 32;
+export const MAX_REQUIRED_CHECKS = 64;
+export const MAX_CHECK_SELECTOR_LENGTH = 1_024;
+export const CHECK_SELECTOR_REGEX = /^(check_run|commit_status):.+/;
+export const DEFAULT_CI_WAIT_TIMEOUT_MS = 60 * 60 * 1000;
 const INITIAL_ATTEMPT_RUN_SEQUENCE = 1;
 const ACTIVE_ATTEMPT_STATES = new Set(["starting", "running"]);
 const ACTIVE_GATE_STATES = new Set(["running", "ambiguous"]);
@@ -158,6 +163,16 @@ const RESULT_SELECT = `SELECT id, task_id AS taskId,
   claim_owner AS claimOwner, claim_handle AS claimHandle,
   claim_expires_at AS claimExpiresAt, created_at AS createdAt,
   acked_at AS ackedAt FROM result_deliveries`;
+const WAIT_SUBSCRIPTION_SELECT = `SELECT id, task_id AS taskId, generation,
+  control_version AS controlVersion, contract_version AS contractVersion,
+  created_by_attempt_id AS createdByAttemptId, kind, github_host AS githubHost,
+  repository_id AS repositoryId, repository_name_snapshot AS repositoryNameSnapshot,
+  revision_sha AS revisionSha, published_ref AS publishedRef,
+  required_checks AS requiredChecks, accepted_conclusions AS acceptedConclusions,
+  status, created_at AS createdAt, deadline_at AS deadlineAt,
+  last_reconciled_at AS lastReconciledAt, next_reconcile_at AS nextReconcileAt,
+  trigger_evidence_id AS triggerEvidenceId, continuation_attempt_id AS continuationAttemptId
+  FROM wait_subscriptions`;
 
 function assistantText(message) {
   if (typeof message?.content === "string") return message.content;
@@ -805,7 +820,34 @@ function attemptSnapshot(row, attemptRuns = []) {
   };
 }
 
-function taskSnapshot(row, attempts = [], evidence = [], remoteEffects = []) {
+function waitSubscriptionSnapshot(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    taskId: row.taskId,
+    generation: Number(row.generation),
+    controlVersion: Number(row.controlVersion),
+    contractVersion: Number(row.contractVersion),
+    createdByAttemptId: row.createdByAttemptId,
+    kind: row.kind,
+    githubHost: row.githubHost,
+    repositoryId: row.repositoryId,
+    repositoryNameSnapshot: row.repositoryNameSnapshot,
+    revisionSha: row.revisionSha,
+    publishedRef: row.publishedRef,
+    requiredChecks: parsed(row.requiredChecks, []),
+    acceptedConclusions: parsed(row.acceptedConclusions, []),
+    status: row.status,
+    createdAt: row.createdAt,
+    deadlineAt: row.deadlineAt,
+    lastReconciledAt: row.lastReconciledAt ?? null,
+    nextReconcileAt: row.nextReconcileAt ?? null,
+    triggerEvidenceId: row.triggerEvidenceId ?? null,
+    continuationAttemptId: row.continuationAttemptId ?? null,
+  };
+}
+
+function taskSnapshot(row, attempts = [], evidence = [], remoteEffects = [], waitSubscriptions = []) {
   return {
     id: row.id,
     sourceRepoRoot: row.sourceRepoRoot,
@@ -834,6 +876,7 @@ function taskSnapshot(row, attempts = [], evidence = [], remoteEffects = []) {
     publicationCount: Number(row.publicationCount ?? 0),
     evidence,
     remoteEffects,
+    waitSubscriptions,
     attempts,
   };
 }
@@ -1216,6 +1259,74 @@ export class RuntimeStore {
     `);
   }
 
+  ensureWaitSubscriptions() {
+    const columns = new Set(
+      this.db
+        .prepare("PRAGMA table_info(wait_subscriptions)")
+        .all()
+        .map((row) => row.name),
+    );
+    if (columns.size === 0) {
+      this.db.exec(`CREATE TABLE IF NOT EXISTS wait_subscriptions (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        generation INTEGER NOT NULL,
+        control_version INTEGER NOT NULL,
+        contract_version INTEGER NOT NULL,
+        created_by_attempt_id TEXT NOT NULL REFERENCES attempts(id),
+        kind TEXT NOT NULL CHECK(kind = 'github_ci'),
+        github_host TEXT NOT NULL,
+        repository_id TEXT NOT NULL,
+        repository_name_snapshot TEXT NOT NULL,
+        revision_sha TEXT NOT NULL,
+        published_ref TEXT NOT NULL,
+        required_checks TEXT NOT NULL,
+        accepted_conclusions TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('active', 'triggered', 'superseded', 'cancelled', 'timed_out')),
+        created_at TEXT NOT NULL,
+        deadline_at TEXT NOT NULL,
+        last_reconciled_at TEXT,
+        next_reconcile_at TEXT,
+        trigger_evidence_id TEXT REFERENCES evidence(id),
+        continuation_attempt_id TEXT REFERENCES attempts(id),
+        UNIQUE(task_id, generation)
+      );
+      CREATE INDEX IF NOT EXISTS wait_subscriptions_task_generation
+        ON wait_subscriptions(task_id, generation, status);
+      CREATE INDEX IF NOT EXISTS wait_subscriptions_status_reconcile
+        ON wait_subscriptions(status, next_reconcile_at, deadline_at);`);
+      return;
+    }
+    for (const [name, type] of [
+      ["control_version", "INTEGER NOT NULL DEFAULT 1"],
+      ["contract_version", "INTEGER NOT NULL DEFAULT 1"],
+      ["github_host", "TEXT NOT NULL DEFAULT 'github.com'"],
+      ["repository_id", "TEXT NOT NULL DEFAULT ''"],
+      ["repository_name_snapshot", "TEXT NOT NULL DEFAULT ''"],
+      ["revision_sha", "TEXT NOT NULL DEFAULT ''"],
+      ["published_ref", "TEXT NOT NULL DEFAULT ''"],
+      ["required_checks", "TEXT NOT NULL DEFAULT '[]'"],
+      ["accepted_conclusions", "TEXT NOT NULL DEFAULT '[\"success\"]'"],
+      ["status", "TEXT NOT NULL DEFAULT 'active'"],
+      ["created_at", "TEXT NOT NULL DEFAULT ''"],
+      ["deadline_at", "TEXT NOT NULL DEFAULT ''"],
+      ["last_reconciled_at", "TEXT"],
+      ["next_reconcile_at", "TEXT"],
+      ["trigger_evidence_id", "TEXT REFERENCES evidence(id)"],
+      ["continuation_attempt_id", "TEXT REFERENCES attempts(id)"],
+    ]) {
+      if (!columns.has(name)) {
+        this.db.exec(`ALTER TABLE wait_subscriptions ADD COLUMN ${name} ${type}`);
+      }
+    }
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS wait_subscriptions_task_generation
+        ON wait_subscriptions(task_id, generation, status);
+      CREATE INDEX IF NOT EXISTS wait_subscriptions_status_reconcile
+        ON wait_subscriptions(status, next_reconcile_at, deadline_at);
+    `);
+  }
+
   open() {
     this.ensureSupported();
     if (this.closed) throw new Error("The pi-sand runtime is closed.");
@@ -1327,8 +1438,37 @@ export class RuntimeStore {
       CREATE INDEX IF NOT EXISTS remote_effects_task
         ON remote_effects(task_id, created_at, id);
       CREATE INDEX IF NOT EXISTS remote_effects_current
-        ON remote_effects(task_id, ref, state, created_at, id);`);
+        ON remote_effects(task_id, ref, state, created_at, id);
+      CREATE TABLE IF NOT EXISTS wait_subscriptions (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        generation INTEGER NOT NULL,
+        control_version INTEGER NOT NULL,
+        contract_version INTEGER NOT NULL,
+        created_by_attempt_id TEXT NOT NULL REFERENCES attempts(id),
+        kind TEXT NOT NULL CHECK(kind = 'github_ci'),
+        github_host TEXT NOT NULL,
+        repository_id TEXT NOT NULL,
+        repository_name_snapshot TEXT NOT NULL,
+        revision_sha TEXT NOT NULL,
+        published_ref TEXT NOT NULL,
+        required_checks TEXT NOT NULL,
+        accepted_conclusions TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('active', 'triggered', 'superseded', 'cancelled', 'timed_out')),
+        created_at TEXT NOT NULL,
+        deadline_at TEXT NOT NULL,
+        last_reconciled_at TEXT,
+        next_reconcile_at TEXT,
+        trigger_evidence_id TEXT REFERENCES evidence(id),
+        continuation_attempt_id TEXT REFERENCES attempts(id),
+        UNIQUE(task_id, generation)
+      );
+      CREATE INDEX IF NOT EXISTS wait_subscriptions_task_generation
+        ON wait_subscriptions(task_id, generation, status);
+      CREATE INDEX IF NOT EXISTS wait_subscriptions_status_reconcile
+        ON wait_subscriptions(status, next_reconcile_at, deadline_at);`);
       this.ensureRemoteEffects();
+      this.ensureWaitSubscriptions();
       this.reconcilePriorGates();
       this.reconcilePriorAttempts();
       return this;
@@ -1632,6 +1772,15 @@ export class RuntimeStore {
         ...(remoteEffectsByTask.get(effect.taskId) ?? []),
         remoteEffectSnapshot(effect),
       ]);
+    const waitSubscriptionRows = this.db
+      .prepare(`${WAIT_SUBSCRIPTION_SELECT} ORDER BY task_id, generation, created_at, id`)
+      .all();
+    const waitSubscriptionsByTask = new Map();
+    for (const wait of waitSubscriptionRows)
+      waitSubscriptionsByTask.set(wait.taskId, [
+        ...(waitSubscriptionsByTask.get(wait.taskId) ?? []),
+        waitSubscriptionSnapshot(wait),
+      ]);
     const grouped = new Map();
     for (const attempt of attempts)
       grouped.set(attempt.taskId, [
@@ -1644,6 +1793,7 @@ export class RuntimeStore {
         grouped.get(row.id) ?? [],
         evidenceByTask.get(row.id) ?? [],
         remoteEffectsByTask.get(row.id) ?? [],
+        waitSubscriptionsByTask.get(row.id) ?? [],
       ),
     );
   }
@@ -1682,7 +1832,11 @@ export class RuntimeStore {
       .prepare(`${REMOTE_EFFECT_SELECT} WHERE task_id = ? ORDER BY created_at, id`)
       .all(id)
       .map(remoteEffectSnapshot);
-    return taskSnapshot(row, attempts, evidence, remoteEffects);
+    const waitSubscriptions = this.db
+      .prepare(`${WAIT_SUBSCRIPTION_SELECT} WHERE task_id = ? ORDER BY generation, created_at, id`)
+      .all(id)
+      .map(waitSubscriptionSnapshot);
+    return taskSnapshot(row, attempts, evidence, remoteEffects, waitSubscriptions);
   }
 
   #remoteEffectRow(id) {
@@ -2020,7 +2174,7 @@ export class RuntimeStore {
       const reservedAt = now();
       const taskReservation = this.db
         .prepare(`UPDATE tasks SET publication_count = publication_count + 1,
-          updated_at = ? WHERE id = ? AND state IN ('accepted', 'running')
+          updated_at = ? WHERE id = ? AND state IN ('accepted', 'running', 'waiting')
           AND control_version = ? AND contract_version = ?
           AND publication_count < ?`)
         .run(
@@ -2114,6 +2268,433 @@ export class RuntimeStore {
       "remote_conflict",
       "Remote publication readback found an unexpected ref value.",
     );
+  }
+
+  async registerWaitSubscription({
+    id,
+    taskId,
+    task_id,
+    revisionSha,
+    candidateSha,
+    revision_sha,
+    candidate_sha,
+    requiredChecks,
+    required_checks,
+    checks,
+    acceptedConclusions,
+    accepted_conclusions,
+    conclusions,
+    githubHost,
+    github_host,
+    repositoryId,
+    repository_id,
+    repositoryNameSnapshot,
+    repository_name_snapshot,
+    deadlineAt,
+    deadline_at,
+    timeoutMs,
+    timeout_ms,
+    kind = "github_ci",
+  } = {}) {
+    this.ensureSupported();
+    const targetTaskId = String(taskId ?? id ?? task_id ?? "").trim();
+    if (!targetTaskId)
+      throw new Error("Wait registration requires a Task id.");
+    this.open();
+
+    const taskRow = this.#taskRow(targetTaskId);
+    if (!taskRow)
+      throw new Error(`Task ${targetTaskId} was not found.`);
+
+    const validTaskStates = new Set(["accepted", "running", "waiting"]);
+    if (!validTaskStates.has(taskRow.state)) {
+      throw Object.assign(
+        new Error(`Task ${targetTaskId} is in state "${taskRow.state}" and cannot be parked on wait.`),
+        { code: "task_ineligible_for_wait" },
+      );
+    }
+
+    const latestAttemptId = taskRow.latestAttemptId;
+    if (!latestAttemptId)
+      throw new Error(`Task ${targetTaskId} has no attempt.`);
+
+    const attemptRow = this.db
+      .prepare(`${ATTEMPT_SELECT} WHERE id = ? AND task_id = ?`)
+      .get(latestAttemptId, targetTaskId);
+    if (!attemptRow)
+      throw new Error(`Task ${targetTaskId} attempt ${latestAttemptId} was not found.`);
+
+    const validAttemptStates = new Set(["starting", "running", "parked_wait"]);
+    if (!validAttemptStates.has(attemptRow.state)) {
+      throw Object.assign(
+        new Error(`Attempt ${latestAttemptId} is in state "${attemptRow.state}" and cannot be parked on wait.`),
+        { code: "attempt_ineligible_for_wait" },
+      );
+    }
+
+    if (kind !== "github_ci") {
+      throw Object.assign(
+        new Error(`v0.4 supports only github_ci wait subscriptions, got: "${kind}".`),
+        { code: "unsupported_wait_kind" },
+      );
+    }
+
+    const targetSha = String(
+      revisionSha ?? candidateSha ?? revision_sha ?? candidate_sha ?? "",
+    ).trim();
+    const normalizedSha = exactOid(targetSha)?.toLowerCase();
+    if (!normalizedSha) {
+      throw Object.assign(
+        new Error("Wait registration requires an exact 40-character revision SHA."),
+        { code: "invalid_revision_sha" },
+      );
+    }
+
+    const expectedRef = `${REMOTE_REF_PREFIX}${targetTaskId}`;
+    const confirmedEffect = this.db
+      .prepare(`${REMOTE_EFFECT_SELECT}
+        WHERE task_id = ? AND ref = ? AND new_oid = ? AND state = 'confirmed'
+        ORDER BY confirmed_at DESC, created_at DESC, id DESC LIMIT 1`)
+      .get(targetTaskId, expectedRef, normalizedSha);
+
+    if (!confirmedEffect) {
+      throw Object.assign(
+        new Error(
+          `Wait registration requires a confirmed remote publication on ${expectedRef} for candidate SHA ${normalizedSha}.`,
+        ),
+        { code: "unconfirmed_remote_publication" },
+      );
+    }
+
+    const taskAuthority = parsed(taskRow.authority, {});
+    const remoteAuth = taskAuthority?.remotePublication ?? taskAuthority?.remote_publication;
+
+    const rawRepoId =
+      repositoryId ??
+      repository_id ??
+      confirmedEffect.repository ??
+      remoteAuth?.repositoryId ??
+      remoteAuth?.repository_id;
+    const normalizedRepoId = boundedRemoteRepositoryId(rawRepoId);
+    if (!normalizedRepoId) {
+      throw Object.assign(
+        new Error("Wait registration requires a canonical repository identity."),
+        { code: "invalid_repository_id" },
+      );
+    }
+
+    const repoNameSnapshot = String(
+      repositoryNameSnapshot ??
+      repository_name_snapshot ??
+      normalizedRepoId,
+    ).trim();
+
+    const rawHost =
+      githubHost ??
+      github_host ??
+      remoteAuth?.githubHost ??
+      remoteAuth?.github_host ??
+      "github.com";
+    if (typeof rawHost !== "string" || !rawHost.trim() || rawHost.includes("\0")) {
+      throw Object.assign(
+        new Error("Wait registration requires a valid GitHub host."),
+        { code: "invalid_github_host" },
+      );
+    }
+    const normalizedHost = rawHost.trim().toLowerCase();
+
+    const completionContract = parsed(taskRow.completionContract, {});
+    const rawChecks =
+      requiredChecks ??
+      required_checks ??
+      checks ??
+      completionContract?.requiredChecks ??
+      completionContract?.required_checks ??
+      completionContract?.ciChecks ??
+      completionContract?.requiredCiChecks ??
+      completionContract?.ci?.requiredChecks ??
+      completionContract?.ci?.required_checks ??
+      [];
+
+    if (!Array.isArray(rawChecks) || rawChecks.length === 0) {
+      throw Object.assign(
+        new Error("Wait registration requires at least one typed CI check selector."),
+        { code: "invalid_required_checks" },
+      );
+    }
+    if (rawChecks.length > MAX_REQUIRED_CHECKS) {
+      throw Object.assign(
+        new Error(`Wait registration required checks exceed limit of ${MAX_REQUIRED_CHECKS}.`),
+        { code: "too_many_required_checks" },
+      );
+    }
+
+    const validatedRequiredChecks = rawChecks.map((selector) => {
+      if (
+        typeof selector !== "string" ||
+        !selector.trim() ||
+        selector.includes("\0") ||
+        Buffer.byteLength(selector.trim(), "utf8") > MAX_CHECK_SELECTOR_LENGTH ||
+        !CHECK_SELECTOR_REGEX.test(selector.trim())
+      ) {
+        throw Object.assign(
+          new Error(
+            `Invalid CI check selector: "${selector}". Check selectors must match ^(check_run|commit_status):.+`,
+          ),
+          { code: "invalid_check_selector" },
+        );
+      }
+      return selector.trim();
+    });
+
+    const rawConclusions =
+      acceptedConclusions ??
+      accepted_conclusions ??
+      conclusions ??
+      completionContract?.acceptedConclusions ??
+      completionContract?.accepted_conclusions ??
+      ["success"];
+
+    if (!Array.isArray(rawConclusions) || rawConclusions.length === 0) {
+      throw Object.assign(
+        new Error("Wait registration requires at least one accepted conclusion."),
+        { code: "invalid_accepted_conclusions" },
+      );
+    }
+
+    const validatedAcceptedConclusions = rawConclusions.map((conclusion) => {
+      if (
+        typeof conclusion !== "string" ||
+        !conclusion.trim() ||
+        conclusion.includes("\0")
+      ) {
+        throw Object.assign(
+          new Error(`Invalid accepted conclusion: "${conclusion}".`),
+          { code: "invalid_accepted_conclusion" },
+        );
+      }
+      return conclusion.trim().toLowerCase();
+    });
+
+    const requestedDeadline = deadlineAt ?? deadline_at;
+    let normalizedDeadlineAt;
+    if (requestedDeadline) {
+      const parsedDate = new Date(requestedDeadline);
+      if (Number.isNaN(parsedDate.getTime())) {
+        throw Object.assign(
+          new Error("Wait registration deadline is invalid."),
+          { code: "invalid_deadline" },
+        );
+      }
+      normalizedDeadlineAt = parsedDate.toISOString();
+    } else {
+      const timeout = Number(
+        timeoutMs ??
+        timeout_ms ??
+        parsed(taskRow.budget, {})?.ciWaitTimeoutMs ??
+        parsed(taskRow.budget, {})?.ci_wait_timeout_ms ??
+        DEFAULT_CI_WAIT_TIMEOUT_MS,
+      );
+      if (!Number.isFinite(timeout) || timeout <= 0) {
+        throw Object.assign(
+          new Error("Wait registration timeout must be a positive number."),
+          { code: "invalid_timeout" },
+        );
+      }
+      normalizedDeadlineAt = new Date(Date.now() + timeout).toISOString();
+    }
+
+    const existingWaitCount = this.db
+      .prepare("SELECT COUNT(*) AS count FROM wait_subscriptions WHERE task_id = ?")
+      .get(targetTaskId).count;
+    if (Number(existingWaitCount) >= MAX_WAIT_SUBSCRIPTIONS_PER_TASK) {
+      throw Object.assign(
+        new Error("Task wait subscription history is bounded."),
+        { code: "too_many_wait_subscriptions" },
+      );
+    }
+
+    const generationRow = this.db
+      .prepare("SELECT COALESCE(MAX(generation), 0) + 1 AS nextGeneration FROM wait_subscriptions WHERE task_id = ?")
+      .get(targetTaskId);
+    const generation = Number(generationRow.nextGeneration);
+
+    const subscriptionId = randomUUID();
+    const timestamp = now();
+    const capturedControlVersion = Number(taskRow.controlVersion);
+    const capturedContractVersion = Number(taskRow.contractVersion);
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const freshTask = this.#taskRow(targetTaskId);
+      if (
+        !freshTask ||
+        !validTaskStates.has(freshTask.state) ||
+        Number(freshTask.controlVersion) !== capturedControlVersion ||
+        Number(freshTask.contractVersion) !== capturedContractVersion
+      ) {
+        throw Object.assign(
+          new Error("Task state or versions changed before wait registration."),
+          { code: "stale_wait_registration" },
+        );
+      }
+
+      const freshAttempt = this.db
+        .prepare(`${ATTEMPT_SELECT} WHERE id = ? AND task_id = ?`)
+        .get(latestAttemptId, targetTaskId);
+      if (!freshAttempt || !validAttemptStates.has(freshAttempt.state)) {
+        throw Object.assign(
+          new Error("Attempt state changed before wait registration."),
+          { code: "stale_wait_registration" },
+        );
+      }
+
+      // Mark any existing active wait subscription for this task as superseded
+      this.db
+        .prepare("UPDATE wait_subscriptions SET status = 'superseded' WHERE task_id = ? AND status = 'active'")
+        .run(targetTaskId);
+
+      // Update current Attempt: state = 'parked_wait'
+      this.db
+        .prepare("UPDATE attempts SET state = 'parked_wait' WHERE id = ?")
+        .run(latestAttemptId);
+
+      // Update Task: state = 'waiting', updated_at = timestamp
+      this.db
+        .prepare(`UPDATE tasks SET state = 'waiting', updated_at = ?
+          WHERE id = ? AND state IN ('accepted', 'running', 'waiting')
+          AND control_version = ? AND contract_version = ?`)
+        .run(timestamp, targetTaskId, capturedControlVersion, capturedContractVersion);
+
+      // Insert new wait_subscriptions row with status 'active'
+      this.db
+        .prepare(`INSERT INTO wait_subscriptions (
+          id, task_id, generation, control_version, contract_version,
+          created_by_attempt_id, kind, github_host, repository_id,
+          repository_name_snapshot, revision_sha, published_ref,
+          required_checks, accepted_conclusions, status, created_at,
+          deadline_at, last_reconciled_at, next_reconcile_at,
+          trigger_evidence_id, continuation_attempt_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, NULL, ?, NULL, NULL)`)
+        .run(
+          subscriptionId,
+          targetTaskId,
+          generation,
+          capturedControlVersion,
+          capturedContractVersion,
+          latestAttemptId,
+          kind,
+          normalizedHost,
+          normalizedRepoId,
+          repoNameSnapshot,
+          normalizedSha,
+          expectedRef,
+          JSON.stringify(validatedRequiredChecks),
+          JSON.stringify(validatedAcceptedConclusions),
+          timestamp,
+          normalizedDeadlineAt,
+          timestamp,
+        );
+
+      this.#appendEvidence({
+        taskId: targetTaskId,
+        attemptId: latestAttemptId,
+        attemptRunId: `${latestAttemptId}:${freshAttempt.number ?? 1}`,
+        kind: "wait_subscription",
+        subject: normalizedSha,
+        payload: {
+          waitSubscriptionId: subscriptionId,
+          taskId: targetTaskId,
+          generation,
+          kind,
+          githubHost: normalizedHost,
+          repositoryId: normalizedRepoId,
+          repositoryNameSnapshot: repoNameSnapshot,
+          revisionSha: normalizedSha,
+          publishedRef: expectedRef,
+          requiredChecks: validatedRequiredChecks,
+          acceptedConclusions: validatedAcceptedConclusions,
+          deadlineAt: normalizedDeadlineAt,
+          createdAt: timestamp,
+        },
+        dedupeKey: `wait_subscription:${targetTaskId}:${generation}:${subscriptionId}`,
+      });
+
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+
+    // After COMMIT: retire live Fresh Executor
+    const active = this.active?.attemptId === latestAttemptId ? this.active : null;
+    if (active) {
+      this.#cancelLocalGate(active);
+    }
+    const workerToRetire = active?.worker ?? attemptRow;
+    const metadataToRetire = active?.workerMetadata ?? workerMetadata(attemptRow);
+
+    let retired = false;
+    try {
+      retired = await this.retireWorker(workerToRetire, metadataToRetire);
+    } catch {
+      retired = false;
+    }
+
+    if (retired) {
+      this.db
+        .prepare("UPDATE attempts SET worker_terminated = 1 WHERE id = ?")
+        .run(latestAttemptId);
+      if (this.active?.attemptId === latestAttemptId) {
+        this.active = null;
+      }
+    } else {
+      // Unproven / unsafe worker retirement fails closed
+      this.markBlocked(
+        targetTaskId,
+        latestAttemptId,
+        "Task wait registration succeeded in DB but Fresh Executor could not be safely retired; executor capacity remains blocked.",
+      );
+      throw Object.assign(
+        new Error("Fresh Executor could not be safely retired when parking Task on wait."),
+        { code: "worker_retirement_unproven" },
+      );
+    }
+
+    const subscriptionRow = this.db
+      .prepare(`${WAIT_SUBSCRIPTION_SELECT} WHERE id = ?`)
+      .get(subscriptionId);
+
+    return {
+      task: this.getTask(targetTaskId),
+      waitSubscription: waitSubscriptionSnapshot(subscriptionRow),
+    };
+  }
+
+  async parkTaskOnWait(options) {
+    return this.registerWaitSubscription(options);
+  }
+
+  async registerWait(options) {
+    return this.registerWaitSubscription(options);
+  }
+
+  getWaitSubscriptions(taskId) {
+    this.open();
+    return this.db
+      .prepare(`${WAIT_SUBSCRIPTION_SELECT} WHERE task_id = ? ORDER BY generation, created_at, id`)
+      .all(taskId)
+      .map(waitSubscriptionSnapshot);
+  }
+
+  getWaitSubscription(id) {
+    this.open();
+    const row = this.db
+      .prepare(`${WAIT_SUBSCRIPTION_SELECT} WHERE id = ?`)
+      .get(id);
+    return waitSubscriptionSnapshot(row);
   }
 
   #insertResultDelivery({
@@ -2316,7 +2897,7 @@ export class RuntimeStore {
       Boolean(
         this.db
           .prepare(
-            `SELECT 1 FROM tasks WHERE state IN ('accepted', 'running', 'blocked') LIMIT 1`,
+            `SELECT 1 FROM tasks WHERE state IN ('accepted', 'running', 'waiting', 'blocked') LIMIT 1`,
           )
           .get(),
       ) ||
@@ -4291,18 +4872,21 @@ export class RuntimeStore {
     try {
       this.db
         .prepare(
-          "UPDATE attempts SET state = 'orphaned', finished_at = ?, terminal_detail = ? WHERE id = ? AND state IN ('starting', 'running', 'failed', 'stopped', 'interrupted')",
+          "UPDATE attempts SET state = 'orphaned', finished_at = ?, terminal_detail = ?, worker_terminated = 0 WHERE id = ? AND state IN ('starting', 'running', 'parked_wait', 'failed', 'stopped', 'interrupted')",
         )
         .run(timestamp, boundedDetail(detail), attemptId);
       this.db
         .prepare(
-          "UPDATE tasks SET state = 'blocked', updated_at = ?, terminal_detail = ?, terminal_reason = ? WHERE id = ? AND state IN ('accepted', 'running', 'failed', 'stopped', 'interrupted')",
+          "UPDATE tasks SET state = 'blocked', updated_at = ?, terminal_detail = ?, terminal_reason = ? WHERE id = ? AND state IN ('accepted', 'running', 'waiting', 'failed', 'stopped', 'interrupted')",
         )
         .run(timestamp, boundedDetail(detail), boundedDetail(detail), taskId);
       this.db
         .prepare(`UPDATE attempt_runs SET state = 'ambiguous', settled_outcome = COALESCE(settled_outcome, ?),
           settled_at = COALESCE(settled_at, ?) WHERE attempt_id = ? AND state IN ('pending', 'accepted')`)
         .run(boundedDetail(detail), timestamp, attemptId);
+      this.db
+        .prepare("UPDATE wait_subscriptions SET status = 'cancelled' WHERE task_id = ? AND status = 'active'")
+        .run(taskId);
       this.db.exec("COMMIT");
     } catch (error) {
       try {
@@ -4324,14 +4908,14 @@ export class RuntimeStore {
     this.open();
     const task = this.getTask(id.trim());
     if (!task) throw new Error(`Task ${id} was not found.`);
-    if (!["accepted", "running"].includes(task.state))
+    if (!["accepted", "running", "waiting"].includes(task.state))
       throw new Error(
         `Task ${id} is already terminal (${task.state}); it is not active.`,
       );
     const attempt = task.attempts.find(
       ({ id: attemptId }) => attemptId === task.latestAttemptId,
     );
-    if (!attempt || !ACTIVE_ATTEMPT_STATES.has(attempt.state))
+    if (!attempt || (!ACTIVE_ATTEMPT_STATES.has(attempt.state) && attempt.state !== "parked_wait"))
       throw new Error(`Task ${id} has no active Attempt to stop.`);
     const worker = attempt;
     const active =
@@ -4340,7 +4924,9 @@ export class RuntimeStore {
     const gateStopped = active
       ? this.#cancelLocalGate(active)
       : this.#reconcileGate(attempt) !== "ambiguous";
-    const stopped = await this.terminateOwnedWorker(worker);
+    const stopped = attempt.state === "parked_wait" && attempt.workerTerminated
+      ? true
+      : await this.terminateOwnedWorker(worker);
     if (!stopped || !gateStopped) {
       const detail = !gateStopped
         ? `Task ${id} local gate could not be safely terminated; ownership or group liveness was not proven.`
@@ -4355,7 +4941,7 @@ export class RuntimeStore {
     try {
       const taskUpdate = this.db
         .prepare(
-          "UPDATE tasks SET state = 'stopped', terminal_detail = ?, terminal_reason = ?, updated_at = ? WHERE id = ? AND state IN ('accepted', 'running')",
+          "UPDATE tasks SET state = 'stopped', terminal_detail = ?, terminal_reason = ?, updated_at = ? WHERE id = ? AND state IN ('accepted', 'running', 'waiting')",
         )
         .run(
           "The Task was intentionally stopped by the user.",
@@ -4366,7 +4952,7 @@ export class RuntimeStore {
       if (taskUpdate.changes === 1) {
         const attemptUpdate = this.db
           .prepare(
-            "UPDATE attempts SET state = 'stopped', finished_at = ?, worker_terminated = 1, terminal_detail = ? WHERE id = ? AND state IN ('starting', 'running') AND gate_terminated = 1",
+            "UPDATE attempts SET state = 'stopped', finished_at = ?, worker_terminated = 1, terminal_detail = ? WHERE id = ? AND state IN ('starting', 'running', 'parked_wait') AND gate_terminated = 1",
           )
           .run(
             timestamp,
@@ -4383,6 +4969,9 @@ export class RuntimeStore {
             timestamp,
             attempt.id,
           );
+        this.db
+          .prepare("UPDATE wait_subscriptions SET status = 'cancelled' WHERE task_id = ? AND status = 'active'")
+          .run(task.id);
         const resultId = this.#insertResultDelivery({
           task: this.#taskRow(task.id),
           outcome: "cancelled",
