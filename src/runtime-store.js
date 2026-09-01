@@ -192,6 +192,33 @@ function attemptRunLimit(task) {
   return Math.min(configured, MAX_ATTEMPT_RUNS_PER_ATTEMPT);
 }
 
+function continuationAcknowledgementStatus(acknowledgement) {
+  if (acknowledgement === false) return "rejected";
+  if (
+    !acknowledgement ||
+    typeof acknowledgement !== "object" ||
+    Array.isArray(acknowledgement)
+  )
+    return "ambiguous";
+  const accepted =
+    acknowledgement.accepted === true || acknowledgement.success === true;
+  const rejected =
+    acknowledgement.accepted === false || acknowledgement.success === false;
+  if (accepted && !rejected) return "accepted";
+  if (rejected && !accepted) return "rejected";
+  return "ambiguous";
+}
+
+function continuationBoundary(acknowledgement) {
+  for (const key of ["promptGeneration", "attemptRunSequence", "runSequence"]) {
+    if (Object.hasOwn(acknowledgement, key)) {
+      const value = Number(acknowledgement[key]);
+      return Number.isInteger(value) ? value : NaN;
+    }
+  }
+  return null;
+}
+
 function defaultCompletionContract(goal) {
   return { objective: goal };
 }
@@ -2446,24 +2473,42 @@ export class RuntimeStore {
       )
         throw new Error("Fresh Executor process/model identity changed.");
     }
+    if (typeof active.sessionId !== "string" || active.sessionId.length === 0)
+      throw new Error("Fresh Executor session identity is unavailable; reuse is refused.");
+    if (active.worker.sessionIdentityChanged === true)
+      throw new Error("Fresh Executor session identity changed.");
+    const capturedSnapshot = active.executionSnapshot;
     const currentSnapshot = active.worker.executionSnapshot;
     if (
-      active.executionSnapshot &&
-      currentSnapshot &&
-      !snapshotsEqual(
-        { ...active.executionSnapshot, sessionId: undefined },
-        { ...currentSnapshot, sessionId: undefined },
-      )
+      !capturedSnapshot ||
+      typeof capturedSnapshot !== "object" ||
+      Array.isArray(capturedSnapshot) ||
+      !currentSnapshot ||
+      typeof currentSnapshot !== "object" ||
+      Array.isArray(currentSnapshot)
     )
-      throw new Error("Fresh Executor capability/environment snapshot changed.");
-    const currentSessionId =
-      active.worker.sessionId ?? active.worker.executionSnapshot?.sessionId;
+      throw new Error("Fresh Executor session/capability snapshot is unavailable; reuse is refused.");
     if (
-      active.sessionId &&
-      currentSessionId !== undefined &&
+      typeof capturedSnapshot.sessionId !== "string" ||
+      capturedSnapshot.sessionId.length === 0 ||
+      typeof currentSnapshot.sessionId !== "string" ||
+      currentSnapshot.sessionId.length === 0
+    )
+      throw new Error("Fresh Executor session identity snapshot is unavailable; reuse is refused.");
+    if (
+      capturedSnapshot.sessionId !== active.sessionId ||
+      currentSnapshot.sessionId !== active.sessionId
+    )
+      throw new Error("Fresh Executor session identity changed.");
+    const currentSessionId = active.worker.sessionId ?? currentSnapshot.sessionId;
+    if (
+      typeof currentSessionId !== "string" ||
+      currentSessionId.length === 0 ||
       currentSessionId !== active.sessionId
     )
       throw new Error("Fresh Executor session identity changed.");
+    if (!snapshotsEqual(capturedSnapshot, currentSnapshot))
+      throw new Error("Fresh Executor capability/environment snapshot changed.");
   }
 
   #assertContinuationSafe(active, options) {
@@ -2537,7 +2582,10 @@ export class RuntimeStore {
       requestedWorktree !== task.taskWorktree
     )
       throw new Error("Task worktree/environment identity changed.");
-    const nextSequence = Number(current.run.sequence) + 1;
+    const latestRun = this.db
+      .prepare("SELECT MAX(sequence) AS sequence FROM attempt_runs WHERE attempt_id = ?")
+      .get(active.attemptId);
+    const nextSequence = Number(latestRun?.sequence ?? current.run.sequence) + 1;
     if (nextSequence > attemptRunLimit(task))
       throw new Error("Fresh Executor Attempt run budget is exhausted.");
     if (typeof options.prompt !== "string" || !options.prompt.trim())
@@ -2554,7 +2602,10 @@ export class RuntimeStore {
     this.db.exec("BEGIN");
     try {
       const current = this.#supervisorState(active);
-      if (!current || Number(current.run.sequence) + 1 !== sequence)
+      const latestRun = this.db
+        .prepare("SELECT MAX(sequence) AS sequence FROM attempt_runs WHERE attempt_id = ?")
+        .get(active.attemptId);
+      if (!current || Number(latestRun?.sequence ?? 0) + 1 !== sequence)
         throw new Error("Fresh Executor Attempt changed before continuation allocation.");
       this.db
         .prepare(`INSERT INTO attempt_runs (
@@ -2578,7 +2629,6 @@ export class RuntimeStore {
     }
     active.previousRun = {
       runSequence: active.runSequence,
-      eventGeneration: active.eventGeneration,
       finalAssistant: active.finalAssistant,
       settled: active.settled,
       awaitingAgentStart: active.awaitingAgentStart,
@@ -2586,7 +2636,6 @@ export class RuntimeStore {
       runSettled: active.runSettled,
     };
     active.runSequence = sequence;
-    active.pendingEventGeneration = sequence;
     active.runPromptInFlight = true;
     active.runAccepted = false;
     active.runSettled = false;
@@ -2596,7 +2645,7 @@ export class RuntimeStore {
     active.pendingEvents = [];
   }
 
-  #acceptContinuationRun(active, sequence, promptGeneration) {
+  #acceptContinuationRun(active, sequence) {
     this.db.exec("BEGIN");
     try {
       const result = this.db
@@ -2627,8 +2676,6 @@ export class RuntimeStore {
       } catch {}
       throw error;
     }
-    active.eventGeneration = promptGeneration;
-    active.pendingEventGeneration = null;
     active.runPromptInFlight = false;
     active.runAccepted = true;
     // The acknowledgement only proves prompt acceptance. Ordinary Pi events
@@ -2642,8 +2689,6 @@ export class RuntimeStore {
     const previous = active.previousRun;
     if (!previous) return;
     active.runSequence = previous.runSequence;
-    active.eventGeneration = previous.eventGeneration;
-    active.pendingEventGeneration = null;
     active.finalAssistant = previous.finalAssistant;
     active.settled = previous.settled;
     active.awaitingAgentStart = previous.awaitingAgentStart;
@@ -2751,11 +2796,17 @@ export class RuntimeStore {
       throw new Error("Fresh Executor Attempt is not eligible for a continuation prompt.");
     this.open();
     const prompt = options.prompt ?? options.message;
-    const { nextSequence } = this.#assertContinuationSafe(active, {
+    const { task, nextSequence } = this.#assertContinuationSafe(active, {
       ...options,
       prompt,
     });
     this.#allocateContinuationRun(active, prompt, nextSequence);
+    try {
+      this.#currentWorkerIsSafe(active, task);
+    } catch (error) {
+      this.#abortContinuationRun(active, error.message);
+      throw error;
+    }
     let acknowledgement;
     try {
       acknowledgement = await active.worker.prompt(prompt);
@@ -2767,12 +2818,9 @@ export class RuntimeStore {
       }
       throw error;
     }
-    const acknowledged =
-      acknowledgement == null ||
-      acknowledgement === true ||
-      acknowledgement.accepted === true ||
-      acknowledgement.success === true;
-    if (!acknowledged) {
+    const acknowledgementStatus =
+      continuationAcknowledgementStatus(acknowledgement);
+    if (acknowledgementStatus === "rejected") {
       const rejection = Object.assign(
         new Error("Fresh Executor rejected the continuation prompt."),
         { code: "PROMPT_REJECTED", phase: "prompt" },
@@ -2780,16 +2828,26 @@ export class RuntimeStore {
       this.#abortContinuationRun(active, rejection.message);
       throw rejection;
     }
-    const promptGeneration = Number(
-      acknowledgement?.promptGeneration ?? active.pendingEventGeneration,
-    );
-    if (!Number.isInteger(promptGeneration) || promptGeneration !== nextSequence) {
+    if (acknowledgementStatus !== "accepted") {
+      const ambiguous = new Error(
+        "Fresh Executor continuation prompt acknowledgement was not explicit; transmission outcome is ambiguous and will not be replayed.",
+      );
+      ambiguous.code = "PROMPT_ACKNOWLEDGEMENT_AMBIGUOUS";
+      ambiguous.phase = "prompt";
+      await this.#handleAmbiguousContinuation(active, ambiguous);
+      throw ambiguous;
+    }
+    const promptBoundary = continuationBoundary(acknowledgement);
+    if (
+      promptBoundary !== null &&
+      (!Number.isInteger(promptBoundary) || promptBoundary !== nextSequence)
+    ) {
       const mismatch = new Error("Fresh Executor prompt acknowledgement was not correlated to the allocated AttemptRun.");
       mismatch.code = "RPC_CORRELATION_FAILED";
       await this.#handleAmbiguousContinuation(active, mismatch);
       throw mismatch;
     }
-    if (!this.#acceptContinuationRun(active, nextSequence, promptGeneration)) {
+    if (!this.#acceptContinuationRun(active, nextSequence)) {
       const stale = new Error("Fresh Executor continuation acknowledgement arrived after the Attempt versions changed.");
       stale.code = "STALE_ATTEMPT";
       await this.#handleAmbiguousContinuation(active, stale);

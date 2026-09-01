@@ -60,7 +60,7 @@ process.stdin.on("data", (chunk) => {
     } else if (request.type === "set_thinking_level") {
       send({ type: "response", command: request.type, success: true, id: request.id });
     } else if (request.type === "get_state") {
-      send({ type: "response", command: request.type, success: true, id: request.id, data: { model: { provider: "provider", id: "model" }, thinkingLevel: "high" } });
+      send({ type: "response", command: request.type, success: true, id: request.id, data: { model: { provider: "provider", id: "model" }, thinkingLevel: "high", sessionId: "session-1" } });
     } else if (request.type === "prompt") {
       promptNumber += 1;
       const currentPrompt = promptNumber;
@@ -261,7 +261,7 @@ test("Fresh Executor closes an unacknowledged re-prompt without replaying the mu
 
 test("Fresh Executor times out an unacknowledged re-prompt without replaying it", async () => {
   await withFreshExecutor(async ({ cwd, fake, setHandle }) => {
-    const handle = await startFake(fake, cwd, { ackGates: { "2": join(cwd, "never") } }, { timeoutMs: 40 });
+    const handle = await startFake(fake, cwd, { ackGates: { "2": join(cwd, "never") } }, { timeoutMs: 250 });
     setHandle(handle);
     const events = [];
     handle.onEvent((event) => events.push(event));
@@ -290,7 +290,11 @@ test("RuntimeStore allocates and settles a second AttemptRun on the same healthy
     prompt(message) {
       prompts.push(message);
       return new Promise((resolvePromptResult) => {
-        resolvePrompt = () => resolvePromptResult({ accepted: true, promptGeneration: 2 });
+        resolvePrompt = () => {
+          emit({ type: "message_end", message: { role: "assistant", content: "buffered stale run 1", stopReason: "stop" } }, { promptAcknowledged: true });
+          emit({ type: "agent_settled", promptNumber: 1 }, { promptAcknowledged: true });
+          resolvePromptResult({ accepted: true });
+        };
       });
     },
     close() {},
@@ -301,8 +305,8 @@ test("RuntimeStore allocates and settles a second AttemptRun on the same healthy
     worktreeRoot: join(parent, "worktrees"),
     workerFactory: async ({ onEvent }) => {
       emit = onEvent;
-      onEvent({ type: "message_end", message: { role: "assistant", content: "run 1", stopReason: "stop" } }, { promptGeneration: 1, promptAcknowledged: true });
-      onEvent({ type: "agent_settled", promptNumber: 1 }, { promptGeneration: 1, promptAcknowledged: true });
+      onEvent({ type: "message_end", message: { role: "assistant", content: "run 1", stopReason: "stop" } });
+      onEvent({ type: "agent_settled", promptNumber: 1 });
       return worker;
     },
   });
@@ -319,12 +323,14 @@ test("RuntimeStore allocates and settles a second AttemptRun on the same healthy
     assert.equal(accepted.attempts.length, 1);
     assert.equal(accepted.attempts[0].attemptRuns[1].state, "accepted");
 
-    emit({ type: "message_end", message: { role: "assistant", content: "stale run 1", stopReason: "stop" } }, { promptGeneration: 1, promptAcknowledged: true });
-    emit({ type: "agent_settled", promptNumber: 1 }, { promptGeneration: 1, promptAcknowledged: true });
+    emit({ type: "message_end", message: { role: "assistant", content: "stale run 1", stopReason: "stop" } });
+    emit({ type: "agent_settled", promptNumber: 1 });
     assert.equal(runtime.getTask(started.id).attempts[0].attemptRuns[1].state, "accepted");
 
-    emit({ type: "message_end", message: { role: "assistant", content: "run 2", stopReason: "stop" } }, { promptGeneration: 2, promptAcknowledged: true });
-    emit({ type: "agent_settled", promptNumber: 2 }, { promptGeneration: 2, promptAcknowledged: true });
+    emit({ type: "agent_start" });
+    assert.equal(runtime.getTask(started.id).attempts[0].attemptRuns[1].state, "accepted");
+    emit({ type: "message_end", message: { role: "assistant", content: "run 2", stopReason: "stop" } });
+    emit({ type: "agent_settled", promptNumber: 2 });
     const settled = await eventually(() => runtime.getTask(started.id), (task) => task.attempts[0].attemptRuns[1].state === "settled");
     assert.equal(settled.attempts[0].attemptRuns[1].settledOutcome, "run 2");
     assert.equal(settled.attempts[0].attemptRuns[1].sequence, 2);
@@ -341,6 +347,7 @@ test("RuntimeStore keeps a delayed continuation pending and known rejection does
   const piCommand = await versionCommand(parent);
   let emit;
   let rejectPrompt;
+  let promptCalls = 0;
   const runtime = new RuntimeStore({
     dbPath: join(parent, "runtime.sqlite"),
     piCommand,
@@ -351,7 +358,10 @@ test("RuntimeStore keeps a delayed continuation pending and known rejection does
       onEvent({ type: "agent_settled" });
       return {
         callbacksAttached: true,
+        executionSnapshot: { sessionId: "session-1" },
         prompt() {
+          promptCalls += 1;
+          if (promptCalls > 1) return { accepted: true };
           return new Promise((_, reject) => {
             rejectPrompt = () => reject(new FreshExecutorError("rejected", { code: "PROMPT_REJECTED", phase: "prompt" }));
           });
@@ -372,6 +382,18 @@ test("RuntimeStore keeps a delayed continuation pending and known rejection does
     assert.equal(rejected.attempts[0].attemptRuns.length, 2);
     assert.equal(rejected.attempts[0].attemptRuns[1].state, "aborted");
     assert.equal(rejected.attempts[0].attemptRuns[0].state, "settled");
+
+    const resumed = await runtime.continueAttempt({ id: started.id, prompt: "after rejection" });
+    assert.equal(resumed.attempts[0].attemptRuns[1].state, "aborted");
+    assert.equal(resumed.attempts[0].attemptRuns[2].state, "accepted");
+    emit({ type: "agent_start" });
+    emit({ type: "message_end", message: { role: "assistant", content: "run after rejection", stopReason: "stop" } });
+    emit({ type: "agent_settled" });
+    const resumedSettled = await eventually(
+      () => runtime.getTask(started.id),
+      (task) => task.attempts[0].attemptRuns[2]?.state === "settled",
+    );
+    assert.equal(resumedSettled.attempts[0].attemptRuns[2].settledOutcome, "run after rejection");
     void emit;
   } finally {
     runtime.close();
@@ -396,6 +418,7 @@ test("RuntimeStore marks transmitted continuation ambiguity and never replays it
       onEvent({ type: "agent_settled" });
       return {
         callbacksAttached: true,
+        executionSnapshot: { sessionId: "session-1" },
         prompt() {
           promptCount += 1;
           return new Promise((_, reject) => {
@@ -426,6 +449,102 @@ test("RuntimeStore marks transmitted continuation ambiguity and never replays it
   }
 });
 
+test("RuntimeStore treats an implicit continuation acknowledgement as transmitted ambiguity", async () => {
+  for (const [name, acknowledgement] of [
+    ["null", null],
+    ["undefined", undefined],
+    ["boolean", true],
+  ]) {
+    const parent = await mkdtemp(join(tmpdir(), `pi-sand-v04-reprompt-ack-${name}-`));
+    const source = repository(parent);
+    const piCommand = await versionCommand(parent);
+    let prompts = 0;
+    const runtime = new RuntimeStore({
+      dbPath: join(parent, "runtime.sqlite"),
+      piCommand,
+      worktreeRoot: join(parent, "worktrees"),
+      workerFactory: async ({ onEvent }) => {
+        onEvent({ type: "message_end", message: { role: "assistant", content: "run 1", stopReason: "stop" } });
+        onEvent({ type: "agent_settled" });
+        return {
+          callbacksAttached: true,
+          executionSnapshot: { sessionId: "session-1" },
+          prompt() {
+            prompts += 1;
+            return acknowledgement;
+          },
+          close() {},
+        };
+      },
+    });
+    try {
+      const started = await runtime.createTask(taskOptions(source, piCommand));
+      await eventually(() => runtime.getTask(started.id), (task) => task.attempts[0].attemptRuns[0].state === "settled");
+      await assert.rejects(
+        runtime.continueAttempt({ id: started.id, prompt: "implicit acknowledgement" }),
+        (error) => error.code === "PROMPT_ACKNOWLEDGEMENT_AMBIGUOUS",
+      );
+      const ambiguous = runtime.getTask(started.id);
+      assert.equal(ambiguous.state, "failed");
+      assert.equal(ambiguous.attempts[0].attemptRuns[1].state, "ambiguous");
+      assert.equal(prompts, 1);
+    } finally {
+      runtime.close();
+      await rm(parent, { recursive: true, force: true });
+    }
+  }
+});
+
+test("RuntimeStore refuses continuation without a stable captured/current session snapshot", async () => {
+  for (const scenario of ["missing", "changed"]) {
+    const parent = await mkdtemp(join(tmpdir(), `pi-sand-v04-reprompt-session-${scenario}-`));
+    const source = repository(parent);
+    const piCommand = await versionCommand(parent);
+    let worker;
+    let prompts = 0;
+    const runtime = new RuntimeStore({
+      dbPath: join(parent, "runtime.sqlite"),
+      piCommand,
+      worktreeRoot: join(parent, "worktrees"),
+      workerFactory: async ({ onEvent }) => {
+        onEvent({ type: "message_end", message: { role: "assistant", content: "run 1", stopReason: "stop" } });
+        onEvent({ type: "agent_settled" });
+        worker = {
+          callbacksAttached: true,
+          executionSnapshot:
+            scenario === "missing"
+              ? { capability: "fixed" }
+              : { sessionId: "session-1", capability: "fixed" },
+          prompt() {
+            prompts += 1;
+            return { accepted: true };
+          },
+          close() {},
+        };
+        return worker;
+      },
+    });
+    try {
+      const started = await runtime.createTask(taskOptions(source, piCommand));
+      await eventually(() => runtime.getTask(started.id), (task) => task.attempts[0].attemptRuns[0].state === "settled");
+      if (scenario === "changed")
+        worker.executionSnapshot = { sessionId: "session-2", capability: "fixed" };
+      await assert.rejects(
+        runtime.continueAttempt({ id: started.id, prompt: "blocked" }),
+        scenario === "missing"
+          ? /session identity.*unavailable/i
+          : /session identity changed/i,
+      );
+      const refused = runtime.getTask(started.id);
+      assert.equal(refused.attempts[0].attemptRuns.length, 1);
+      assert.equal(prompts, 0);
+    } finally {
+      runtime.close();
+      await rm(parent, { recursive: true, force: true });
+    }
+  }
+});
+
 test("RuntimeStore refuses continuation after the frozen capability snapshot changes", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-reprompt-capability-"));
   const source = repository(parent);
@@ -441,7 +560,7 @@ test("RuntimeStore refuses continuation after the frozen capability snapshot cha
       onEvent({ type: "agent_settled" });
       worker = {
         callbacksAttached: true,
-        executionSnapshot: { capability: "fixed" },
+        executionSnapshot: { sessionId: "session-1", capability: "fixed" },
         prompt() {
           prompts += 1;
           return { accepted: true };
@@ -454,7 +573,7 @@ test("RuntimeStore refuses continuation after the frozen capability snapshot cha
   try {
     const started = await runtime.createTask(taskOptions(source, piCommand));
     await eventually(() => runtime.getTask(started.id), (task) => task.attempts[0].attemptRuns[0].state === "settled");
-    worker.executionSnapshot = { capability: "changed" };
+    worker.executionSnapshot = { sessionId: "session-1", capability: "changed" };
     await assert.rejects(runtime.continueAttempt({ id: started.id, prompt: "blocked" }), /capability\/environment snapshot changed/i);
     assert.equal(runtime.getTask(started.id).attempts[0].attemptRuns.length, 1);
     assert.equal(prompts, 0);
@@ -484,7 +603,12 @@ test("RuntimeStore refuses continuation on a version or model mismatch before al
         emit = onEvent;
         onEvent({ type: "message_end", message: { role: "assistant", content: "run 1", stopReason: "stop" } });
         onEvent({ type: "agent_settled" });
-        return { callbacksAttached: true, prompt() { prompts += 1; }, close() {} };
+        return {
+          callbacksAttached: true,
+          executionSnapshot: { sessionId: "session-1" },
+          prompt() { prompts += 1; },
+          close() {},
+        };
       },
     });
     try {
