@@ -931,11 +931,15 @@ export function matchCheckRun(selector, checkRun) {
   return false;
 }
 
-export function matchCommitStatus(selector, status) {
+export function matchCommitStatus(selector, status, revisionSha) {
   if (
     typeof selector !== "string" ||
     !selector.startsWith("commit_status:") ||
-    !status
+    !status ||
+    typeof revisionSha !== "string" ||
+    typeof status.sha !== "string" ||
+    status.sha.length !== revisionSha.length ||
+    status.sha.toLowerCase() !== revisionSha.toLowerCase()
   )
     return false;
   const targetContext = selector.slice("commit_status:".length).trim();
@@ -2651,6 +2655,100 @@ export class RuntimeStore {
     );
   }
 
+  #reconcileRetiredWaitRegistrationFailure(taskId, attemptId, error) {
+    const detail = boundedDetail(
+      `Wait registration failed after the Fresh Executor was retired: ${commandError(error)} The Attempt was safely interrupted.`,
+    );
+    const timestamp = now();
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#taskRow(taskId);
+      const attempt = this.db
+        .prepare(`${ATTEMPT_SELECT} WHERE id = ? AND task_id = ?`)
+        .get(attemptId, taskId);
+
+      if (attempt) {
+        // Retirement already proved this exact worker gone. Only fence the
+        // durable bit; retain PID/PGID/start/boot identity for the audit trail.
+        this.db
+          .prepare("UPDATE attempts SET worker_terminated = 1 WHERE id = ? AND task_id = ?")
+          .run(attemptId, taskId);
+      }
+
+      let taskInterrupted = false;
+      if (
+        task &&
+        task.latestAttemptId === attemptId &&
+        ["accepted", "running", "waiting"].includes(task.state)
+      ) {
+        const taskUpdate = this.db
+          .prepare(`UPDATE tasks SET state = 'interrupted', updated_at = ?,
+            final_result = NULL, final_branch_head = COALESCE(final_branch_head, ?),
+            final_revision = COALESCE(final_revision, ?), terminal_detail = ?,
+            terminal_reason = ? WHERE id = ? AND latest_attempt_id = ?
+            AND state IN ('accepted', 'running', 'waiting')`)
+          .run(
+            timestamp,
+            attempt?.finalBranchHead ?? task.finalBranchHead ?? null,
+            task.finalRevision ?? attempt?.finalBranchHead ?? null,
+            detail,
+            "wait_registration_interrupted",
+            taskId,
+            attemptId,
+          );
+        taskInterrupted = taskUpdate.changes === 1;
+
+        if (attempt) {
+          this.db
+            .prepare(`UPDATE attempts SET state = CASE
+                WHEN state IN ('starting', 'running', 'parked_wait') THEN 'interrupted'
+                ELSE state END,
+              finished_at = CASE
+                WHEN state IN ('starting', 'running', 'parked_wait') THEN COALESCE(finished_at, ?)
+                ELSE finished_at END,
+              terminal_detail = CASE
+                WHEN state IN ('starting', 'running', 'parked_wait') THEN ?
+                ELSE terminal_detail END,
+              worker_terminated = 1 WHERE id = ? AND task_id = ?`)
+            .run(timestamp, detail, attemptId, taskId);
+        }
+      }
+
+      if (taskInterrupted) {
+        this.db
+          .prepare(`UPDATE attempt_runs SET state = 'aborted',
+            settled_outcome = COALESCE(settled_outcome, ?),
+            settled_at = COALESCE(settled_at, ?) WHERE attempt_id = ?
+            AND state IN ('pending', 'accepted')`)
+          .run(detail, timestamp, attemptId);
+        this.db
+          .prepare("UPDATE wait_subscriptions SET status = 'cancelled' WHERE task_id = ? AND status = 'active'")
+          .run(taskId);
+        const currentTask = this.#taskRow(taskId);
+        const resultId = this.#insertResultDelivery({
+          task: currentTask,
+          outcome: "failed",
+          finalResult: null,
+          terminalDetail: detail,
+          terminalReason: "wait_registration_interrupted",
+          finalRevision: currentTask?.finalRevision ?? null,
+          finalBranchHead: currentTask?.finalBranchHead ?? null,
+        });
+        if (!resultId)
+          throw new Error("Interrupted Task did not produce a Result delivery.");
+      }
+
+      this.db.exec("COMMIT");
+      return true;
+    } catch (reconciliationError) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      throw reconciliationError;
+    }
+  }
+
   async registerWaitSubscription({
     id,
     taskId,
@@ -2963,8 +3061,8 @@ export class RuntimeStore {
     }
 
     let generation;
-    this.db.exec("BEGIN IMMEDIATE");
     try {
+      this.db.exec("BEGIN IMMEDIATE");
       const freshTask = this.#taskRow(targetTaskId);
       if (
         !freshTask ||
@@ -3084,6 +3182,22 @@ export class RuntimeStore {
       try {
         this.db.exec("ROLLBACK");
       } catch {}
+      if (workerRetired) {
+        try {
+          const reconciled = this.#reconcileRetiredWaitRegistrationFailure(
+            targetTaskId,
+            latestAttemptId,
+            error,
+          );
+          if (reconciled && this.active?.attemptId === latestAttemptId)
+            this.active = null;
+        } catch (reconciliationError) {
+          throw new Error(
+            `Wait registration failed after worker retirement and could not durably reconcile: ${commandError(reconciliationError)}`,
+            { cause: error },
+          );
+        }
+      }
       throw error;
     }
 
@@ -3416,7 +3530,7 @@ export class RuntimeStore {
         }
       } else if (selector.startsWith("commit_status:")) {
         const matching = commitStatuses.filter((st) =>
-          matchCommitStatus(selector, st),
+          matchCommitStatus(selector, st, subscription.revisionSha),
         );
         if (matching.length > 0) {
           matching.sort((a, b) => {

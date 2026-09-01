@@ -309,6 +309,55 @@ test("due reactor persists exact ci_not_observable control evidence and terminal
   }
 });
 
+test("retirement/version barrier reconciles a dead worker without a running Task or false wait", async () => {
+  const value = await fixture();
+  try {
+    const waiting = await eventually(
+      () => value.runtime.getTask(value.task.id),
+      (task) => task.state === "waiting",
+    );
+    const candidate = waiting.finalRevision;
+    const retireWorker = value.runtime.retireWorker.bind(value.runtime);
+    value.runtime.retireWorker = async (...args) => {
+      const retired = await retireWorker(...args);
+      if (retired) {
+        value.runtime.db
+          .prepare("UPDATE tasks SET control_version = control_version + 1 WHERE id = ?")
+          .run(value.task.id);
+      }
+      return retired;
+    };
+
+    await assert.rejects(
+      () => value.runtime.registerWaitSubscription({
+        taskId: value.task.id,
+        revisionSha: candidate,
+        requiredChecks: ["check_run:github-actions/ci", "commit_status:build"],
+      }),
+      (error) => error.code === "stale_wait_registration",
+    );
+
+    const reconciled = value.runtime.getTask(value.task.id);
+    assert.equal(reconciled.state, "interrupted");
+    assert.equal(reconciled.attempts[0].state, "interrupted");
+    assert.equal(reconciled.attempts[0].workerTerminated, true);
+    assert.equal(value.runtime.active, null);
+    assert.equal(
+      reconciled.waitSubscriptions.filter((subscription) => subscription.status === "active").length,
+      0,
+    );
+    assert.equal(value.runtime.hasCapacityConflict(), false);
+    assert.equal(
+      value.runtime.db
+        .prepare("SELECT COUNT(*) AS count FROM result_deliveries WHERE task_id = ? AND outcome = 'failed'")
+        .get(value.task.id).count,
+      1,
+    );
+  } finally {
+    await closeFixture(value);
+  }
+});
+
 test("wait registration rejects selector, conclusion, repository, and host retargeting", async () => {
   const value = await fixture();
   try {

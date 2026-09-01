@@ -344,6 +344,55 @@ test("2. wrong SHA is green but R pending -> R remains pending", async () => {
   }
 });
 
+test("2a. commit status with missing or mismatched SHA stays pending and cannot trigger", async () => {
+  const value = await fixture({
+    completionContract: {
+      objective: "reconcile task on CI wait",
+      requiredChecks: ["commit_status:build"],
+    },
+  });
+  try {
+    const candidateR = await commitCandidate(
+      value.task.taskWorktree,
+      "app.js",
+      "console.log('test2a');\n",
+      "feat: app",
+    );
+    await value.runtime.publishTask({ id: value.task.id, candidateSha: candidateR });
+    const registered = await value.runtime.registerWaitSubscription({
+      taskId: value.task.id,
+      revisionSha: candidateR,
+      requiredChecks: ["commit_status:build"],
+    });
+
+    const wrongSha = "0123456789abcdef0123456789abcdef01234567";
+    value.gitHubAdapter.setHooks({
+      checkRunsHook: async () => [],
+      commitStatusesHook: async () => [
+        { id: 2003, context: "build", state: "success", sha: wrongSha },
+        { id: 2004, context: "build", state: "success" },
+      ],
+    });
+
+    const results = await value.runtime.startWaitReactor({
+      observer: value.gitHubAdapter,
+    });
+    assert.equal(results[0].classification, "pending");
+    assert.equal(results[0].triggered, undefined);
+    assert.equal(value.runtime.getTask(value.task.id).state, "waiting");
+    assert.equal(value.runtime.getWaitSubscription(registered.waitSubscription.id).status, "active");
+    assert.equal(
+      value.runtime.getTask(value.task.id).evidence.filter(
+        (e) => e.kind === "github_status_observation",
+      ).length,
+      0,
+    );
+  } finally {
+    value.runtime.stopWaitReactor();
+    await closeFixture(value);
+  }
+});
+
 test("3. one required selector missing -> pending", async () => {
   const value = await fixture({
     completionContract: {
