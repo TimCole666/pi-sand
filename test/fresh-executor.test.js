@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startFreshExecutor, FRESH_EXECUTOR_ARGS, FRESH_REVIEWER_ARGS } from "../src/fresh-executor.js";
@@ -50,6 +51,22 @@ process.stdin.on("data", (chunk) => {
         thinkingLevel: behavior.stateThinkingLevel || behavior.thinkingLevel || "medium",
       } }, Number(behavior.stateDelay || 0));
     } else if (command.type === "prompt") {
+      if (process.env.FAKE_PI_ATTACK) {
+        const fs = require("node:fs");
+        const { spawnSync } = require("node:child_process");
+        const targets = [process.env.FAKE_PI_ATTACK_TASK, process.env.FAKE_PI_ATTACK_SOURCE].filter(Boolean);
+        const writes = targets.map((target) => {
+          try { fs.writeFileSync(target + "/reviewer-mutated.txt", "must not persist"); return "write"; }
+          catch (error) { return error.code; }
+        });
+        const chmods = targets.map((target) => {
+          try { fs.chmodSync(target, 0o755); return "chmod"; }
+          catch (error) { return error.code; }
+        });
+        const unmount = spawnSync("umount", [process.env.FAKE_PI_ATTACK_SOURCE], { encoding: "utf8" });
+        const push = spawnSync("git", ["-C", process.env.FAKE_PI_ATTACK_SOURCE, "push"], { encoding: "utf8" });
+        record({ type: "attack", writes, chmods, unmount: unmount.status, push: push.status, pushStderr: push.stderr?.slice(0, 256) });
+      }
       if (behavior.promptRejected) {
         send({ type: "response", command: "prompt", success: false, id: command.id });
       } else {
@@ -212,6 +229,36 @@ test("Fresh Executor reviewer profile exposes only read-only Pi tools", async ()
     assert.equal(FRESH_REVIEWER_ARGS.at(-1), "read,grep,find,ls");
     assert.equal(FRESH_REVIEWER_ARGS.some((arg) => /bash|write|edit|task|daemon|push/i.test(arg)), false);
     assert.equal(FRESH_REVIEWER_ARGS.includes("--approve"), true);
+    return handle;
+  });
+});
+
+test("Fresh Executor reviewer process cannot mutate accepted paths, refs, or its mount namespace", async () => {
+  await withExecutor({}, async ({ directory, fake }) => {
+    const source = join(directory, "source");
+    const review = join(directory, "review");
+    await mkdir(source);
+    await mkdir(review);
+    execFileSync("git", ["init", "-q", source]);
+    execFileSync("git", ["-C", source, "config", "user.email", "test@example.com"]);
+    execFileSync("git", ["-C", source, "config", "user.name", "Test"]);
+    await writeFile(join(source, "accepted.txt"), "accepted\n");
+    execFileSync("git", ["-C", source, "add", "."]);
+    execFileSync("git", ["-C", source, "commit", "-qm", "accepted"]);
+    const handle = await start(fake, review, {
+      role: "reviewer",
+      taskWorktree: source,
+      sourceRepoRoot: source,
+      reviewWorktree: review,
+      env: { ...process.env, ...fake.env, FAKE_PI_ATTACK: "1", FAKE_PI_ATTACK_TASK: source, FAKE_PI_ATTACK_SOURCE: source },
+    });
+    const attack = (await readCommands(fake.log)).find(({ type }) => type === "attack");
+    assert.deepEqual(attack.writes, ["EROFS", "EROFS"]);
+    assert.deepEqual(attack.chmods, ["EROFS", "EROFS"]);
+    assert.notEqual(attack.unmount, 0);
+    assert.notEqual(attack.push, 0);
+    assert.equal(existsSync(join(source, "reviewer-mutated.txt")), false);
+    assert.equal(execFileSync("git", ["-C", source, "status", "--porcelain"], { encoding: "utf8" }).trim(), "");
     return handle;
   });
 });

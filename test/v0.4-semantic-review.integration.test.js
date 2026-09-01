@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -34,11 +35,6 @@ async function fixture({ completionContract, reviewerFactory, workerFactory, bud
     calls.push({ role, cwd, taskPrompt });
     if (role === "reviewer") {
       calls.at(-1).candidateAtStart = git(cwd, ["rev-parse", "HEAD"]);
-      await assert.rejects(
-        writeFile(join(cwd, "reviewer-only.txt"), "isolated\n"),
-        /EACCES|permission denied/i,
-        "the reviewer view must reject filesystem mutation",
-      );
       onEvent({ type: "message_end", message: { role: "assistant", content: JSON.stringify({ candidateSha: calls.at(-1).candidateAtStart, verdicts: [{ criterion: "semantic criterion", verdict: "pass", evidenceRefs: ["deterministic-gates"] }], findings: [{ severity: "info", detail: "No semantic discrepancies found.", evidenceRefs: ["deterministic-gates"] }], uncertainty: "", recommendation: "accept" }), stopReason: "stop" } });
     } else {
       await writeFile(join(cwd, "candidate.txt"), "candidate\n");
@@ -47,9 +43,11 @@ async function fixture({ completionContract, reviewerFactory, workerFactory, bud
     onEvent({ type: "agent_settled" });
     return { callbacksAttached: true, executionSnapshot: { sessionId: `${role}-session` }, close() {} };
   };
-  const runtime = new RuntimeStore({ dbPath: join(parent, "runtime.sqlite"), piCommand, worktreeRoot: join(parent, "worktrees"), workerFactory: workerFactory ?? defaultWorker, reviewerFactory });
+  const dbPath = join(parent, "runtime.sqlite");
+  const worktreeRoot = join(parent, "worktrees");
+  const runtime = new RuntimeStore({ dbPath, piCommand, worktreeRoot, workerFactory: workerFactory ?? defaultWorker, reviewerFactory });
   const task = await runtime.createTask({ cwd: source, trusted: true, goal: "implement fixture", model: { provider: "provider", id: "model" }, thinkingLevel: "low", completionContract: completionContract ?? { objective: "implement fixture", localGates: [{ id: "green", command: [process.execPath, "-e", "process.exit(0)"] }] }, budget });
-  return { parent, source, runtime, task, calls };
+  return { parent, source, runtime, task, calls, dbPath, worktreeRoot, piCommand };
 }
 
 async function closeFixture(value) {
@@ -86,6 +84,54 @@ test("conditional review is a fresh exact-candidate Attempt with bounded context
     assert.equal(await readFile(join(completed.taskWorktree, "reviewer-only.txt")).catch(() => null), null);
     assert.equal(completed.evidence.filter((evidence) => evidence.kind === "semantic_review").length, 1);
   } finally { await closeFixture(value); }
+});
+
+test("daemon restart retires a persisted reviewer and cleans its ephemeral view", async () => {
+  const value = await fixture({
+    reviewerFactory: async () => ({ callbacksAttached: true, executionSnapshot: { sessionId: "review-session" }, close() {} }),
+    completionContract: { objective: "restart reviewer", semanticReview: true, semanticCriteria: ["semantic criterion"], localGates: [{ id: "green", command: [process.execPath, "-e", "process.exit(0)"] }] },
+  });
+  let restarted;
+  try {
+    const running = await eventually(() => value.runtime.getTask(value.task.id), (task) => task.attempts.some((attempt) => attempt.role === "reviewer" && attempt.state === "running"));
+    const reviewer = running.attempts.find((attempt) => attempt.role === "reviewer");
+    assert.ok(reviewer.reviewWorktree);
+    assert.ok(reviewer.reviewWorktreeRoot);
+    assert.equal(await readFile(join(reviewer.reviewWorktree, "base.txt"), "utf8"), "base\n");
+    value.runtime.db.prepare("UPDATE attempts SET state = 'completed', worker_terminated = 1 WHERE id = ?").run(reviewer.id);
+    value.runtime.release();
+    restarted = new RuntimeStore({ dbPath: value.dbPath, piCommand: value.piCommand, worktreeRoot: value.worktreeRoot, workerFactory: async () => ({ callbacksAttached: true, executionSnapshot: { sessionId: "unused" }, close() {} }) });
+    const restored = restarted.getTask(value.task.id);
+    const restoredReviewer = restored.attempts.find((attempt) => attempt.id === reviewer.id);
+    assert.equal(restoredReviewer.reviewWorktree, null);
+    assert.equal(restoredReviewer.reviewWorktreeRoot, null);
+    assert.equal(existsSync(reviewer.reviewWorktree), false);
+  } finally {
+    restarted?.release();
+    await closeFixture(value);
+  }
+});
+
+test("reviewer cleanup path traversal fails closed and retains the view", async () => {
+  const value = await fixture({
+    reviewerFactory: async () => ({ callbacksAttached: true, executionSnapshot: { sessionId: "review-session" }, close() {} }),
+    completionContract: { objective: "cleanup fence", semanticReview: true, semanticCriteria: ["semantic criterion"], localGates: [{ id: "green", command: [process.execPath, "-e", "process.exit(0)"] }] },
+  });
+  let restarted;
+  try {
+    const running = await eventually(() => value.runtime.getTask(value.task.id), (task) => task.attempts.some((attempt) => attempt.role === "reviewer" && attempt.state === "running"));
+    const reviewer = running.attempts.find((attempt) => attempt.role === "reviewer");
+    value.runtime.db.prepare("UPDATE attempts SET state = 'completed', worker_terminated = 1, review_worktree_root = ? WHERE id = ?").run(value.parent, reviewer.id);
+    value.runtime.release();
+    restarted = new RuntimeStore({ dbPath: value.dbPath, piCommand: value.piCommand, worktreeRoot: value.worktreeRoot, workerFactory: async () => ({ callbacksAttached: true, executionSnapshot: { sessionId: "unused" }, close() {} }) });
+    const blocked = restarted.getTask(value.task.id);
+    assert.equal(blocked.state, "blocked");
+    assert.equal(blocked.terminalReason, "semantic_review_cleanup_failed");
+    assert.equal(existsSync(reviewer.reviewWorktree), true);
+  } finally {
+    restarted?.release();
+    await closeFixture(value);
+  }
 });
 
 test("malformed semantic receipts are durably blocked and never verified", async () => {

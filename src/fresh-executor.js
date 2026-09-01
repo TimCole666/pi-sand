@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { readProcessIdentity, stopOwnedProcessGroupSync, WORKER_STOP_TIMEOUT_MS } from "./process.js";
 
 export const FRESH_PI_VERSION = "0.84.4";
@@ -16,6 +17,8 @@ export const FRESH_REVIEWER_ARGS = [
   "read,grep,find,ls",
 ];
 export const FRESH_EXECUTOR_VERSION_ERROR = "Fresh Executor requires Pi 0.84.4 exactly.";
+const REVIEWER_SANDBOX = fileURLToPath(new URL("./reviewer-sandbox.js", import.meta.url));
+const UNSHARE = "/usr/bin/unshare";
 
 function argsForRole(role) {
   return role === "reviewer" ? FRESH_REVIEWER_ARGS : FRESH_EXECUTOR_ARGS;
@@ -27,8 +30,8 @@ function environmentForRole(role, env) {
   // A reviewer has no daemon or runtime IPC authority. It retains provider
   // credentials so Pi can answer the review, but cannot discover the shared
   // Task database/socket through inherited configuration.
-  for (const key of ["PI_SAND_RUNTIME_DB", "PI_SAND_SOCKET", "PI_SAND_DB", "PI_SAND_TASK_WORKTREE_ROOT"])
-    delete restricted[key];
+  for (const key of Object.keys(restricted))
+    if (key.startsWith("PI_SAND_")) delete restricted[key];
   return restricted;
 }
 
@@ -138,6 +141,7 @@ class FreshExecutorClient {
   #sessionIdentityChanged = false;
   #executionSnapshot;
   #args;
+  #reviewerSandbox;
 
   constructor(options) {
     const role = options?.role === "reviewer" ? "reviewer" : "executor";
@@ -153,6 +157,7 @@ class FreshExecutorClient {
     };
     this.#options.env = environmentForRole(role, this.#options.env);
     this.#args = [...argsForRole(role)];
+    this.#reviewerSandbox = role === "reviewer";
     if (typeof this.#options.cwd !== "string" || this.#options.cwd.length === 0) {
       throw startupError("Fresh Executor requires a task worktree cwd.", { code: "INVALID_CWD" });
     }
@@ -261,8 +266,30 @@ class FreshExecutorClient {
   }
 
   #spawn() {
+    let command = this.#options.command;
+    let args = [...this.#args];
+    if (this.#reviewerSandbox) {
+      const view = this.#options.reviewWorktree ?? this.#options.cwd;
+      const taskWorktree = this.#options.taskWorktree ?? this.#options.cwd;
+      const sourceRepoRoot = this.#options.sourceRepoRoot ?? this.#options.cwd;
+      command = UNSHARE;
+      args = [
+        "--user",
+        "--map-root-user",
+        "--mount",
+        "--propagation",
+        "private",
+        process.execPath,
+        REVIEWER_SANDBOX,
+        view,
+        taskWorktree,
+        sourceRepoRoot,
+        this.#options.command,
+        JSON.stringify(this.#args),
+      ];
+    }
     try {
-      this.#child = this.#options.spawnImpl(this.#options.command, [...this.#args], {
+      this.#child = this.#options.spawnImpl(command, args, {
         cwd: this.#options.cwd,
         detached: true,
         env: this.#options.env,
