@@ -159,6 +159,7 @@ async function fixture({
   budget,
   attemptClock,
   attemptTimer,
+  waitClock,
 } = {}) {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-bounded-repair-"));
   const { source, remote, base } = await repository(parent);
@@ -185,6 +186,7 @@ async function fixture({
     gitHubAdapter: fakeGitHub,
     attemptClock,
     attemptTimer,
+    waitClock,
   });
   const task = await runtime.createTask({
     cwd: source,
@@ -517,6 +519,17 @@ test("4. CI R fails -> fresh repair Attempt -> R2 -> fast-forward publish -> exa
     assert.equal(taskRunning.attempts.length, 2);
     assert.equal(taskRunning.attempts[1].cause, "repair");
     assert.equal(taskRunning.attempts[1].resumeWaitId, wait1.waitSubscription.id);
+    assert.match(attemptSpawns[1], /pi-sand Verification Repair Request/);
+    assert.match(attemptSpawns[1], new RegExp(`Candidate SHA: ${candidateR1}`));
+    assert.match(attemptSpawns[1], /Completion contract:/);
+    assert.match(attemptSpawns[1], /Failing CI observation:/);
+    assert.match(attemptSpawns[1], /selector.*check_run:github-actions\/ci/i);
+    assert.match(attemptSpawns[1], /normalizedState.*failure/i);
+    assert.match(attemptSpawns[1], /conclusion.*failure/i);
+    assert.match(attemptSpawns[1], /Task branch:/);
+    assert.match(attemptSpawns[1], /Task worktree:/);
+    assert.match(attemptSpawns[1], /Remaining budget:/);
+    assert.ok(taskRunning.attempts[1].attemptRuns[0].evidenceRefs.length > 0);
 
     // Attempt 2 produces R2 on top of R1
     const candidateR2 = await commitCandidate(
@@ -938,7 +951,173 @@ test("9. unsafe same-Attempt context allocates one fresh local repair Attempt", 
 });
 
 // -----------------------------------------------------------------------------
-// Scenario 10: expired CI wait fails only after the final exact reconciliation
+// Scenario 10: known same-Attempt repair rejection retires the worker and
+// falls through to a fresh repair Attempt
+// -----------------------------------------------------------------------------
+test("10. known same-Attempt repair rejection becomes a fresh repair failure", async () => {
+  for (const rejectionKind of ["accepted-false", "PROMPT_REJECTED"]) {
+    let workerCount = 0;
+    const value = await fixture({
+      workerFactory: async ({ cwd, onEvent }) => {
+        workerCount += 1;
+        const workerNumber = workerCount;
+        if (workerNumber === 2) {
+          await writeFile(join(cwd, "pass.txt"), "pass\\n");
+        }
+        onEvent({
+          type: "message_end",
+          message: { role: "assistant", content: "candidate ready", stopReason: "stop" },
+        });
+        onEvent({ type: "agent_settled" });
+        return {
+          callbacksAttached: true,
+          sessionId: `rejection-${rejectionKind}-${workerNumber}`,
+          executionSnapshot: { sessionId: `rejection-${rejectionKind}-${workerNumber}` },
+          prompt() {
+            if (workerNumber !== 1) return { accepted: true };
+            if (rejectionKind === "accepted-false") return { accepted: false };
+            throw Object.assign(new Error("repair rejected"), {
+              code: "PROMPT_REJECTED",
+              phase: "prompt",
+            });
+          },
+          close() {},
+        };
+      },
+      completionContract: {
+        objective: "recover from rejected same-Attempt repair",
+        localGates: [{
+          id: "pass-after-rejection",
+          command: [
+            process.execPath,
+            "-e",
+            "if (!require('node:fs').existsSync('pass.txt')) process.exit(1)",
+          ],
+        }],
+      },
+    });
+    try {
+      const completed = await eventually(
+        () => value.runtime.getTask(value.task.id),
+        (task) => task.state === "completed",
+      );
+      assert.equal(workerCount, 2);
+      assert.equal(completed.attempts.length, 2);
+      assert.equal(completed.attempts[0].attemptRuns[1].state, "aborted");
+      assert.equal(completed.attempts[1].cause, "repair");
+      assert.equal(completed.terminalReason, "verified_local");
+    } finally {
+      await closeFixture(value);
+    }
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Scenario 11: total commitment expiry is enforced while CI remains pending
+// -----------------------------------------------------------------------------
+test("11. pending CI wait is bounded by the total commitment deadline", async () => {
+  let clock = Date.now();
+  const value = await fixture({
+    waitClock: () => clock,
+    budget: {
+      totalCommitmentWallClockDeadlineMs: 10_000,
+      ciWaitDeadlineMs: 60_000,
+    },
+    completionContract: {
+      objective: "bounded pending CI",
+      localGates: [{ id: "local-pass", command: [process.execPath, "-e", "process.exit(0)"] }],
+      requiredChecks: ["check_run:github-actions/ci"],
+    },
+  });
+  try {
+    const waiting = await eventually(
+      () => value.runtime.getTask(value.task.id),
+      (task) => task.state === "waiting",
+    );
+    const wait = waiting.waitSubscriptions[0];
+    const acceptedAt = Date.parse(waiting.acceptedAt);
+    assert.ok(Date.parse(wait.deadlineAt) <= acceptedAt + 10_000);
+
+    clock = Date.parse(wait.deadlineAt) + 1;
+    value.runtime.waitClock = () => clock;
+    const [result] = await value.runtime.startWaitReactor({ observer: value.gitHubAdapter });
+    assert.equal(result.classification, "timed_out");
+    assert.equal(result.triggered, true);
+
+    const terminal = value.runtime.getTask(value.task.id);
+    assert.equal(terminal.state, "failed");
+    assert.equal(terminal.terminalReason, "external_timeout");
+    assert.match(terminal.terminalDetail, /total commitment wall-clock deadline/i);
+    assert.equal(value.runtime.getWaitSubscription(wait.id).status, "timed_out");
+    assert.equal(
+      value.runtime.db
+        .prepare("SELECT COUNT(*) AS count FROM result_deliveries WHERE task_id = ?")
+        .get(value.task.id).count,
+      1,
+    );
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Scenario 12: exhausted CI-wake model escalation is terminal and durable
+// -----------------------------------------------------------------------------
+test("12. exhausted CI-wake escalation produces a terminal Result", async () => {
+  const value = await fixture({
+    budget: { maxModelOrThinkingEscalations: 0 },
+    completionContract: {
+      objective: "bounded CI escalation",
+      requiredChecks: ["check_run:github-actions/ci"],
+    },
+  });
+  try {
+    const candidate = await commitCandidate(
+      value.task.taskWorktree,
+      "app.js",
+      "candidate\\n",
+      "candidate",
+    );
+    await value.runtime.publishTask({ id: value.task.id, candidateSha: candidate });
+    const registered = await value.runtime.registerWaitSubscription({
+      taskId: value.task.id,
+      revisionSha: candidate,
+      requiredChecks: ["check_run:github-actions/ci"],
+    });
+    value.gitHubAdapter.setCheckRuns([{
+      id: 1201,
+      name: "ci",
+      head_sha: candidate,
+      status: "completed",
+      conclusion: "failure",
+      app: { slug: "github-actions" },
+    }]);
+
+    const [result] = await value.runtime.startWaitReactor({
+      model: { provider: "other", id: "other-model" },
+      thinkingLevel: "high",
+    });
+    assert.equal(result.classification, "failure");
+    assert.equal(result.triggered, true);
+    const terminal = value.runtime.getTask(value.task.id);
+    assert.equal(terminal.state, "failed");
+    assert.equal(terminal.terminalReason, "budget_exhausted");
+    assert.match(terminal.terminalDetail, /model\/thinking escalation budget/i);
+    assert.equal(value.runtime.getWaitSubscription(registered.waitSubscription.id).status, "triggered");
+    assert.equal(terminal.attempts.length, 1);
+    assert.equal(
+      value.runtime.db
+        .prepare("SELECT COUNT(*) AS count FROM result_deliveries WHERE task_id = ?")
+        .get(value.task.id).count,
+      1,
+    );
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Scenario 13: expired CI wait fails only after the final exact reconciliation
 // -----------------------------------------------------------------------------
 test("10. expired CI wait produces one durable external-timeout Result after final reconciliation", async () => {
   const value = await fixture({

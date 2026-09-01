@@ -3433,7 +3433,15 @@ export class RuntimeStore {
         { code: "invalid_wait_clock" },
       );
     }
-    const maximumDeadline = waitClockTime + taskBudget.ciWaitDeadlineMs;
+    const maximumCiDeadline = waitClockTime + taskBudget.ciWaitDeadlineMs;
+    const acceptedAt = new Date(taskRow.acceptedAt || taskRow.createdAt).getTime();
+    const maximumCommitmentDeadline = Number.isFinite(acceptedAt)
+      ? acceptedAt + taskBudget.totalCommitmentWallClockDeadlineMs
+      : Number.POSITIVE_INFINITY;
+    const maximumDeadline = Math.min(
+      maximumCiDeadline,
+      maximumCommitmentDeadline,
+    );
     const requestedDeadline = deadlineAt ?? deadline_at;
     let normalizedDeadlineAt;
     if (requestedDeadline) {
@@ -3456,7 +3464,10 @@ export class RuntimeStore {
         );
       }
       normalizedDeadlineAt = new Date(
-        waitClockTime + Math.min(requestedTimeout, taskBudget.ciWaitDeadlineMs),
+        Math.min(
+          waitClockTime + Math.min(requestedTimeout, taskBudget.ciWaitDeadlineMs),
+          maximumCommitmentDeadline,
+        ),
       ).toISOString();
     }
 
@@ -3810,8 +3821,20 @@ export class RuntimeStore {
     const taskRow = this.#taskRow(subscription.taskId);
     if (!taskRow) throw new Error(`Task ${subscription.taskId} was not found.`);
 
-    const nowTime = nowOverride ? new Date(nowOverride).getTime() : Date.now();
+    const nowTime = nowOverride ? new Date(nowOverride).getTime() : new Date(this.waitClock()).getTime();
     const nowIso = new Date(nowTime).toISOString();
+    const taskBudget = normalizeBudget(taskRow.budget);
+    const acceptedAt = new Date(taskRow.acceptedAt || taskRow.createdAt).getTime();
+    const totalCommitmentDeadline = Number.isFinite(acceptedAt)
+      ? acceptedAt + taskBudget.totalCommitmentWallClockDeadlineMs
+      : Number.NaN;
+    const subscriptionDeadline = new Date(subscription.deadlineAt).getTime();
+    const effectiveDeadline = Number.isFinite(totalCommitmentDeadline)
+      ? Math.min(subscriptionDeadline, totalCommitmentDeadline)
+      : subscriptionDeadline;
+    const effectiveDeadlineIso = Number.isFinite(effectiveDeadline)
+      ? new Date(effectiveDeadline).toISOString()
+      : subscription.deadlineAt;
 
     const adapter = gitHubAdapter ?? gitHubClient ?? this.gitHubAdapter;
     let checkRuns = [];
@@ -3856,9 +3879,9 @@ export class RuntimeStore {
       if (isAuth) {
         this.db
           .prepare(
-            "UPDATE wait_subscriptions SET last_reconciled_at = ? WHERE id = ?",
+            "UPDATE wait_subscriptions SET last_reconciled_at = ?, deadline_at = MIN(deadline_at, ?) WHERE id = ?",
           )
-          .run(nowIso, id);
+          .run(nowIso, effectiveDeadlineIso, id);
         if (markBlockedOnAuth) {
           this.markBlocked(
             subscription.taskId,
@@ -3883,9 +3906,9 @@ export class RuntimeStore {
         const nextReconcileIso = new Date(nowTime + retryDelay).toISOString();
         this.db
           .prepare(
-            "UPDATE wait_subscriptions SET last_reconciled_at = ?, next_reconcile_at = ? WHERE id = ?",
+            "UPDATE wait_subscriptions SET last_reconciled_at = ?, next_reconcile_at = ?, deadline_at = MIN(deadline_at, ?) WHERE id = ?",
           )
-          .run(nowIso, nextReconcileIso, id);
+          .run(nowIso, nextReconcileIso, effectiveDeadlineIso, id);
         return {
           task: this.getTask(subscription.taskId),
           waitSubscription: this.getWaitSubscription(id),
@@ -3901,7 +3924,6 @@ export class RuntimeStore {
       throw error;
     }
 
-    const taskBudget = normalizeBudget(taskRow.budget);
     const graceMs = taskBudget.ciCheckAppearanceGraceMs;
     const elapsedMs = nowTime - new Date(subscription.createdAt).getTime();
     const graceExpired = elapsedMs >= graceMs;
@@ -4086,7 +4108,11 @@ export class RuntimeStore {
 
     let classification = classifyOverallObservation(selectorResults);
 
-    if (classification !== "success" && nowTime >= new Date(subscription.deadlineAt).getTime()) {
+    if (
+      classification !== "success" &&
+      Number.isFinite(effectiveDeadline) &&
+      nowTime >= effectiveDeadline
+    ) {
       classification = "timed_out";
       // Keep the row active until the runtime-owned trigger transaction when
       // this is a wake. That transaction must atomically create the timeout
@@ -4107,7 +4133,9 @@ export class RuntimeStore {
         nowTime,
         subscription.id,
       );
-      nextReconcileIso = new Date(nowTime + nextInterval).toISOString();
+      nextReconcileIso = new Date(
+        Math.min(nowTime + nextInterval, effectiveDeadline),
+      ).toISOString();
     }
 
     if (
@@ -4133,9 +4161,9 @@ export class RuntimeStore {
 
     this.db
       .prepare(
-        "UPDATE wait_subscriptions SET last_reconciled_at = ?, next_reconcile_at = ? WHERE id = ?",
+        "UPDATE wait_subscriptions SET last_reconciled_at = ?, next_reconcile_at = ?, deadline_at = MIN(deadline_at, ?) WHERE id = ?",
       )
-      .run(nowIso, nextReconcileIso, id);
+      .run(nowIso, nextReconcileIso, effectiveDeadlineIso, id);
 
     return {
       task: this.getTask(subscription.taskId),
@@ -4291,7 +4319,9 @@ export class RuntimeStore {
       throw new Error("Triggering wait subscription requires a subscription id.");
     this.open();
 
-    const timestamp = nowOverride ? resultTimestamp(nowOverride) : now();
+    const timestamp = nowOverride != null
+      ? resultTimestamp(() => nowOverride)
+      : now();
 
     let taskToLaunch = null;
     let newAttemptId = null;
@@ -4345,6 +4375,17 @@ export class RuntimeStore {
       if (!taskRow) {
         throw new Error(`Task ${waitRow.taskId} was not found.`);
       }
+      const triggerBudget = normalizeBudget(taskRow.budget);
+      const triggerAcceptedAt = new Date(
+        taskRow.acceptedAt || taskRow.createdAt,
+      ).getTime();
+      const totalCommitmentDeadline = Number.isFinite(triggerAcceptedAt)
+        ? triggerAcceptedAt + triggerBudget.totalCommitmentWallClockDeadlineMs
+        : Number.NaN;
+      const waitDeadline = new Date(waitRow.deadlineAt).getTime();
+      const effectiveDeadline = Number.isFinite(totalCommitmentDeadline)
+        ? Math.min(waitDeadline, totalCommitmentDeadline)
+        : waitDeadline;
 
       // Require Task is non-terminal (state IN ('waiting', 'running', 'accepted'))
       if (!["waiting", "running", "accepted"].includes(taskRow.state)) {
@@ -4575,6 +4616,39 @@ export class RuntimeStore {
         const nowTime = new Date(timestamp).getTime();
         const wallClockElapsed = nowTime - new Date(taskRow.acceptedAt || taskRow.createdAt).getTime();
 
+        const lastAttemptRow = this.db
+          .prepare(
+            "SELECT id, number, provider, model_id, thinking_level, applied_provider, applied_model_id, applied_thinking_level FROM attempts WHERE task_id = ? ORDER BY number DESC LIMIT 1",
+          )
+          .get(taskRow.id);
+        const nextNumber = Number(lastAttemptRow?.number ?? 1) + 1;
+        effectiveModel = model ?? {
+          provider:
+            lastAttemptRow?.applied_provider ??
+            lastAttemptRow?.provider ??
+            "anthropic",
+          id:
+            lastAttemptRow?.applied_model_id ??
+            lastAttemptRow?.model_id ??
+            "claude-3-5-sonnet",
+        };
+        effectiveThinkingLevel =
+          thinkingLevel ??
+          lastAttemptRow?.applied_thinking_level ??
+          lastAttemptRow?.thinking_level ??
+          "off";
+        const lastApplied = this.#getTaskLastAppliedConfiguration(taskRow.id);
+        const requestedEscalation = Boolean(
+          lastApplied &&
+          (lastApplied.provider !== effectiveModel.provider ||
+            lastApplied.modelId !== effectiveModel.id ||
+            lastApplied.thinkingLevel !== effectiveThinkingLevel),
+        );
+        const escalationBudgetExhausted =
+          requestedEscalation &&
+          this.#getTaskModelOrThinkingEscalationsCount(taskRow.id) >=
+            budget.maxModelOrThinkingEscalations;
+
         const fp = ciFailureFingerprint({
           revisionSha: waitRow.revisionSha,
           classification,
@@ -4592,9 +4666,11 @@ export class RuntimeStore {
 
         if (classification === "timed_out" || wallClockElapsed >= budget.totalCommitmentWallClockDeadlineMs) {
           terminalReason = "external_timeout";
-          terminalDetail = classification === "timed_out"
-            ? `GitHub CI wait subscription deadline expired for revision ${waitRow.revisionSha}.`
-            : "Task total commitment wall-clock deadline expired.";
+          terminalDetail =
+            Number.isFinite(totalCommitmentDeadline) &&
+            nowTime >= totalCommitmentDeadline
+              ? "Task total commitment wall-clock deadline expired."
+              : `GitHub CI wait subscription deadline expired for revision ${waitRow.revisionSha}.`;
         } else if (consecutiveCount >= budget.maxSameFailureFingerprint) {
           terminalReason = "stalled";
           terminalDetail = `Task CI repair stalled on repeated failure fingerprint for revision ${waitRow.revisionSha}.`;
@@ -4613,6 +4689,9 @@ export class RuntimeStore {
         } else if (startupFailures >= budget.maxStartupFailures) {
           terminalReason = "budget_exhausted";
           terminalDetail = `Task startup failure budget (${budget.maxStartupFailures}) exhausted.`;
+        } else if (escalationBudgetExhausted) {
+          terminalReason = "budget_exhausted";
+          terminalDetail = `Task model/thinking escalation budget (${budget.maxModelOrThinkingEscalations}) exhausted.`;
         }
 
         if (terminalReason) {
@@ -4684,28 +4763,6 @@ export class RuntimeStore {
           };
         }
 
-        const lastAttemptRow = this.db
-          .prepare(
-            "SELECT id, number, provider, model_id, thinking_level, applied_provider, applied_model_id, applied_thinking_level FROM attempts WHERE task_id = ? ORDER BY number DESC LIMIT 1",
-          )
-          .get(taskRow.id);
-
-        const nextNumber = Number(lastAttemptRow?.number ?? 1) + 1;
-        effectiveModel = model ?? {
-          provider:
-            lastAttemptRow?.applied_provider ??
-            lastAttemptRow?.provider ??
-            "anthropic",
-          id:
-            lastAttemptRow?.applied_model_id ??
-            lastAttemptRow?.model_id ??
-            "claude-3-5-sonnet",
-        };
-        effectiveThinkingLevel =
-          thinkingLevel ??
-          lastAttemptRow?.applied_thinking_level ??
-          lastAttemptRow?.thinking_level ??
-          "off";
         this.#assertFreshAttemptBudget(
           taskRow.id,
           effectiveModel,
@@ -4718,15 +4775,49 @@ export class RuntimeStore {
             ? `GitHub CI check appearance grace window expired for revision ${waitRow.revisionSha}.`
             : `GitHub CI checks failed on revision ${waitRow.revisionSha}.`;
 
-        launchPacket = buildTaskPacket({
+        const remainingCommitmentMs = Number.isFinite(totalCommitmentDeadline)
+          ? Math.max(0, totalCommitmentDeadline - nowTime)
+          : null;
+        const remainingBudget = {
+          remainingTotalAttempts: Math.max(0, budget.maxTotalAttempts - nextNumber),
+          remainingCodeProducingAttempts: Math.max(0, budget.maxCodeProducingAttempts - codeAttempts),
+          remainingCiRepairCycles: Math.max(0, budget.maxCiRepairCycles - (ciRepairs + 1)),
+          remainingPublications: Math.max(0, maxPubs - (pubCount + 1)),
+          remainingRunsInAttempt: budget.maxPiRunsPerAttempt,
+          remainingPiTurnsInAttempt: budget.maxPiTurnsPerAttempt,
+          remainingStartupFailures: Math.max(0, budget.maxStartupFailures - startupFailures),
+          remainingSameFailureFingerprint: Math.max(0, budget.maxSameFailureFingerprint - consecutiveCount),
+          remainingNoProgressSupervisorIterations: budget.maxNoProgressSupervisorIterations,
+          remainingModelOrThinkingEscalations: Math.max(
+            0,
+            budget.maxModelOrThinkingEscalations -
+              this.#getTaskModelOrThinkingEscalationsCount(taskRow.id),
+          ),
+          remainingCommitmentWallClockMs: remainingCommitmentMs,
+          remainingCiWaitMs: Math.max(0, effectiveDeadline - nowTime),
+        };
+        launchPacket = buildRepairPrompt({
           taskId: taskRow.id,
           attemptNumber: nextNumber,
           goal: taskRow.goal,
           taskBranch: taskRow.taskBranch,
           taskWorktree: taskRow.taskWorktree,
           baseCommit: taskRow.baseCommit,
-          priorState: "ci_failed",
-          priorDetail: repairDetail,
+          candidateSha: waitRow.revisionSha,
+          completionContract: parsed(taskRow.completionContract),
+          ciEvidence: {
+            revisionSha: waitRow.revisionSha,
+            classification,
+            failingChecks: selectorResults.map((result) => ({
+              selector: result.selector,
+              normalizedState: result.normalizedState,
+              conclusion: result.conclusion ?? null,
+              evidenceId: result.evidenceId ?? null,
+            })),
+            evidenceRefs: allEvidenceIds,
+          },
+          priorFailureDetail: `Previous attempt outcome: ci_failed; ${repairDetail}`,
+          remainingBudget,
         });
 
         // Insert fresh Attempt
@@ -5088,7 +5179,7 @@ export class RuntimeStore {
     }
   }
 
-  async startWaitReactor({ observer, skipSpawn = false } = {}) {
+  async startWaitReactor({ observer, skipSpawn = false, model, thinkingLevel } = {}) {
     this.open();
     if (observer) this.waitObserver = observer;
     this.waitReactorEnabled = true;
@@ -5098,6 +5189,8 @@ export class RuntimeStore {
         gitHubAdapter: this.waitObserver ?? this.gitHubAdapter,
         trigger: true,
         skipSpawn,
+        model,
+        thinkingLevel,
       }, WAIT_RECONCILE_CAPABILITY);
     } finally {
       this.#scheduleWaitReactor();
@@ -6985,18 +7078,26 @@ export class RuntimeStore {
             const nextSequence = active.runSequence + 1;
             this.#allocateContinuationRun(active, repairPrompt, nextSequence, "local_repair");
             let acknowledgement;
+            let rejectedSameAttemptRepair = false;
             try {
               acknowledgement = await active.worker.prompt(repairPrompt);
             } catch (error) {
               if (error?.code === "PROMPT_REJECTED") {
+                // A known rejection is not ambiguous, but it is still a repair
+                // failure. Retire this worker and use the fresh-Attempt path
+                // below rather than leaving the Task running on the restored
+                // settled run forever.
                 this.#abortContinuationRun(active, error.message);
+                rejectedSameAttemptRepair = true;
               } else {
                 await this.#handleAmbiguousContinuation(active, error);
+                return;
               }
-              return;
             }
 
-            const ackStatus = continuationAcknowledgementStatus(acknowledgement);
+            const ackStatus = rejectedSameAttemptRepair
+              ? "rejected"
+              : continuationAcknowledgementStatus(acknowledgement);
             if (ackStatus === "accepted") {
               if (this.#acceptContinuationRun(active, nextSequence)) {
                 // The old supervisor owns finalization while the prompt is in
@@ -7012,7 +7113,8 @@ export class RuntimeStore {
                 return;
               }
             } else if (ackStatus === "rejected") {
-              this.#abortContinuationRun(active, "Fresh Executor rejected the repair prompt.");
+              if (!rejectedSameAttemptRepair)
+                this.#abortContinuationRun(active, "Fresh Executor rejected the repair prompt.");
             } else {
               await this.#handleAmbiguousContinuation(
                 active,
