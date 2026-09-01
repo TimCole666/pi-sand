@@ -101,7 +101,7 @@ function makeTransport(expectedEndpoint) {
   return transport;
 }
 
-async function fixture({ workerFactory, workerRetireTimeoutMs, taskAuthority = authority } = {}) {
+async function fixture({ workerFactory, workerRetireTimeoutMs, taskAuthority = authority, completionContract } = {}) {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-ci-wait-"));
   const { source, remote, base } = await repository(parent);
   const dbPath = join(parent, "runtime.sqlite");
@@ -130,7 +130,7 @@ async function fixture({ workerFactory, workerRetireTimeoutMs, taskAuthority = a
     model: { provider: "provider", id: "model" },
     thinkingLevel: "high",
     authority: taskAuthority,
-    completionContract: {
+    completionContract: completionContract ?? {
       objective: "park task on CI wait",
       requiredChecks: ["check_run:github-actions/ci"],
     },
@@ -165,7 +165,12 @@ async function closeFixture(fixtureValue) {
 }
 
 test("1. exact R + required selectors -> one active wait, Task waiting, Attempt parked, worker retired", async () => {
-  const value = await fixture();
+  const value = await fixture({
+    completionContract: {
+      objective: "park task on CI wait",
+      requiredChecks: ["check_run:github-actions/ci", "commit_status:build"],
+    },
+  });
   try {
     const candidateR = await commitCandidate(value.task.taskWorktree, "app.js", "console.log(1);\n", "feat: app");
     await value.runtime.publishTask({ id: value.task.id, candidateSha: candidateR });
@@ -321,7 +326,7 @@ test("4. registering generation N+1 supersedes N atomically; only N+1 remains ac
     const gen1 = await value.runtime.registerWaitSubscription({
       taskId: value.task.id,
       revisionSha: firstCandidate,
-      requiredChecks: ["check_run:ci/test"],
+      requiredChecks: ["check_run:github-actions/ci"],
     });
 
     assert.equal(gen1.waitSubscription.generation, 1);
@@ -330,7 +335,7 @@ test("4. registering generation N+1 supersedes N atomically; only N+1 remains ac
     const gen2 = await value.runtime.registerWaitSubscription({
       taskId: value.task.id,
       revisionSha: secondCandidate,
-      requiredChecks: ["check_run:ci/test", "commit_status:coverage"],
+      requiredChecks: ["check_run:github-actions/ci"],
     });
 
     assert.equal(gen2.waitSubscription.generation, 2);
@@ -366,7 +371,7 @@ test("5. waiting frees executor process capacity but second autonomous Commitmen
     await value.runtime.registerWaitSubscription({
       taskId: value.task.id,
       revisionSha: candidateR,
-      requiredChecks: ["check_run:ci/test"],
+      requiredChecks: ["check_run:github-actions/ci"],
     });
 
     assert.equal(value.runtime.active, null);
@@ -436,7 +441,7 @@ test("6. unsafe/unproven worker retirement does not expose free executor capacit
       () => value.runtime.registerWaitSubscription({
         taskId: value.task.id,
         revisionSha: candidateR,
-        requiredChecks: ["check_run:ci/test"],
+        requiredChecks: ["check_run:github-actions/ci"],
       }),
       (error) => error.code === "worker_retirement_unproven",
     );

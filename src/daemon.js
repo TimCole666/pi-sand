@@ -78,18 +78,24 @@ async function handleRequest(request, store) {
     case "task.wait":
     case "wait.register":
       return await store.registerWaitSubscription(params);
-    case "wait.reconcile":
+    case "wait.reconcile": {
+      // Reconciliation is an observation request, not a caller-supplied wake.
+      // Classification and terminal action belong to the daemon-owned reactor.
+      const {
+        trigger: _trigger,
+        autoTrigger: _autoTrigger,
+        classification: _classification,
+        observation: _observation,
+        evidenceId: _evidenceId,
+        evidenceIds: _evidenceIds,
+        selectorResults: _selectorResults,
+        ...observationParams
+      } = params;
       return await store.reconcileWaitSubscription(
         params.id ?? params.subscriptionId ?? params.waitId,
-        params,
+        observationParams,
       );
-    case "wait.trigger":
-    case "wait.process_observation":
-    case "wait.processObservation":
-      return await store.triggerWaitSubscription(
-        params.id ?? params.subscriptionId ?? params.waitId,
-        params,
-      );
+    }
     case "result.claim": {
       const result = store.claimResult(
         params.clientInstanceId ?? params.client_instance_id,
@@ -185,8 +191,10 @@ export async function startRuntimeDaemon({
   // after the runtime DB lock is acquired, so a stale socket is never removed
   // by a process that failed to become the runtime owner.
   ensureRuntimeDirectoryForSocket(socketPath);
+  // Acquire DB ownership before swallowing an observer/provider startup error;
+  // a losing daemon must never reclaim the live owner's socket.
   store.open();
-  await store.reconcileActiveWaits().catch(() => {});
+  await store.startWaitReactor().catch(() => {});
   const connections = new Set();
   const server = createServer((socket) => {
     connections.add(socket);

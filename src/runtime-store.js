@@ -58,6 +58,7 @@ export const DEFAULT_CI_CHECK_APPEARANCE_GRACE_MS = 10 * 60 * 1000;
 export const CI_RECONCILE_INTERVAL_INITIAL_MS = 30_000;
 export const CI_RECONCILE_INTERVAL_MID_MS = 60_000;
 export const CI_RECONCILE_INTERVAL_LATE_MS = 300_000;
+export const WAIT_REACTOR_IDLE_INTERVAL_MS = 60_000;
 const INITIAL_ATTEMPT_RUN_SEQUENCE = 1;
 const ACTIVE_ATTEMPT_STATES = new Set(["starting", "running"]);
 const ACTIVE_GATE_STATES = new Set(["running", "ambiguous"]);
@@ -438,6 +439,9 @@ function remotePublicationAuthority(authority) {
   );
   const remoteUrlDigest =
     raw.remoteUrlDigest ?? raw.remote_url_digest ?? null;
+  const githubHost = Object.hasOwn(raw, "githubHost") || Object.hasOwn(raw, "github_host")
+    ? normalizeGithubHost(raw.githubHost ?? raw.github_host)
+    : null;
   if (remote !== "origin")
     throw new Error("Remote publication authority must name origin.");
   if (repository === null)
@@ -462,6 +466,7 @@ function remotePublicationAuthority(authority) {
     remote,
     repositoryId: repository,
     remoteUrlDigest: remoteUrlDigest?.toLowerCase() ?? null,
+    ...(githubHost ? { githubHost } : {}),
     allowedRefPrefix,
     allowCreateOrFastForward: true,
     allowRewrite: false,
@@ -620,6 +625,46 @@ function continuationBoundary(acknowledgement) {
 
 function defaultCompletionContract(goal) {
   return { objective: goal };
+}
+
+function normalizeGithubHost(value) {
+  if (value == null) return "github.com";
+  if (typeof value !== "string" || !value.trim() || value.includes("\0"))
+    throw new Error("Task GitHub host must be a valid hostname.");
+  const host = value.trim().toLowerCase();
+  if (!/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]{1,5})?$/.test(host))
+    throw new Error("Task GitHub host must be a valid hostname.");
+  return host;
+}
+
+function requiredChecksFromContract(contract) {
+  if (!contract || typeof contract !== "object" || Array.isArray(contract))
+    return [];
+  return contract.requiredChecks ??
+    contract.required_checks ??
+    contract.ciChecks ??
+    contract.requiredCiChecks ??
+    contract.ci?.requiredChecks ??
+    contract.ci?.required_checks ??
+    [];
+}
+
+function acceptedConclusionsFromContract(contract) {
+  if (!contract || typeof contract !== "object" || Array.isArray(contract))
+    return ["success"];
+  return contract.acceptedConclusions ??
+    contract.accepted_conclusions ??
+    contract.ci?.acceptedConclusions ??
+    contract.ci?.accepted_conclusions ??
+    ["success"];
+}
+
+function sameStringSet(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length)
+    return false;
+  const leftSorted = [...left].sort();
+  const rightSorted = [...right].sort();
+  return leftSorted.every((value, index) => value === rightSorted[index]);
 }
 
 function localGatesFromContract(contract) {
@@ -1087,16 +1132,32 @@ async function fetchGitHubJson(url, token) {
   return await res.json();
 }
 
+async function fetchGitHubPages({ apiBase, repository, sha, path, key }) {
+  const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+  const items = [];
+  for (let page = 1; page <= 20; page += 1) {
+    const url = `${apiBase}/repos/${repository}/commits/${sha}/${path}?per_page=100&page=${page}`;
+    const data = await fetchGitHubJson(url, token);
+    const pageItems = Array.isArray(data?.[key]) ? data[key] : [];
+    items.push(...pageItems);
+    if (pageItems.length < 100) break;
+  }
+  return items;
+}
+
 export const defaultGitHubAdapter = {
   async fetchCheckRuns({ repository, sha, githubHost = "github.com" }) {
     const apiBase =
       githubHost === "github.com"
         ? "https://api.github.com"
         : `https://${githubHost}/api/v3`;
-    const url = `${apiBase}/repos/${repository}/commits/${sha}/check-runs`;
-    const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
-    const data = await fetchGitHubJson(url, token);
-    return data.check_runs ?? [];
+    return fetchGitHubPages({
+      apiBase,
+      repository,
+      sha,
+      path: "check-runs",
+      key: "check_runs",
+    });
   },
 
   async fetchCommitStatuses({ repository, sha, githubHost = "github.com" }) {
@@ -1104,10 +1165,13 @@ export const defaultGitHubAdapter = {
       githubHost === "github.com"
         ? "https://api.github.com"
         : `https://${githubHost}/api/v3`;
-    const url = `${apiBase}/repos/${repository}/commits/${sha}/status`;
-    const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
-    const data = await fetchGitHubJson(url, token);
-    return data.statuses ?? [];
+    return fetchGitHubPages({
+      apiBase,
+      repository,
+      sha,
+      path: "status",
+      key: "statuses",
+    });
   },
 };
 
@@ -1220,6 +1284,9 @@ export class RuntimeStore {
     beforeRemotePush,
     gitHubAdapter,
     gitHubClient,
+    waitClock = () => Date.now(),
+    waitTimer = globalThis,
+    waitObserver,
   } = {}) {
     this.dbPath = dbPath;
     this.piCommand = piCommand;
@@ -1248,6 +1315,18 @@ export class RuntimeStore {
       throw new Error("Remote publication transport must provide readRef and push.");
     this.beforeRemotePush = beforeRemotePush;
     this.gitHubAdapter = gitHubAdapter ?? gitHubClient ?? defaultGitHubAdapter;
+    this.waitClock = typeof waitClock === "function" ? waitClock : () => Date.now();
+    this.waitTimer = waitTimer ?? globalThis;
+    if (
+      typeof this.waitTimer.setTimeout !== "function" ||
+      typeof this.waitTimer.clearTimeout !== "function"
+    )
+      throw new Error("Wait reactor timer must provide setTimeout and clearTimeout.");
+    this.waitObserver = waitObserver ?? null;
+    this.waitReactorEnabled = false;
+    this.waitReactorTimer = null;
+    this.waitReactorRunning = false;
+    this.waitReactorRequested = false;
     this.databaseLock = null;
     this.db = null;
     this.active = null;
@@ -2665,56 +2744,62 @@ export class RuntimeStore {
         { code: "unconfirmed_remote_publication" },
       );
     }
+    if (
+      Number(confirmedEffect.controlVersion) !== Number(taskRow.controlVersion) ||
+      Number(confirmedEffect.contractVersion) !== Number(taskRow.contractVersion)
+    ) {
+      throw Object.assign(
+        new Error("Wait registration requires a publication accepted under the current Task contract."),
+        { code: "stale_remote_publication" },
+      );
+    }
 
     const taskAuthority = parsed(taskRow.authority, {});
     const remoteAuth = taskAuthority?.remotePublication ?? taskAuthority?.remote_publication;
 
-    const rawRepoId =
-      repositoryId ??
-      repository_id ??
+    const trustedRepoId = boundedRemoteRepositoryId(
       confirmedEffect.repository ??
-      remoteAuth?.repositoryId ??
-      remoteAuth?.repository_id;
-    const normalizedRepoId = boundedRemoteRepositoryId(rawRepoId);
-    if (!normalizedRepoId) {
+        remoteAuth?.repositoryId ??
+        remoteAuth?.repository_id,
+    );
+    if (!trustedRepoId) {
       throw Object.assign(
         new Error("Wait registration requires a canonical repository identity."),
         { code: "invalid_repository_id" },
       );
     }
-
-    const repoNameSnapshot = String(
-      repositoryNameSnapshot ??
-      repository_name_snapshot ??
-      normalizedRepoId,
-    ).trim();
-
-    const rawHost =
-      githubHost ??
-      github_host ??
-      remoteAuth?.githubHost ??
-      remoteAuth?.github_host ??
-      "github.com";
-    if (typeof rawHost !== "string" || !rawHost.trim() || rawHost.includes("\0")) {
+    const requestedRepoId = repositoryId ?? repository_id;
+    if (
+      requestedRepoId != null &&
+      boundedRemoteRepositoryId(requestedRepoId) !== trustedRepoId
+    ) {
       throw Object.assign(
-        new Error("Wait registration requires a valid GitHub host."),
-        { code: "invalid_github_host" },
+        new Error("Wait registration repository does not match accepted remote authority."),
+        { code: "wait_authority_mismatch" },
       );
     }
-    const normalizedHost = rawHost.trim().toLowerCase();
+    const normalizedRepoId = trustedRepoId;
+    const repoNameSnapshot = normalizedRepoId;
+
+    const trustedHost = normalizeGithubHost(
+      remoteAuth?.githubHost ?? remoteAuth?.github_host,
+    );
+    const requestedHost = githubHost ?? github_host;
+    const normalizedHost = normalizeGithubHost(requestedHost ?? trustedHost);
+    if (normalizedHost !== trustedHost) {
+      throw Object.assign(
+        new Error("Wait registration GitHub host does not match accepted remote authority."),
+        { code: "wait_authority_mismatch" },
+      );
+    }
 
     const completionContract = parsed(taskRow.completionContract, {});
-    const rawChecks =
-      requiredChecks ??
-      required_checks ??
-      checks ??
-      completionContract?.requiredChecks ??
-      completionContract?.required_checks ??
-      completionContract?.ciChecks ??
-      completionContract?.requiredCiChecks ??
-      completionContract?.ci?.requiredChecks ??
-      completionContract?.ci?.required_checks ??
-      [];
+    const trustedChecks = requiredChecksFromContract(completionContract);
+    const requestedChecks = requiredChecks ?? required_checks ?? checks;
+    const rawChecks = requestedChecks ?? trustedChecks;
+    const checkSelectorsMatch =
+      requestedChecks == null ||
+      (Array.isArray(requestedChecks) && sameStringSet(requestedChecks, trustedChecks));
 
     if (!Array.isArray(rawChecks) || rawChecks.length === 0) {
       throw Object.assign(
@@ -2746,15 +2831,24 @@ export class RuntimeStore {
       }
       return selector.trim();
     });
+    if (!checkSelectorsMatch) {
+      throw Object.assign(
+        new Error("Wait registration check selectors do not match the accepted Completion Contract."),
+        { code: "wait_authority_mismatch" },
+      );
+    }
 
-    const rawConclusions =
-      acceptedConclusions ??
-      accepted_conclusions ??
-      conclusions ??
-      completionContract?.acceptedConclusions ??
-      completionContract?.accepted_conclusions ??
-      ["success"];
-
+    const trustedConclusions = acceptedConclusionsFromContract(completionContract);
+    const requestedConclusions =
+      acceptedConclusions ?? accepted_conclusions ?? conclusions;
+    const rawConclusions = requestedConclusions ?? trustedConclusions;
+    const conclusionsMatch =
+      requestedConclusions == null ||
+      (Array.isArray(requestedConclusions) &&
+        sameStringSet(
+          requestedConclusions.map((value) => String(value).trim().toLowerCase()),
+          trustedConclusions.map((value) => String(value).trim().toLowerCase()),
+        ));
     if (!Array.isArray(rawConclusions) || rawConclusions.length === 0) {
       throw Object.assign(
         new Error("Wait registration requires at least one accepted conclusion."),
@@ -2775,6 +2869,12 @@ export class RuntimeStore {
       }
       return conclusion.trim().toLowerCase();
     });
+    if (!conclusionsMatch) {
+      throw Object.assign(
+        new Error("Wait registration conclusions do not match the accepted Completion Contract."),
+        { code: "wait_authority_mismatch" },
+      );
+    }
 
     const requestedDeadline = deadlineAt ?? deadline_at;
     let normalizedDeadlineAt;
@@ -2801,7 +2901,14 @@ export class RuntimeStore {
           { code: "invalid_timeout" },
         );
       }
-      normalizedDeadlineAt = new Date(Date.now() + timeout).toISOString();
+      const clockTime = new Date(this.waitClock()).getTime();
+      if (!Number.isFinite(clockTime)) {
+        throw Object.assign(
+          new Error("Wait reactor clock returned an invalid time."),
+          { code: "invalid_wait_clock" },
+        );
+      }
+      normalizedDeadlineAt = new Date(clockTime + timeout).toISOString();
     }
 
     const subscriptionId = randomUUID();
@@ -2962,6 +3069,16 @@ export class RuntimeStore {
         new Error("Fresh Executor could not be safely retired when parking Task on wait."),
         { code: "worker_retirement_unproven" },
       );
+    }
+
+    if (this.waitReactorEnabled) {
+      await this.reconcileWaitSubscription(subscriptionId, {
+        now: this.waitClock(),
+        gitHubAdapter: this.waitObserver ?? this.gitHubAdapter,
+        trigger: true,
+        internal: true,
+      });
+      this.#scheduleWaitReactor();
     }
 
     const subscriptionRow = this.db
@@ -3782,13 +3899,90 @@ export class RuntimeStore {
     return this.triggerWaitSubscription(id, opts);
   }
 
+  #scheduleWaitReactor() {
+    if (!this.waitReactorEnabled || this.closed || !this.db) return;
+    if (this.waitReactorTimer) this.waitTimer.clearTimeout(this.waitReactorTimer);
+    const clockValue = this.waitClock();
+    const currentTime = new Date(clockValue).getTime();
+    const next = this.db
+      .prepare(`SELECT MIN(next_reconcile_at) AS nextReconcileAt
+        FROM wait_subscriptions WHERE status = 'active'`)
+      .get()?.nextReconcileAt;
+    const nextTime = next ? new Date(next).getTime() : Number.NaN;
+    const delay = Number.isFinite(nextTime)
+      ? Math.max(0, nextTime - currentTime)
+      : WAIT_REACTOR_IDLE_INTERVAL_MS;
+    this.waitReactorTimer = this.waitTimer.setTimeout(() => {
+      this.waitReactorTimer = null;
+      void this.#runWaitReactor();
+    }, delay);
+    this.waitReactorTimer?.unref?.();
+  }
+
+  async #runWaitReactor() {
+    if (!this.waitReactorEnabled || this.closed || !this.db) return;
+    if (this.waitReactorRunning) {
+      this.waitReactorRequested = true;
+      return;
+    }
+    this.waitReactorRunning = true;
+    try {
+      do {
+        this.waitReactorRequested = false;
+        await this.reconcileActiveWaits({
+          dueOnly: true,
+          now: this.waitClock(),
+          gitHubAdapter: this.waitObserver ?? this.gitHubAdapter,
+          trigger: true,
+          internal: true,
+        });
+      } while (this.waitReactorRequested);
+    } finally {
+      this.waitReactorRunning = false;
+      this.#scheduleWaitReactor();
+    }
+  }
+
+  async startWaitReactor({ observer } = {}) {
+    this.open();
+    if (observer) this.waitObserver = observer;
+    this.waitReactorEnabled = true;
+    try {
+      return await this.reconcileActiveWaits({
+        now: this.waitClock(),
+        gitHubAdapter: this.waitObserver ?? this.gitHubAdapter,
+        trigger: true,
+        internal: true,
+      });
+    } finally {
+      this.#scheduleWaitReactor();
+    }
+  }
+
+  stopWaitReactor() {
+    this.waitReactorEnabled = false;
+    this.waitReactorRequested = false;
+    if (this.waitReactorTimer) this.waitTimer.clearTimeout(this.waitReactorTimer);
+    this.waitReactorTimer = null;
+  }
+
   async reconcileActiveWaits(options = {}) {
     this.open();
-    const rows = this.db
-      .prepare(
-        "SELECT id FROM wait_subscriptions WHERE status = 'active' ORDER BY created_at, id",
-      )
-      .all();
+    const dueOnly = options.dueOnly === true;
+    const nowValue = options.now ?? this.waitClock();
+    const nowTime = new Date(nowValue).getTime();
+    const rows = dueOnly
+      ? this.db
+          .prepare(`SELECT id FROM wait_subscriptions
+            WHERE status = 'active' AND
+              (next_reconcile_at IS NULL OR next_reconcile_at <= ?)
+            ORDER BY created_at, id`)
+          .all(new Date(nowTime).toISOString())
+      : this.db
+          .prepare(
+            "SELECT id FROM wait_subscriptions WHERE status = 'active' ORDER BY created_at, id",
+          )
+          .all();
     const results = [];
     for (const row of rows) {
       try {
@@ -5195,7 +5389,8 @@ export class RuntimeStore {
       const current = this.#supervisorState(active);
       if (!current) return;
       const task = current.task;
-      const gates = localGatesFromContract(parsed(task.completionContract));
+      const completionContract = parsed(task.completionContract);
+      const gates = localGatesFromContract(completionContract);
       // A contract without an explicit local criterion remains under the
       // #50 Supervisor seam; it must not turn executor prose into completion.
       if (gates.length === 0) return;
@@ -5304,6 +5499,22 @@ export class RuntimeStore {
       ]);
       if (finalStatus)
         throw new Error("Task worktree changed during local verification.");
+
+      // A local pass is only a rung in the ladder when the accepted contract
+      // also requires remote CI. Publish this exact candidate and park the
+      // Task on an exact-SHA wait; never emit verified_local in that case.
+      const requiredChecks = requiredChecksFromContract(completionContract);
+      if (requiredChecks.length > 0) {
+        await this.publishTask({ id: task.id, candidateSha: recordedCandidateSha });
+        await this.registerWaitSubscription({
+          taskId: task.id,
+          revisionSha: recordedCandidateSha,
+          requiredChecks,
+          acceptedConclusions: acceptedConclusionsFromContract(completionContract),
+        });
+        return;
+      }
+
       const retired = await this.retireWorker(
         active.worker,
         active.workerMetadata,
@@ -6268,6 +6479,7 @@ export class RuntimeStore {
 
   release() {
     if (this.closed) return;
+    this.stopWaitReactor();
     const active = this.active;
     try {
       if (active) {

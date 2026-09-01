@@ -175,7 +175,7 @@ async function fixture({
     authority: taskAuthority,
     completionContract: completionContract ?? {
       objective: "reconcile task on CI wait",
-      requiredChecks: ["check_run:github-actions/ci", "commit_status:build"],
+      requiredChecks: ["check_run:github-actions/ci"],
     },
   });
   await eventually(
@@ -209,7 +209,12 @@ async function closeFixture(fixtureValue) {
 }
 
 test("1. exact R has all required checks success -> normalized success", async () => {
-  const value = await fixture();
+  const value = await fixture({
+    completionContract: {
+      objective: "reconcile task on CI wait",
+      requiredChecks: ["check_run:github-actions/ci", "commit_status:build"],
+    },
+  });
   try {
     const candidateR = await commitCandidate(
       value.task.taskWorktree,
@@ -279,7 +284,12 @@ test("1. exact R has all required checks success -> normalized success", async (
 });
 
 test("2. wrong SHA is green but R pending -> R remains pending", async () => {
-  const value = await fixture();
+  const value = await fixture({
+    completionContract: {
+      objective: "reconcile task on CI wait",
+      requiredChecks: ["check_run:github-actions/ci", "commit_status:build"],
+    },
+  });
   try {
     const candidateR = await commitCandidate(
       value.task.taskWorktree,
@@ -335,7 +345,12 @@ test("2. wrong SHA is green but R pending -> R remains pending", async () => {
 });
 
 test("3. one required selector missing -> pending", async () => {
-  const value = await fixture();
+  const value = await fixture({
+    completionContract: {
+      objective: "reconcile task on CI wait",
+      requiredChecks: ["check_run:github-actions/ci", "commit_status:coverage"],
+    },
+  });
   try {
     const candidateR = await commitCandidate(
       value.task.taskWorktree,
@@ -386,7 +401,12 @@ test("3. one required selector missing -> pending", async () => {
 });
 
 test("4. one required selector fails -> failure", async () => {
-  const value = await fixture();
+  const value = await fixture({
+    completionContract: {
+      objective: "reconcile task on CI wait",
+      requiredChecks: ["check_run:github-actions/ci", "commit_status:build"],
+    },
+  });
   try {
     const candidateR = await commitCandidate(
       value.task.taskWorktree,
@@ -441,7 +461,12 @@ test("4. one required selector fails -> failure", async () => {
 });
 
 test("5. unrelated green check does not satisfy required selector", async () => {
-  const value = await fixture();
+  const value = await fixture({
+    completionContract: {
+      objective: "reconcile task on CI wait",
+      requiredChecks: ["check_run:github-actions/required-gate"],
+    },
+  });
   try {
     const candidateR = await commitCandidate(
       value.task.taskWorktree,
@@ -497,7 +522,12 @@ test("5. unrelated green check does not satisfy required selector", async () => 
 });
 
 test("6. neutral/skipped rejected by default and accepted only when contract allows", async () => {
-  const value = await fixture();
+  const value = await fixture({
+    completionContract: {
+      objective: "reconcile task on CI wait",
+      requiredChecks: ["check_run:github-actions/ci"],
+    },
+  });
   try {
     const candidateR = await commitCandidate(
       value.task.taskWorktree,
@@ -547,26 +577,28 @@ test("6. neutral/skipped rejected by default and accepted only when contract all
     );
     assert.equal(resSkipped.classification, "failure");
 
-    // 6b: Custom acceptedConclusions allowing skipped and neutral
-    const customWait = await value.runtime.registerWaitSubscription({
-      taskId: value.task.id,
-      revisionSha: candidateR,
-      requiredChecks: ["check_run:github-actions/ci"],
-      acceptedConclusions: ["success", "neutral", "skipped"],
-    });
-
-    const resCustom = await value.runtime.reconcileWaitSubscription(
-      customWait.waitSubscription.id,
+    // 6b: A caller cannot widen the accepted conclusion policy.
+    await assert.rejects(
+      () => value.runtime.registerWaitSubscription({
+        taskId: value.task.id,
+        revisionSha: candidateR,
+        requiredChecks: ["check_run:github-actions/ci"],
+        acceptedConclusions: ["success", "neutral", "skipped"],
+      }),
+      (error) => error.code === "wait_authority_mismatch",
     );
-    assert.equal(resCustom.classification, "success");
-    assert.equal(resCustom.selectorResults[0].normalizedState, "success");
   } finally {
     await closeFixture(value);
   }
 });
 
 test("7. duplicate polling does not create unbounded duplicate Evidence", async () => {
-  const value = await fixture();
+  const value = await fixture({
+    completionContract: {
+      objective: "reconcile task on CI wait",
+      requiredChecks: ["check_run:github-actions/ci", "commit_status:build"],
+    },
+  });
   try {
     const candidateR = await commitCandidate(
       value.task.taskWorktree,

@@ -170,7 +170,10 @@ async function fixture({
     goal: "implement feature",
     trusted: true,
     authority: taskAuthority,
-    completionContract,
+    completionContract: completionContract ?? {
+      objective: "implement feature",
+      requiredChecks: ["check_run:github-actions/ci"],
+    },
     budget,
     model: { provider: "anthropic", id: "claude-3-5-sonnet" },
     thinkingLevel: "low",
