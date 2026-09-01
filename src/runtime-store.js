@@ -3144,6 +3144,33 @@ export class RuntimeStore {
       .map(waitSubscriptionSnapshot);
   }
 
+  #recordCiNotObservableEvidence(subscription, selector, observedAt) {
+    return this.#appendEvidence({
+      taskId: subscription.taskId,
+      attemptId: subscription.createdByAttemptId,
+      attemptRunId: null,
+      kind: "github_ci_control_observation",
+      source: "github_ci",
+      subject: subscription.revisionSha,
+      payload: {
+        waitSubscriptionId: subscription.id,
+        taskId: subscription.taskId,
+        generation: subscription.generation,
+        controlVersion: subscription.controlVersion,
+        contractVersion: subscription.contractVersion,
+        repository: subscription.repositoryId,
+        ref: subscription.publishedRef,
+        sha: subscription.revisionSha,
+        selector,
+        normalizedState: "ci_not_observable",
+        conclusion: null,
+        reason: "appearance_grace_expired",
+        observedAt,
+      },
+      dedupeKey: `github_ci_control_observation:${subscription.taskId}:${subscription.generation}:${subscription.controlVersion}:${subscription.contractVersion}:${subscription.repositoryId}:${subscription.publishedRef}:${subscription.revisionSha}:${selector}`,
+    });
+  }
+
   async reconcileWaitSubscription(
     subscriptionId,
     options = {},
@@ -3376,10 +3403,15 @@ export class RuntimeStore {
           const normalizedState = graceExpired
             ? "ci_not_observable"
             : "pending";
+          const evidenceId = graceExpired
+            ? this.#recordCiNotObservableEvidence(subscription, selector, nowIso)
+            : null;
+          if (evidenceId) evidenceIds.push(evidenceId);
           selectorResults.push({
             selector,
             normalizedState,
             matched: false,
+            evidenceId,
           });
         }
       } else if (selector.startsWith("commit_status:")) {
@@ -3449,10 +3481,15 @@ export class RuntimeStore {
           const normalizedState = graceExpired
             ? "ci_not_observable"
             : "pending";
+          const evidenceId = graceExpired
+            ? this.#recordCiNotObservableEvidence(subscription, selector, nowIso)
+            : null;
+          if (evidenceId) evidenceIds.push(evidenceId);
           selectorResults.push({
             selector,
             normalizedState,
             matched: false,
+            evidenceId,
           });
         }
       }
@@ -3555,7 +3592,7 @@ export class RuntimeStore {
           observed_at AS observedAt
         FROM evidence
         WHERE task_id = ? AND attempt_id = ? AND source = 'github_ci'
-          AND subject = ? AND kind IN ('github_check_observation', 'github_status_observation')
+          AND subject = ? AND kind IN ('github_check_observation', 'github_status_observation', 'github_ci_control_observation')
         ORDER BY observed_at DESC, id DESC`)
       .all(taskRow.id, waitRow.createdByAttemptId, waitRow.revisionSha);
     const latestBySelector = new Map();
@@ -3569,6 +3606,14 @@ export class RuntimeStore {
       const selector = payload?.selector;
       const normalizedState = payload?.normalizedState;
       const conclusion = payload?.conclusion;
+      const isControlObservation = row.kind === "github_ci_control_observation";
+      const isProviderObservation =
+        row.kind === "github_check_observation" ||
+        row.kind === "github_status_observation";
+      if (
+        !isProviderObservation && !isControlObservation
+      )
+        continue;
       if (
         payload?.waitSubscriptionId !== waitRow.id ||
         payload?.taskId !== taskRow.id ||
@@ -3576,18 +3621,28 @@ export class RuntimeStore {
         payload?.repository !== waitRow.repositoryId ||
         payload?.sha !== waitRow.revisionSha ||
         !requiredChecks.includes(selector) ||
-        !["success", "failure"].includes(normalizedState) ||
-        typeof conclusion !== "string" ||
-        !conclusion.trim() ||
-        (normalizedState === "success" &&
-          !acceptedConclusions.includes(conclusion.toLowerCase()))
+        (isControlObservation &&
+          (payload?.controlVersion == null ||
+            Number(payload.controlVersion) !== Number(waitRow.controlVersion) ||
+            payload?.contractVersion == null ||
+            Number(payload.contractVersion) !== Number(waitRow.contractVersion) ||
+            payload?.ref !== waitRow.publishedRef ||
+            normalizedState !== "ci_not_observable" ||
+            conclusion !== null ||
+            payload?.reason !== "appearance_grace_expired")) ||
+        (isProviderObservation &&
+          (!["success", "failure"].includes(normalizedState) ||
+            typeof conclusion !== "string" ||
+            !conclusion.trim() ||
+            (normalizedState === "success" &&
+              !acceptedConclusions.includes(conclusion.toLowerCase()))))
       )
         continue;
       latestBySelector.set(selector, {
         selector,
         normalizedState,
-        conclusion: conclusion.toLowerCase(),
-        matched: true,
+        conclusion: typeof conclusion === "string" ? conclusion.toLowerCase() : null,
+        matched: !isControlObservation,
         evidenceId: row.id,
         observedAt: row.observedAt,
       });
@@ -3755,7 +3810,75 @@ export class RuntimeStore {
       );
       const evidenceRefsJson = JSON.stringify(allEvidenceIds);
 
-      if (classification === "success") {
+      if (classification === "ci_not_observable") {
+        // A missing required selector is a bounded external-observability block,
+        // not a CI failure. End the wait and retain the exact control receipt
+        // without manufacturing a failed provider result or repair Attempt.
+        const terminalDetail = `Required GitHub CI selector(s) did not appear within the grace window for revision ${waitRow.revisionSha}.`;
+        const taskUpdate = this.db
+          .prepare(
+            `UPDATE tasks SET state = 'blocked', updated_at = ?, final_result = ?,
+            terminal_detail = ?, final_branch_head = ?, final_revision = ?,
+            completion_evidence_ref = ?, terminal_reason = ?
+            WHERE id = ? AND state IN ('waiting', 'running', 'accepted')
+            AND control_version = ? AND contract_version = ?`,
+          )
+          .run(
+            timestamp,
+            null,
+            terminalDetail,
+            waitRow.revisionSha,
+            waitRow.revisionSha,
+            evidenceRefsJson,
+            "ci_not_observable",
+            taskRow.id,
+            taskRow.controlVersion,
+            taskRow.contractVersion,
+          );
+        if (taskUpdate.changes !== 1)
+          throw new Error("Task state CAS failed when blocking unobservable CI.");
+
+        const attemptUpdate = this.db
+          .prepare(
+            `UPDATE attempts SET state = 'failed', finished_at = ?, worker_terminated = 1,
+            final_result = ?, terminal_detail = ?, final_branch_head = ?
+            WHERE id = ? AND task_id = ? AND state = 'parked_wait'
+              AND worker_terminated = 1 AND gate_terminated = 1`,
+          )
+          .run(
+            timestamp,
+            null,
+            terminalDetail,
+            waitRow.revisionSha,
+            waitRow.createdByAttemptId,
+            taskRow.id,
+          );
+        if (attemptUpdate.changes !== 1)
+          throw new Error("Parked Attempt fence rejected unobservable CI block.");
+
+        const waitUpdate = this.db
+          .prepare(
+            `UPDATE wait_subscriptions SET status = 'triggered',
+            trigger_evidence_id = ?, last_reconciled_at = ?, next_reconcile_at = NULL
+            WHERE id = ? AND status = 'active'`,
+          )
+          .run(triggerEvidenceId, timestamp, id);
+        if (waitUpdate.changes !== 1)
+          throw new Error("Wait subscription trigger CAS failed.");
+
+        const resultId = this.#insertResultDelivery({
+          task: this.#taskRow(taskRow.id),
+          outcome: "failed",
+          finalResult: null,
+          terminalDetail,
+          terminalReason: "ci_not_observable",
+          finalRevision: waitRow.revisionSha,
+          finalBranchHead: waitRow.revisionSha,
+          evidenceRefs: allEvidenceIds,
+        });
+        if (!resultId)
+          throw new Error("Blocked Task did not produce a Result delivery.");
+      } else if (classification === "success") {
         // 7A. CI Success without remaining model work: CAS Task -> completed
         const taskUpdate = this.db
           .prepare(

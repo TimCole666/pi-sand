@@ -20,7 +20,7 @@ const eventually = async (read, predicate) => {
   throw new Error("timed out waiting for deterministic runtime state");
 };
 
-async function fixture() {
+async function fixture({ budget, waitClock, waitTimer } = {}) {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-convergence-"));
   const source = join(parent, "source");
   const remote = join(parent, "fixture", "repository.git");
@@ -67,6 +67,8 @@ async function fixture() {
     piCommand,
     worktreeRoot: join(parent, "worktrees"),
     gitHubAdapter: adapter,
+    waitClock,
+    waitTimer,
     remoteTransport: {
       readRef: () => publishedSha,
       push: ({ newOid }) => {
@@ -89,6 +91,7 @@ async function fixture() {
     model: { provider: "provider", id: "model" },
     thinkingLevel: "high",
     authority,
+    budget,
     completionContract: {
       objective: "verify and wait",
       localGates: [{ id: "build", command: [process.execPath, "-e", "process.exit(0)"] }],
@@ -204,6 +207,102 @@ test("daemon-owned wait reactor reconciles a due CI change without a user reques
     scheduled.callback();
     const completed = await eventually(() => value.runtime.getTask(value.task.id), (task) => task.state === "completed");
     assert.equal(completed.terminalReason, "verified_ci");
+  } finally {
+    value.runtime.stopWaitReactor();
+    await closeFixture(value);
+  }
+});
+
+test("due reactor persists exact ci_not_observable control evidence and terminalizes once", async () => {
+  let clock = Date.now();
+  const timers = [];
+  const timer = {
+    setTimeout(callback, delay) {
+      const entry = { callback, delay, unref() {} };
+      timers.push(entry);
+      return entry;
+    },
+    clearTimeout(entry) {
+      const index = timers.indexOf(entry);
+      if (index >= 0) timers.splice(index, 1);
+    },
+  };
+  const value = await fixture({
+    budget: { ciCheckAppearanceGraceMs: 60_000 },
+    waitClock: () => clock,
+    waitTimer: timer,
+  });
+  try {
+    const waiting = await eventually(() => value.runtime.getTask(value.task.id), (task) => task.state === "waiting");
+    const waitId = waiting.waitSubscriptions[0].id;
+    await value.runtime.startWaitReactor({ observer: value.adapter });
+    const firstDue = timers.shift();
+    assert.ok(firstDue);
+    const firstNext = value.runtime.getWaitSubscription(waitId).nextReconcileAt;
+
+    clock += firstDue.delay + 1;
+    firstDue.callback();
+    await eventually(
+      () => value.runtime.getWaitSubscription(waitId),
+      (subscription) => subscription.nextReconcileAt !== firstNext,
+    );
+    await eventually(() => timers.length, (count) => count > 0);
+    const graceDue = timers.shift();
+    assert.ok(graceDue);
+    clock = Date.parse(value.runtime.getWaitSubscription(waitId).nextReconcileAt) + 1;
+    graceDue.callback();
+    const blocked = await eventually(
+      () => value.runtime.getTask(value.task.id),
+      (task) => task.state === "blocked",
+    );
+    const waitAfter = value.runtime.getWaitSubscription(waitId);
+    assert.equal(waitAfter.status, "triggered");
+    assert.equal(waitAfter.continuationAttemptId, null);
+    assert.equal(blocked.terminalReason, "ci_not_observable");
+    assert.equal(blocked.finalRevision, waiting.finalRevision);
+
+    const controlEvidence = blocked.evidence.filter(
+      (e) => e.kind === "github_ci_control_observation",
+    );
+    assert.equal(controlEvidence.length, 2);
+    for (const evidence of controlEvidence) {
+      assert.deepEqual(
+        {
+          taskId: evidence.payload.taskId,
+          waitSubscriptionId: evidence.payload.waitSubscriptionId,
+          generation: evidence.payload.generation,
+          controlVersion: evidence.payload.controlVersion,
+          contractVersion: evidence.payload.contractVersion,
+          repository: evidence.payload.repository,
+          ref: evidence.payload.ref,
+          sha: evidence.payload.sha,
+          selector: evidence.payload.selector,
+          normalizedState: evidence.payload.normalizedState,
+        },
+        {
+          taskId: value.task.id,
+          waitSubscriptionId: waitId,
+          generation: waitAfter.generation,
+          controlVersion: waitAfter.controlVersion,
+          contractVersion: waitAfter.contractVersion,
+          repository: waitAfter.repositoryId,
+          ref: waitAfter.publishedRef,
+          sha: waitAfter.revisionSha,
+          selector: evidence.payload.selector,
+          normalizedState: "ci_not_observable",
+        },
+      );
+      assert.match(evidence.dedupeKey, /^github_ci_control_observation:/);
+    }
+    const deliveries = value.runtime.db
+      .prepare("SELECT * FROM result_deliveries WHERE task_id = ?")
+      .all(value.task.id);
+    assert.equal(deliveries.length, 1);
+    assert.equal(deliveries[0].outcome, "failed");
+    assert.match(deliveries[0].payload, /ci_not_observable/);
+    assert.equal(blocked.attempts.length, 1);
+    assert.equal(blocked.attempts[0].state, "failed");
+    assert.equal(blocked.attempts[0].workerTerminated, true);
   } finally {
     value.runtime.stopWaitReactor();
     await closeFixture(value);
