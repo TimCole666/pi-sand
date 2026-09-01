@@ -41,9 +41,21 @@ export const MAX_ATTEMPT_RUNS_PER_ATTEMPT = 4;
 export const MAX_CONTINUATION_PROMPT_LENGTH = MAX_TASK_PACKET_LENGTH;
 export const COMMITMENT_CONTRACT_VERSION = 1;
 export const COMMITMENT_CONTROL_VERSION = 1;
+export const REMOTE_REF_PREFIX = "refs/heads/pi-sand/";
+export const MAX_REMOTE_PUBLICATIONS = 3;
+export const MAX_REMOTE_EFFECTS_PER_TASK = 32;
+export const MAX_REMOTE_REPOSITORY_ID_LENGTH = 1_024;
+export const MAX_REMOTE_EFFECT_DETAIL_LENGTH = 2 * 1_024;
 const INITIAL_ATTEMPT_RUN_SEQUENCE = 1;
 const ACTIVE_ATTEMPT_STATES = new Set(["starting", "running"]);
 const ACTIVE_GATE_STATES = new Set(["running", "ambiguous"]);
+const REMOTE_EFFECT_STATES = new Set([
+  "prepared",
+  "transmitted_unknown",
+  "confirmed",
+  "conflict",
+  "failed",
+]);
 const RETRYABLE_TASK_STATES = new Set(["failed", "stopped", "interrupted"]);
 const WORKER_RETIRE_TIMEOUT_MS = 2_000;
 const now = () => new Date().toISOString();
@@ -136,6 +148,15 @@ const EVIDENCE_SELECT = `SELECT id, task_id AS taskId, attempt_id AS attemptId,
   attempt_run_id AS attemptRunId, kind, source, subject, subject_digest AS subjectDigest,
   payload, payload_digest AS payloadDigest, dedupe_key AS dedupeKey,
   observed_at AS observedAt FROM evidence`;
+const REMOTE_EFFECT_SELECT = `SELECT id, task_id AS taskId,
+  control_version AS controlVersion, contract_version AS contractVersion,
+  remote, repository, remote_url_digest AS remoteUrlDigest, ref,
+  expected_old_oid AS expectedOldOid, new_oid AS newOid,
+  action_digest AS actionDigest, state, attempt_count AS attemptCount,
+  detail, created_at AS createdAt, prepared_at AS preparedAt,
+  transmitted_at AS transmittedAt, confirmed_at AS confirmedAt,
+  updated_at AS updatedAt, last_readback_oid AS lastReadbackOid
+  FROM remote_effects`;
 const RESULT_SELECT = `SELECT id, task_id AS taskId,
   control_version AS controlVersion, contract_version AS contractVersion,
   kind, outcome, payload, payload_digest AS payloadDigest, state,
@@ -182,6 +203,183 @@ function promptDigest(prompt) {
 
 function digest(value) {
   return createHash("sha256").update(String(value), "utf8").digest("hex");
+}
+
+function exactOid(value) {
+  return typeof value === "string" && /^[0-9a-f]{40}$/i.test(value)
+    ? value
+    : null;
+}
+
+function remoteError(code, message, cause) {
+  return Object.assign(new Error(message), { code, cause });
+}
+
+function remoteDetail(error) {
+  const code = typeof error?.code === "string" ? error.code : "transport";
+  return `Remote Git ${code} failure.`;
+}
+
+function remoteCredentialField(key) {
+  return /token|secret|password|credential|authorization|private.?key|api.?key/i.test(
+    String(key),
+  );
+}
+
+function assertNoRemoteCredentials(value, path = "authority") {
+  if (!value || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    for (const [index, entry] of value.entries())
+      assertNoRemoteCredentials(entry, `${path}[${index}]`);
+    return;
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    if (remoteCredentialField(key))
+      throw new Error(`${path} contains a credential field.`);
+    if (
+      typeof entry === "string" &&
+      /:\/\/[^/\\s:@]+:[^@\\s]+@/.test(entry)
+    )
+      throw new Error(`${path}.${key} contains embedded credentials.`);
+    assertNoRemoteCredentials(entry, `${path}.${key}`);
+  }
+}
+
+function boundedRemoteRepositoryId(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const repository = value.trim();
+  if (
+    repository.includes("\0") ||
+    Buffer.byteLength(repository, "utf8") > MAX_REMOTE_REPOSITORY_ID_LENGTH
+  )
+    throw new Error("Remote publication repository identity is bounded.");
+  if (/:[^/\\s:@]+@/.test(repository))
+    throw new Error("Remote publication repository identity cannot contain credentials.");
+  return repository;
+}
+
+function remotePublicationAuthority(authority) {
+  const parsedAuthority = parsed(authority, null);
+  const raw =
+    parsedAuthority?.remotePublication ?? parsedAuthority?.remote_publication;
+  if (raw == null) return null;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw))
+    throw new Error("Task remotePublication authority must be a JSON object.");
+  assertNoRemoteCredentials(raw, "authority.remotePublication");
+  const remote = raw.remote ?? raw.remoteName ?? raw.remote_name;
+  const repository = boundedRemoteRepositoryId(
+    raw.repositoryId ??
+      raw.repository_id ??
+      raw.repository ??
+      raw.repositoryIdentity ??
+      raw.repository_identity,
+  );
+  const allowedRefPrefix =
+    raw.allowedRefPrefix ?? raw.allowed_ref_prefix ?? REMOTE_REF_PREFIX;
+  const allowCreateOrFastForward =
+    raw.allowCreateOrFastForward ?? raw.allow_create_or_fast_forward;
+  const allowRewrite = raw.allowRewrite ?? raw.allow_rewrite ?? false;
+  const allowDelete = raw.allowDelete ?? raw.allow_delete ?? false;
+  const allowPr = raw.allowPr ?? raw.allow_pr ?? false;
+  const allowMerge = raw.allowMerge ?? raw.allow_merge ?? false;
+  const maxPublications = Number(
+    raw.maxPublications ??
+      raw.max_publications ??
+      raw.publicationBudget ??
+      MAX_REMOTE_PUBLICATIONS,
+  );
+  const remoteUrlDigest =
+    raw.remoteUrlDigest ?? raw.remote_url_digest ?? null;
+  if (remote !== "origin")
+    throw new Error("Remote publication authority must name origin.");
+  if (repository === null)
+    throw new Error("Remote publication authority requires repository identity.");
+  if (allowedRefPrefix !== REMOTE_REF_PREFIX)
+    throw new Error("Remote publication authority has an unsupported ref prefix.");
+  if (allowCreateOrFastForward !== true)
+    throw new Error("Remote publication authority must allow create/fast-forward.");
+  if ([allowRewrite, allowDelete, allowPr, allowMerge].some((value) => value === true))
+    throw new Error("Remote publication authority permits an out-of-scope mutation.");
+  if (!Number.isInteger(maxPublications) || maxPublications <= 0 || maxPublications > MAX_REMOTE_PUBLICATIONS)
+    throw new Error("Remote publication budget is bounded.");
+  if (
+    remoteUrlDigest !== null &&
+    (typeof remoteUrlDigest !== "string" || !/^[0-9a-f]{64}$/i.test(remoteUrlDigest))
+  )
+    throw new Error("Remote publication remote URL digest is invalid.");
+  return {
+    provider: typeof raw.provider === "string" && raw.provider.trim()
+      ? raw.provider.trim()
+      : "git",
+    remote,
+    repositoryId: repository,
+    remoteUrlDigest: remoteUrlDigest?.toLowerCase() ?? null,
+    allowedRefPrefix,
+    allowCreateOrFastForward: true,
+    allowRewrite: false,
+    allowDelete: false,
+    allowPr: false,
+    allowMerge: false,
+    maxPublications,
+  };
+}
+
+function normalizeAuthority(authority) {
+  if (authority == null) return DEFAULT_AUTHORITY;
+  if (typeof authority !== "object" || Array.isArray(authority)) return authority;
+  const rawRemote = authority.remotePublication ?? authority.remote_publication;
+  if (rawRemote == null) return authority;
+  const remote = remotePublicationAuthority(authority);
+  const normalized = { ...authority, remotePublication: remote };
+  delete normalized.remote_publication;
+  return normalized;
+}
+
+function remotePublicationRequired(contract) {
+  if (!contract || typeof contract !== "object" || Array.isArray(contract))
+    return false;
+  const raw = contract.remotePublication ?? contract.remote_publication;
+  return contract.requiresRemotePublication === true ||
+    contract.remotePublicationRequired === true ||
+    raw?.required === true ||
+    raw?.publish === true;
+}
+
+function readExactRemoteRef({ cwd, remote, ref }) {
+  let output;
+  try {
+    output = execFileSync(
+      "git",
+      ["ls-remote", "--exit-code", "--refs", remote, ref],
+      { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    );
+  } catch (error) {
+    if (error?.status === 2 && !String(error.stdout ?? "").trim()) return null;
+    throw remoteError("read", "Remote ref read failed.", error);
+  }
+  const rows = String(output)
+    .trim()
+    .split("\\n")
+    .filter(Boolean)
+    .map((line) => line.split("\\t"));
+  if (rows.length === 0) return null;
+  if (rows.length !== 1 || rows[0][1] !== ref || !exactOid(rows[0][0]))
+    throw remoteError("read", "Remote ref read was not exact.");
+  return rows[0][0].toLowerCase();
+}
+
+function pushExactRemoteRef({ cwd, remote, ref, expectedOldOid, newOid }) {
+  execFileSync(
+    "git",
+    [
+      "push",
+      "--porcelain",
+      remote,
+      `${newOid}:${ref}`,
+      `--force-with-lease=${ref}:${expectedOldOid ?? ""}`,
+    ],
+    { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+  );
 }
 
 function sortedSnapshot(value) {
@@ -364,6 +562,31 @@ function evidenceSnapshot(row) {
   };
 }
 
+function remoteEffectSnapshot(row) {
+  return {
+    id: row.id,
+    taskId: row.taskId,
+    controlVersion: row.controlVersion,
+    contractVersion: row.contractVersion,
+    remote: row.remote,
+    repository: row.repository,
+    remoteUrlDigest: row.remoteUrlDigest ?? null,
+    ref: row.ref,
+    expectedOldOid: row.expectedOldOid ?? null,
+    newOid: row.newOid,
+    actionDigest: row.actionDigest,
+    state: row.state,
+    attemptCount: Number(row.attemptCount ?? 0),
+    detail: row.detail ?? null,
+    createdAt: row.createdAt,
+    preparedAt: row.preparedAt,
+    transmittedAt: row.transmittedAt ?? null,
+    confirmedAt: row.confirmedAt ?? null,
+    updatedAt: row.updatedAt,
+    lastReadbackOid: row.lastReadbackOid ?? null,
+  };
+}
+
 function resultSnapshot(row) {
   if (!row) return null;
   return {
@@ -415,7 +638,7 @@ function attemptSnapshot(row, attemptRuns = []) {
   };
 }
 
-function taskSnapshot(row, attempts = [], evidence = []) {
+function taskSnapshot(row, attempts = [], evidence = [], remoteEffects = []) {
   return {
     id: row.id,
     sourceRepoRoot: row.sourceRepoRoot,
@@ -442,6 +665,7 @@ function taskSnapshot(row, attempts = [], evidence = []) {
     completionEvidenceRef: row.completionEvidenceRef ?? null,
     terminalReason: row.terminalReason ?? null,
     evidence,
+    remoteEffects,
     attempts,
   };
 }
@@ -517,6 +741,8 @@ export class RuntimeStore {
     bootId = linuxBootIdentity(),
     resultClaimLeaseMs = process.env.PI_SAND_RESULT_CLAIM_LEASE_MS ?? RESULT_CLAIM_LEASE_MS,
     resultClock = () => Date.now(),
+    remoteTransport,
+    beforeRemotePush,
   } = {}) {
     this.dbPath = dbPath;
     this.piCommand = piCommand;
@@ -534,6 +760,16 @@ export class RuntimeStore {
       ? Math.min(Math.max(1, Math.floor(configuredResultClaimLeaseMs)), MAX_RESULT_CLAIM_LEASE_MS)
       : RESULT_CLAIM_LEASE_MS;
     this.resultClock = resultClock;
+    this.remoteTransport = remoteTransport ?? {
+      readRef: readExactRemoteRef,
+      push: pushExactRemoteRef,
+    };
+    if (
+      typeof this.remoteTransport.readRef !== "function" ||
+      typeof this.remoteTransport.push !== "function"
+    )
+      throw new Error("Remote publication transport must provide readRef and push.");
+    this.beforeRemotePush = beforeRemotePush;
     this.databaseLock = null;
     this.db = null;
     this.active = null;
@@ -765,6 +1001,41 @@ export class RuntimeStore {
     }
   }
 
+  ensureRemoteEffects() {
+    const columns = new Set(
+      this.db
+        .prepare("PRAGMA table_info(remote_effects)")
+        .all()
+        .map((row) => row.name),
+    );
+    for (const [name, type] of [
+      ["repository", "TEXT NOT NULL DEFAULT ''"],
+      ["remote_url_digest", "TEXT"],
+      ["expected_old_oid", "TEXT"],
+      ["new_oid", "TEXT NOT NULL DEFAULT ''"],
+      ["action_digest", "TEXT NOT NULL DEFAULT ''"],
+      ["state", "TEXT NOT NULL DEFAULT 'failed'"],
+      ["attempt_count", "INTEGER NOT NULL DEFAULT 0"],
+      ["detail", "TEXT"],
+      ["prepared_at", "TEXT"],
+      ["transmitted_at", "TEXT"],
+      ["confirmed_at", "TEXT"],
+      ["updated_at", "TEXT"],
+      ["last_readback_oid", "TEXT"],
+    ]) {
+      if (!columns.has(name))
+        this.db.exec(`ALTER TABLE remote_effects ADD COLUMN ${name} ${type}`);
+    }
+    this.db.exec(`
+      UPDATE remote_effects SET
+        prepared_at = COALESCE(prepared_at, created_at),
+        updated_at = COALESCE(updated_at, created_at)
+      WHERE prepared_at IS NULL OR updated_at IS NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS remote_effect_identity
+        ON remote_effects(task_id, ref, new_oid, action_digest);
+    `);
+  }
+
   open() {
     this.ensureSupported();
     if (this.closed) throw new Error("The pi-sand runtime is closed.");
@@ -848,7 +1119,35 @@ export class RuntimeStore {
       CREATE INDEX IF NOT EXISTS result_deliveries_claimable
         ON result_deliveries(state, created_at, id);
       CREATE INDEX IF NOT EXISTS result_deliveries_task
-        ON result_deliveries(task_id, created_at, id);`);
+        ON result_deliveries(task_id, created_at, id);
+      CREATE TABLE IF NOT EXISTS remote_effects (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        control_version INTEGER NOT NULL,
+        contract_version INTEGER NOT NULL,
+        remote TEXT NOT NULL,
+        repository TEXT NOT NULL,
+        remote_url_digest TEXT,
+        ref TEXT NOT NULL,
+        expected_old_oid TEXT,
+        new_oid TEXT NOT NULL,
+        action_digest TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('prepared', 'transmitted_unknown', 'confirmed', 'conflict', 'failed')),
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        detail TEXT,
+        created_at TEXT NOT NULL,
+        prepared_at TEXT NOT NULL,
+        transmitted_at TEXT,
+        confirmed_at TEXT,
+        updated_at TEXT NOT NULL,
+        last_readback_oid TEXT,
+        UNIQUE(task_id, ref, new_oid, action_digest)
+      );
+      CREATE INDEX IF NOT EXISTS remote_effects_task
+        ON remote_effects(task_id, created_at, id);
+      CREATE INDEX IF NOT EXISTS remote_effects_current
+        ON remote_effects(task_id, ref, state, created_at, id);`);
+      this.ensureRemoteEffects();
       this.reconcilePriorGates();
       this.reconcilePriorAttempts();
       return this;
@@ -1143,6 +1442,15 @@ export class RuntimeStore {
         ...(evidenceByTask.get(evidence.taskId) ?? []),
         evidenceSnapshot(evidence),
       ]);
+    const remoteEffectRows = this.db
+      .prepare(`${REMOTE_EFFECT_SELECT} ORDER BY task_id, created_at, id`)
+      .all();
+    const remoteEffectsByTask = new Map();
+    for (const effect of remoteEffectRows)
+      remoteEffectsByTask.set(effect.taskId, [
+        ...(remoteEffectsByTask.get(effect.taskId) ?? []),
+        remoteEffectSnapshot(effect),
+      ]);
     const grouped = new Map();
     for (const attempt of attempts)
       grouped.set(attempt.taskId, [
@@ -1154,6 +1462,7 @@ export class RuntimeStore {
         row,
         grouped.get(row.id) ?? [],
         evidenceByTask.get(row.id) ?? [],
+        remoteEffectsByTask.get(row.id) ?? [],
       ),
     );
   }
@@ -1188,7 +1497,11 @@ export class RuntimeStore {
       .prepare(`${EVIDENCE_SELECT} WHERE task_id = ? ORDER BY observed_at, id`)
       .all(id)
       .map(evidenceSnapshot);
-    return taskSnapshot(row, attempts, evidence);
+    const remoteEffects = this.db
+      .prepare(`${REMOTE_EFFECT_SELECT} WHERE task_id = ? ORDER BY created_at, id`)
+      .all(id)
+      .map(remoteEffectSnapshot);
+    return taskSnapshot(row, attempts, evidence, remoteEffects);
   }
 
   #insertResultDelivery({
@@ -1430,6 +1743,7 @@ export class RuntimeStore {
     const requestedCompletionContract =
       completionContract ?? defaultCompletionContract(goal.trim());
     localGatesFromContract(requestedCompletionContract);
+    const requestedAuthority = normalizeAuthority(authority);
 
     const preflight = preflightGitWorkspace(cwd);
     const compatibility = checkFreshExecutorCompatibility({
@@ -1457,7 +1771,7 @@ export class RuntimeStore {
     const storedCompletionContract = serialized(requestedCompletionContract, {
       objective: cleanGoal,
     });
-    const storedAuthority = serialized(authority, DEFAULT_AUTHORITY);
+    const storedAuthority = serialized(requestedAuthority, DEFAULT_AUTHORITY);
     const storedBudget = serialized(budget, DEFAULT_BUDGET);
     const storedReturnRoute = serialized(returnRoute, DEFAULT_RETURN_ROUTE);
     let packet;
