@@ -142,7 +142,7 @@ const ATTEMPT_SELECT = `SELECT id, task_id AS taskId, number, applied_provider A
   gate_pid AS gatePid, gate_pgid AS gatePgid, gate_start_identity AS gateStartIdentity,
   gate_boot_id AS gateBootId, gate_state AS gateState, gate_terminated AS gateTerminated,
   final_result AS finalResult, terminal_detail AS terminalDetail, final_branch_head AS finalBranchHead,
-  shutdown_reason AS shutdownReason
+  shutdown_reason AS shutdownReason, resume_wait_id AS resumeWaitId, cause
   FROM attempts`;
 const ATTEMPT_RUN_SELECT = `SELECT attempt_id AS attemptId, sequence, kind,
   control_version AS controlVersion, contract_version AS contractVersion,
@@ -821,6 +821,8 @@ function attemptSnapshot(row, attemptRuns = []) {
     gateState:
       row.gateState ?? (row.gateTerminated === 1 ? "none" : "ambiguous"),
     gateTerminated: row.gateTerminated === 1,
+    resumeWaitId: row.resumeWaitId ?? null,
+    cause: row.cause ?? null,
     attemptRuns,
   };
 }
@@ -1333,6 +1335,8 @@ export class RuntimeStore {
             gate_terminated INTEGER NOT NULL DEFAULT 1,
             final_result TEXT, terminal_detail TEXT, final_branch_head TEXT, shutdown_reason TEXT,
             applied_provider TEXT, applied_model_id TEXT, applied_thinking_level TEXT,
+            resume_wait_id TEXT UNIQUE REFERENCES wait_subscriptions(id),
+            cause TEXT CHECK(cause IN ('initial', 'continuation', 'repair', 'review', 'retry')),
             UNIQUE(task_id, number)
           );
           INSERT INTO attempts (id, task_id, number, provider, model_id, thinking_level, state, started_at,
@@ -1347,7 +1351,8 @@ export class RuntimeStore {
             applied_model_id, applied_thinking_level
           FROM attempts_legacy;
           DROP TABLE attempts_legacy;
-          CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id, number);`);
+          CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id, number);
+          CREATE UNIQUE INDEX IF NOT EXISTS attempts_resume_wait ON attempts(resume_wait_id);`);
         this.db.exec("COMMIT");
       } catch (error) {
         try {
@@ -1358,6 +1363,26 @@ export class RuntimeStore {
         this.db.exec("PRAGMA foreign_keys = ON;");
       }
     }
+  }
+
+  ensureAttemptColumns() {
+    const columns = new Set(
+      this.db
+        .prepare("PRAGMA table_info(attempts)")
+        .all()
+        .map((row) => row.name),
+    );
+    for (const [name, type] of [
+      ["resume_wait_id", "TEXT REFERENCES wait_subscriptions(id)"],
+      ["cause", "TEXT CHECK(cause IN ('initial', 'continuation', 'repair', 'review', 'retry'))"],
+    ]) {
+      if (!columns.has(name)) {
+        this.db.exec(`ALTER TABLE attempts ADD COLUMN ${name} ${type}`);
+      }
+    }
+    this.db.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS attempts_resume_wait ON attempts(resume_wait_id)",
+    );
   }
 
   ensureCommitmentColumns() {
@@ -1625,12 +1650,15 @@ export class RuntimeStore {
           gate_terminated INTEGER NOT NULL DEFAULT 1,
           final_result TEXT, terminal_detail TEXT, final_branch_head TEXT, shutdown_reason TEXT,
           applied_provider TEXT, applied_model_id TEXT, applied_thinking_level TEXT,
+          resume_wait_id TEXT UNIQUE REFERENCES wait_subscriptions(id),
+          cause TEXT CHECK(cause IN ('initial', 'continuation', 'repair', 'review', 'retry')),
           UNIQUE(task_id, number)
         );
         CREATE INDEX IF NOT EXISTS tasks_created ON tasks(created_at, id);
         CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id, number);`);
       this.ensureCompletionColumns();
       this.ensureCommitmentColumns();
+      this.ensureAttemptColumns();
       this.db.exec(`CREATE TABLE IF NOT EXISTS attempt_runs (
         attempt_id TEXT NOT NULL REFERENCES attempts(id), sequence INTEGER NOT NULL,
         kind TEXT NOT NULL CHECK(kind IN ('initial', 'continue', 'local_repair', 'review')),
@@ -2975,13 +3003,16 @@ export class RuntimeStore {
 
   async reconcileWaitSubscription(
     subscriptionId,
-    {
+    options = {},
+  ) {
+    const {
       now: nowOverride,
       gitHubAdapter,
       gitHubClient,
       markBlockedOnAuth = true,
-    } = {},
-  ) {
+      trigger = false,
+      autoTrigger = false,
+    } = options;
     this.ensureSupported();
     const id = String(subscriptionId ?? "").trim();
     if (!id) throw new Error("Wait reconciliation requires a subscription id.");
@@ -3295,6 +3326,22 @@ export class RuntimeStore {
       nextReconcileIso = new Date(nowTime + nextInterval).toISOString();
     }
 
+    if (options.trigger === true || options.autoTrigger === true) {
+      if (
+        classification === "success" ||
+        classification === "failure" ||
+        classification === "ci_not_observable"
+      ) {
+        return await this.triggerWaitSubscription(id, {
+          classification,
+          selectorResults,
+          evidenceIds,
+          now: nowOverride,
+          ...options,
+        });
+      }
+    }
+
     this.db
       .prepare(
         "UPDATE wait_subscriptions SET last_reconciled_at = ?, next_reconcile_at = ? WHERE id = ?",
@@ -3308,6 +3355,415 @@ export class RuntimeStore {
       selectorResults,
       evidenceIds,
     };
+  }
+
+  async triggerWaitSubscription(
+    subscriptionId,
+    {
+      classification,
+      observation = null,
+      evidenceId = null,
+      evidenceIds = [],
+      selectorResults = [],
+      model = null,
+      thinkingLevel = null,
+      now: nowOverride = null,
+      skipSpawn = false,
+    } = {},
+  ) {
+    this.ensureSupported();
+    const id = String(subscriptionId ?? "").trim();
+    if (!id)
+      throw new Error("Triggering wait subscription requires a subscription id.");
+    if (!classification)
+      throw new Error("Triggering wait subscription requires a classification.");
+    this.open();
+
+    const timestamp = nowOverride ? resultTimestamp(nowOverride) : now();
+
+    let taskToLaunch = null;
+    let newAttemptId = null;
+    let newAttemptNumber = null;
+    let launchPacket = null;
+    let effectiveModel = null;
+    let effectiveThinkingLevel = null;
+    let repairDetail = null;
+    let targetTaskId = null;
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const waitRow = this.db
+        .prepare(`${WAIT_SUBSCRIPTION_SELECT} WHERE id = ?`)
+        .get(id);
+      if (!waitRow) {
+        throw new Error(`Wait subscription ${id} was not found.`);
+      }
+
+      targetTaskId = waitRow.taskId;
+
+      // Idempotency: If already triggered, return current task & subscription without allocating again
+      if (waitRow.status === "triggered") {
+        this.db.exec("COMMIT");
+        return {
+          task: this.getTask(waitRow.taskId),
+          waitSubscription: waitSubscriptionSnapshot(waitRow),
+          triggered: false,
+          alreadyTriggered: true,
+          classification,
+        };
+      }
+
+      // If status is not active (superseded, cancelled, timed_out), no-op / stale
+      if (waitRow.status !== "active") {
+        this.db.exec("COMMIT");
+        return {
+          task: this.getTask(waitRow.taskId),
+          waitSubscription: waitSubscriptionSnapshot(waitRow),
+          triggered: false,
+          stale: true,
+          classification,
+        };
+      }
+
+      const taskRow = this.#taskRow(waitRow.taskId);
+      if (!taskRow) {
+        throw new Error(`Task ${waitRow.taskId} was not found.`);
+      }
+
+      // Require Task is non-terminal (state IN ('waiting', 'running', 'accepted'))
+      if (!["waiting", "running", "accepted"].includes(taskRow.state)) {
+        this.db.exec("COMMIT");
+        return {
+          task: this.getTask(taskRow.id),
+          waitSubscription: waitSubscriptionSnapshot(waitRow),
+          triggered: false,
+          stale: true,
+          classification,
+        };
+      }
+
+      // Require exact task + generation + control_version + contract_version match
+      if (
+        taskRow.controlVersion !== waitRow.controlVersion ||
+        taskRow.contractVersion !== waitRow.contractVersion
+      ) {
+        this.db.exec("COMMIT");
+        return {
+          task: this.getTask(taskRow.id),
+          waitSubscription: waitSubscriptionSnapshot(waitRow),
+          triggered: false,
+          stale: true,
+          classification,
+        };
+      }
+
+      // Require exact repository + SHA match if observation specifies them
+      if (
+        observation?.sha &&
+        observation.sha.toLowerCase() !== waitRow.revisionSha.toLowerCase()
+      ) {
+        this.db.exec("COMMIT");
+        return {
+          task: this.getTask(taskRow.id),
+          waitSubscription: waitSubscriptionSnapshot(waitRow),
+          triggered: false,
+          stale: true,
+          classification,
+        };
+      }
+      if (
+        observation?.repository &&
+        observation.repository.toLowerCase() !== waitRow.repositoryId.toLowerCase()
+      ) {
+        this.db.exec("COMMIT");
+        return {
+          task: this.getTask(taskRow.id),
+          waitSubscription: waitSubscriptionSnapshot(waitRow),
+          triggered: false,
+          stale: true,
+          classification,
+        };
+      }
+
+      // Insert/fetch immutable trigger Evidence using stable dedupe identity
+      let triggerEvidenceId = evidenceId;
+      if (!triggerEvidenceId) {
+        const dedupeKey = `wait_trigger:${taskRow.id}:${waitRow.generation}:${waitRow.revisionSha}:${classification}`;
+        triggerEvidenceId = this.#appendEvidence({
+          taskId: taskRow.id,
+          attemptId: waitRow.createdByAttemptId,
+          attemptRunId: null,
+          kind: "wait_trigger",
+          source: "github_ci",
+          subject: waitRow.revisionSha,
+          payload: {
+            waitSubscriptionId: waitRow.id,
+            taskId: taskRow.id,
+            generation: waitRow.generation,
+            classification,
+            revisionSha: waitRow.revisionSha,
+            repositoryId: waitRow.repositoryId,
+            selectorResults,
+            observation,
+            triggeredAt: timestamp,
+          },
+          dedupeKey,
+        });
+      }
+
+      const allEvidenceIds = Array.from(
+        new Set([triggerEvidenceId, ...(evidenceIds || [])].filter(Boolean)),
+      );
+      const evidenceRefsJson = JSON.stringify(allEvidenceIds);
+
+      if (classification === "success") {
+        // 7A. CI Success without remaining model work: CAS Task -> completed
+        const taskUpdate = this.db
+          .prepare(
+            `UPDATE tasks SET state = 'completed', updated_at = ?, final_result = ?,
+            terminal_detail = ?, final_branch_head = ?, final_revision = ?,
+            completion_evidence_ref = ?, terminal_reason = ?
+            WHERE id = ? AND state IN ('waiting', 'running', 'accepted')
+            AND control_version = ? AND contract_version = ?`,
+          )
+          .run(
+            timestamp,
+            null,
+            "Task completed after GitHub CI checks passed.",
+            waitRow.revisionSha,
+            waitRow.revisionSha,
+            evidenceRefsJson,
+            "verified_ci",
+            taskRow.id,
+            taskRow.controlVersion,
+            taskRow.contractVersion,
+          );
+
+        if (taskUpdate.changes !== 1) {
+          throw new Error("Task state CAS failed when completing verified CI.");
+        }
+
+        // Complete the parked attempt if still in parked_wait/running/starting
+        this.db
+          .prepare(
+            `UPDATE attempts SET state = 'completed', finished_at = ?, worker_terminated = 1,
+            final_result = ?, terminal_detail = ?, final_branch_head = ?
+            WHERE id = ? AND task_id = ? AND state IN ('parked_wait', 'running', 'starting')`,
+          )
+          .run(
+            timestamp,
+            null,
+            "Task completed after GitHub CI checks passed.",
+            waitRow.revisionSha,
+            waitRow.createdByAttemptId,
+            taskRow.id,
+          );
+
+        // Mark wait subscription triggered
+        const waitUpdate = this.db
+          .prepare(
+            `UPDATE wait_subscriptions SET status = 'triggered',
+            trigger_evidence_id = ?, last_reconciled_at = ?, next_reconcile_at = NULL
+            WHERE id = ? AND status = 'active'`,
+          )
+          .run(triggerEvidenceId, timestamp, id);
+
+        if (waitUpdate.changes !== 1) {
+          throw new Error("Wait subscription trigger CAS failed.");
+        }
+
+        // Insert pending result_deliveries row
+        const resultId = this.#insertResultDelivery({
+          task: this.#taskRow(taskRow.id),
+          outcome: "completed",
+          finalResult: null,
+          terminalDetail: "Task completed after GitHub CI checks passed.",
+          terminalReason: "verified_ci",
+          finalRevision: waitRow.revisionSha,
+          finalBranchHead: waitRow.revisionSha,
+          evidenceRefs: allEvidenceIds,
+        });
+
+        if (!resultId) {
+          throw new Error("Completed Task did not produce a Result delivery.");
+        }
+      } else {
+        // 7B. CI Failure or further model work required:
+        // Allocate exactly one continuation Attempt with cause = 'repair' and resume_wait_id = wait.id
+        const lastAttemptRow = this.db
+          .prepare(
+            "SELECT id, number, provider, model_id, thinking_level, applied_provider, applied_model_id, applied_thinking_level FROM attempts WHERE task_id = ? ORDER BY number DESC LIMIT 1",
+          )
+          .get(taskRow.id);
+
+        const nextNumber = Number(lastAttemptRow?.number ?? 1) + 1;
+        const freshAttemptId = randomUUID();
+
+        repairDetail =
+          classification === "ci_not_observable"
+            ? `GitHub CI check appearance grace window expired for revision ${waitRow.revisionSha}.`
+            : `GitHub CI checks failed on revision ${waitRow.revisionSha}.`;
+
+        launchPacket = buildTaskPacket({
+          taskId: taskRow.id,
+          attemptNumber: nextNumber,
+          goal: taskRow.goal,
+          taskBranch: taskRow.taskBranch,
+          taskWorktree: taskRow.taskWorktree,
+          baseCommit: taskRow.baseCommit,
+          priorState: "ci_failed",
+          priorDetail: repairDetail,
+        });
+
+        // Insert fresh Attempt
+        this.db
+          .prepare(
+            `INSERT INTO attempts (
+              id, task_id, number, provider, model_id, thinking_level,
+              state, started_at, worker_terminated, resume_wait_id, cause
+            ) VALUES (?, ?, ?, NULL, NULL, NULL, 'starting', ?, 0, ?, 'repair')`,
+          )
+          .run(
+            freshAttemptId,
+            taskRow.id,
+            nextNumber,
+            timestamp,
+            waitRow.id,
+          );
+
+        // Insert attempt_runs row
+        this.db
+          .prepare(
+            `INSERT INTO attempt_runs (
+              attempt_id, sequence, kind, control_version, contract_version,
+              prompt_digest, state, evidence_refs, started_at
+            ) VALUES (?, 1, 'local_repair', ?, ?, ?, 'pending', ?, ?)`,
+          )
+          .run(
+            freshAttemptId,
+            taskRow.controlVersion,
+            taskRow.contractVersion,
+            promptDigest(launchPacket),
+            evidenceRefsJson,
+            timestamp,
+          );
+
+        // Update task latest_attempt_id = freshAttemptId, state = 'running', updated_at = timestamp
+        const taskUpdate = this.db
+          .prepare(
+            `UPDATE tasks SET state = 'running', latest_attempt_id = ?, updated_at = ?
+            WHERE id = ? AND state IN ('waiting', 'running', 'accepted')
+            AND control_version = ? AND contract_version = ?`,
+          )
+          .run(
+            freshAttemptId,
+            timestamp,
+            taskRow.id,
+            taskRow.controlVersion,
+            taskRow.contractVersion,
+          );
+
+        if (taskUpdate.changes !== 1) {
+          throw new Error("Task state update failed when allocating continuation attempt.");
+        }
+
+        // Update wait_subscriptions: status = 'triggered', continuation_attempt_id = freshAttemptId
+        const waitUpdate = this.db
+          .prepare(
+            `UPDATE wait_subscriptions SET status = 'triggered',
+            trigger_evidence_id = ?, continuation_attempt_id = ?,
+            last_reconciled_at = ?, next_reconcile_at = NULL
+            WHERE id = ? AND status = 'active'`,
+          )
+          .run(
+            triggerEvidenceId,
+            freshAttemptId,
+            timestamp,
+            id,
+          );
+
+        if (waitUpdate.changes !== 1) {
+          throw new Error("Wait subscription trigger update failed.");
+        }
+
+        newAttemptId = freshAttemptId;
+        newAttemptNumber = nextNumber;
+        taskToLaunch = {
+          id: taskRow.id,
+          sourceRepoRoot: taskRow.sourceRepoRoot,
+          baseCommit: taskRow.baseCommit,
+          taskBranch: taskRow.taskBranch,
+          taskWorktree: taskRow.taskWorktree,
+          goal: taskRow.goal,
+          contractVersion: taskRow.contractVersion,
+          controlVersion: taskRow.controlVersion,
+        };
+
+        effectiveModel = model ?? {
+          provider:
+            lastAttemptRow?.applied_provider ??
+            lastAttemptRow?.provider ??
+            "anthropic",
+          id:
+            lastAttemptRow?.applied_model_id ??
+            lastAttemptRow?.model_id ??
+            "claude-3-5-sonnet",
+        };
+        effectiveThinkingLevel =
+          thinkingLevel ??
+          lastAttemptRow?.applied_thinking_level ??
+          lastAttemptRow?.thinking_level ??
+          "off";
+      }
+
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+
+    // Step 9: AFTER COMMIT: only then spawn if a new Attempt exists
+    if (newAttemptId && taskToLaunch && !skipSpawn) {
+      try {
+        await this.launchAttempt({
+          task: taskToLaunch,
+          attemptId: newAttemptId,
+          number: newAttemptNumber,
+          model: effectiveModel,
+          thinkingLevel: effectiveThinkingLevel,
+          packet: launchPacket,
+          priorState: "ci_failed",
+          priorDetail: repairDetail,
+        });
+      } catch (spawnError) {
+        // If spawn fails, launchAttempt will have handled settling or error recording
+      }
+    }
+
+    return {
+      task: this.getTask(targetTaskId ?? (this.getWaitSubscription(id)?.taskId ?? id)),
+      waitSubscription: this.getWaitSubscription(id),
+      classification,
+      continuationAttemptId: newAttemptId ?? null,
+      triggered: true,
+    };
+  }
+
+  async processWaitObservation(subscriptionIdOrOptions, options = {}) {
+    const id =
+      typeof subscriptionIdOrOptions === "string"
+        ? subscriptionIdOrOptions
+        : subscriptionIdOrOptions?.subscriptionId ??
+          subscriptionIdOrOptions?.id ??
+          subscriptionIdOrOptions?.waitId;
+    const opts =
+      typeof subscriptionIdOrOptions === "object" &&
+      subscriptionIdOrOptions !== null
+        ? { ...subscriptionIdOrOptions, ...options }
+        : options;
+    return this.triggerWaitSubscription(id, opts);
   }
 
   async reconcileActiveWaits(options = {}) {
@@ -3657,8 +4113,8 @@ export class RuntimeStore {
           timestamp,
         );
       this.db
-        .prepare(`INSERT INTO attempts (id, task_id, number, provider, model_id, thinking_level, state, started_at, worker_terminated)
-        VALUES (?, ?, 1, NULL, NULL, NULL, 'starting', ?, 0)`)
+        .prepare(`INSERT INTO attempts (id, task_id, number, provider, model_id, thinking_level, state, started_at, worker_terminated, cause)
+        VALUES (?, ?, 1, NULL, NULL, NULL, 'starting', ?, 0, 'initial')`)
         .run(attemptId, taskId, timestamp);
       this.db
         .prepare(`INSERT INTO attempt_runs (
@@ -5717,7 +6173,7 @@ export class RuntimeStore {
       this.db.exec("BEGIN");
       this.db
         .prepare(
-          "INSERT INTO attempts (id, task_id, number, provider, model_id, thinking_level, state, started_at, worker_terminated) VALUES (?, ?, ?, NULL, NULL, NULL, 'starting', ?, 0)",
+          "INSERT INTO attempts (id, task_id, number, provider, model_id, thinking_level, state, started_at, worker_terminated, cause) VALUES (?, ?, ?, NULL, NULL, NULL, 'starting', ?, 0, 'retry')",
         )
         .run(attemptId, task.id, number, timestamp);
       this.db

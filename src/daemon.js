@@ -83,6 +83,13 @@ async function handleRequest(request, store) {
         params.id ?? params.subscriptionId ?? params.waitId,
         params,
       );
+    case "wait.trigger":
+    case "wait.process_observation":
+    case "wait.processObservation":
+      return await store.triggerWaitSubscription(
+        params.id ?? params.subscriptionId ?? params.waitId,
+        params,
+      );
     case "result.claim": {
       const result = store.claimResult(
         params.clientInstanceId ?? params.client_instance_id,
