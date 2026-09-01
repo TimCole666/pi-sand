@@ -81,6 +81,13 @@ function environmentDigest(env) {
     .digest("hex");
 }
 
+function frozenExecutionSnapshot(snapshot) {
+  return Object.freeze({
+    ...snapshot,
+    args: Object.freeze([...(snapshot.args ?? [])]),
+  });
+}
+
 /**
  * One controlled Pi 0.84.4 RPC process. Configuration is deliberately not
  * exposed as fire-and-forget methods: start() is the only operation that can
@@ -104,8 +111,11 @@ class FreshExecutorClient {
   #pendingPromptGeneration = null;
   #promptInFlight = false;
   #promptAmbiguous = false;
+  #promptStatus = "none";
+  #awaitingAgentStart = false;
   #settled = false;
   #sessionId = null;
+  #sessionIdentityChanged = false;
   #executionSnapshot;
 
   constructor(options) {
@@ -126,14 +136,15 @@ class FreshExecutorClient {
         throw startupError(`Fresh Executor requires ${field}.`, { code: "INVALID_CONFIGURATION" });
       }
     }
-    this.#executionSnapshot = Object.freeze({
+    this.#executionSnapshot = frozenExecutionSnapshot({
       command: this.#options.command,
       cwd: this.#options.cwd,
-      args: [...FRESH_EXECUTOR_ARGS],
+      args: FRESH_EXECUTOR_ARGS,
       provider: this.#options.provider,
       modelId: this.#options.modelId,
       thinkingLevel: this.#options.thinkingLevel,
       environmentDigest: environmentDigest(this.#options.env),
+      sessionId: null,
     });
   }
 
@@ -182,12 +193,21 @@ class FreshExecutorClient {
         });
       }
 
+      this.#sessionId =
+        typeof state.sessionId === "string" && state.sessionId.length > 0
+          ? state.sessionId
+          : null;
+      this.#executionSnapshot = frozenExecutionSnapshot({
+        ...this.#executionSnapshot,
+        sessionId: this.#sessionId,
+      });
       const promptGeneration = this.#promptGeneration + 1;
       this.#pendingPromptGeneration = promptGeneration;
+      this.#promptStatus = "pending";
       const promptResponse = await this.#request(
         "prompt",
         { message: this.#options.taskPrompt },
-        { promptGeneration },
+        { promptGeneration, requiresAgentStart: false },
       );
       if (promptResponse.success !== true) {
         throw startupError("Fresh Executor rejected the Task prompt.", {
@@ -298,9 +318,14 @@ class FreshExecutorClient {
         if (message.success === true) {
           this.#promptGeneration = pending.promptGeneration;
           this.#pendingPromptGeneration = null;
+          this.#promptStatus = "accepted";
+          this.#awaitingAgentStart = pending.requiresAgentStart === true;
           this.#settled = false;
-        } else if (this.#pendingPromptGeneration === pending.promptGeneration) {
-          this.#pendingPromptGeneration = null;
+        } else {
+          this.#promptStatus = "rejected";
+          this.#awaitingAgentStart = false;
+          if (this.#pendingPromptGeneration === pending.promptGeneration)
+            this.#pendingPromptGeneration = null;
         }
       }
       pending.resolve(message);
@@ -309,26 +334,38 @@ class FreshExecutorClient {
     const metadata = this.#eventMetadata();
     if (message.type === "session") {
       const sessionId = message.id ?? message.sessionId;
-      if (typeof sessionId === "string") this.#sessionId ??= sessionId;
+      if (
+        typeof sessionId === "string" &&
+        this.#sessionId &&
+        this.#sessionId !== sessionId
+      ) {
+        this.#sessionIdentityChanged = true;
+        if (this.#promptInFlight) this.#promptAmbiguous = true;
+      }
     }
-    if (metadata.promptAcknowledged && message.type === "agent_start")
+    if (metadata.promptAcknowledged && message.type === "agent_start") {
+      this.#awaitingAgentStart = false;
       this.#settled = false;
-    if (metadata.promptAcknowledged && message.type === "agent_settled")
+    }
+    if (
+      metadata.promptAcknowledged &&
+      message.type === "agent_settled" &&
+      !this.#awaitingAgentStart
+    )
       this.#settled = true;
     this.#eventHistory.push(message);
     for (const listener of this.#eventListeners) listener(message, metadata);
   }
 
   #eventMetadata() {
-    const promptGeneration = this.#pendingPromptGeneration ?? this.#promptGeneration;
-    return {
-      promptGeneration,
-      promptAcknowledged:
-        promptGeneration > 0 && promptGeneration === this.#promptGeneration,
-    };
+    return { promptAcknowledged: this.#promptStatus === "accepted" };
   }
 
-  #request(command, payload, { promptGeneration = null } = {}) {
+  #request(
+    command,
+    payload,
+    { promptGeneration = null, requiresAgentStart = false } = {},
+  ) {
     if (this.#transportError) return Promise.reject(this.#transportError);
     if (this.#closed || this.#closing) {
       return Promise.reject(startupError("Fresh Executor is closed.", { code: "WORKER_CLOSED", phase: "transport" }));
@@ -345,7 +382,14 @@ class FreshExecutorClient {
           phase: command,
         }));
       }, this.#options.timeoutMs);
-      this.#pending.set(id, { command, resolve, reject, timer, promptGeneration });
+      this.#pending.set(id, {
+        command,
+        resolve,
+        reject,
+        timer,
+        promptGeneration,
+        requiresAgentStart,
+      });
       try {
         this.#child.stdin.write(`${JSON.stringify(request)}\n`);
       } catch (error) {
@@ -398,6 +442,16 @@ class FreshExecutorClient {
         code: "PROMPT_AMBIGUOUS",
         phase: "prompt",
       });
+    if (typeof this.#sessionId !== "string" || this.#sessionId.length === 0)
+      throw startupError("Fresh Executor session identity is unavailable; reuse is refused.", {
+        code: "SESSION_ID_UNAVAILABLE",
+        phase: "prompt",
+      });
+    if (this.#sessionIdentityChanged)
+      throw startupError("Fresh Executor session identity changed; reuse is refused.", {
+        code: "SESSION_IDENTITY_CHANGED",
+        phase: "prompt",
+      });
     if (this.#promptInFlight)
       throw startupError("Fresh Executor already has a prompt in flight.", {
         code: "PROMPT_IN_FLIGHT",
@@ -411,13 +465,14 @@ class FreshExecutorClient {
 
     const promptGeneration = this.#promptGeneration + 1;
     this.#pendingPromptGeneration = promptGeneration;
+    this.#promptStatus = "pending";
     this.#promptInFlight = true;
     this.#settled = false;
     try {
       const response = await this.#request(
         "prompt",
         { message },
-        { promptGeneration },
+        { promptGeneration, requiresAgentStart: true },
       );
       if (response.success !== true)
         throw startupError("Fresh Executor rejected the continuation prompt.", {
@@ -425,6 +480,12 @@ class FreshExecutorClient {
           phase: "prompt",
         });
       this.#promptInFlight = false;
+      if (this.#sessionIdentityChanged) {
+        throw startupError("Fresh Executor session identity changed; reuse is refused.", {
+          code: "SESSION_IDENTITY_CHANGED",
+          phase: "prompt",
+        });
+      }
       return { accepted: true, promptGeneration };
     } catch (error) {
       if (this.#pendingPromptGeneration === promptGeneration)
@@ -432,6 +493,7 @@ class FreshExecutorClient {
       this.#promptInFlight = false;
       if (error.code === "PROMPT_REJECTED") {
         this.#settled = true;
+        this.#awaitingAgentStart = false;
       } else {
         this.#promptAmbiguous = true;
       }
@@ -479,8 +541,9 @@ class FreshExecutorClient {
       get sessionId() { return client.#sessionId; },
       get promptGeneration() { return client.#promptGeneration; },
       get executionSnapshot() {
-        return { ...client.#executionSnapshot, args: [...client.#executionSnapshot.args], sessionId: client.#sessionId };
+        return client.#executionSnapshot;
       },
+      get sessionIdentityChanged() { return client.#sessionIdentityChanged; },
       prompt: (message) => client.#prompt(message),
       onEvent: (listener) => {
         client.#eventListeners.add(listener);

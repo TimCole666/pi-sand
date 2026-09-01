@@ -192,16 +192,6 @@ function attemptRunLimit(task) {
   return Math.min(configured, MAX_ATTEMPT_RUNS_PER_ATTEMPT);
 }
 
-function eventPromptGeneration(event, metadata) {
-  const value =
-    metadata?.promptGeneration ??
-    event?.promptGeneration ??
-    event?.attemptRunSequence ??
-    event?.runSequence ??
-    null;
-  return value == null ? null : Number(value);
-}
-
 function defaultCompletionContract(goal) {
   return { objective: goal };
 }
@@ -1401,8 +1391,7 @@ export class RuntimeStore {
       worker: null,
       executionSnapshot: null,
       sessionId: null,
-      eventGeneration: INITIAL_ATTEMPT_RUN_SEQUENCE,
-      pendingEventGeneration: null,
+      awaitingAgentStart: false,
       packet: taskPacket,
       finalAssistant: null,
       settled: false,
@@ -1450,9 +1439,13 @@ export class RuntimeStore {
             provider: model.provider,
             modelId: model.id,
             thinkingLevel,
+            sessionId: null,
           };
-      active.sessionId = worker?.sessionId ?? null;
-      active.eventGeneration = Number(worker?.promptGeneration) || INITIAL_ATTEMPT_RUN_SEQUENCE;
+      const sessionId = worker?.sessionId ?? active.executionSnapshot?.sessionId;
+      active.sessionId =
+        typeof sessionId === "string" && sessionId.length > 0
+          ? sessionId
+          : null;
       const metadata = workerMetadata(worker) ?? active.workerMetadata;
       if (metadata) {
         active.workerMetadata =
@@ -1492,10 +1485,7 @@ export class RuntimeStore {
       const replayed = new Set();
       for (const event of Array.isArray(worker?.events) ? worker.events : []) {
         replayed.add(event);
-        this.handleWorkerEvent(active, event, {
-          promptGeneration: active.eventGeneration,
-          promptAcknowledged: true,
-        });
+        this.handleWorkerEvent(active, event, { promptAcknowledged: true });
       }
       for (const pending of active.pendingEvents) {
         const event = pending?.event ?? pending;
@@ -1534,20 +1524,9 @@ export class RuntimeStore {
       active.pendingEvents.push({ event, metadata });
       return;
     }
-    const promptGeneration = eventPromptGeneration(event, metadata);
-    const expectedGeneration = active.runPromptInFlight
-      ? active.pendingEventGeneration
-      : active.eventGeneration;
-    if (
-      promptGeneration !== null &&
-      Number(promptGeneration) !== Number(expectedGeneration)
-    )
-      return;
-    if (active.runPromptInFlight && metadata && metadata.promptAcknowledged !== true)
-      return;
     if (event?.type === "session") {
       const sessionId = event.id ?? event.sessionId;
-      if (typeof sessionId !== "string") return;
+      if (typeof sessionId !== "string" || sessionId.length === 0) return;
       if (active.sessionId && active.sessionId !== sessionId) {
         active.rpcCoherent = false;
         if (active.runPromptInFlight) {
@@ -1563,9 +1542,10 @@ export class RuntimeStore {
             checkpoint: false,
           });
         }
-        return;
       }
-      active.sessionId ??= sessionId;
+      // A session event is an identity observation only. The authoritative
+      // session id is captured from get_state, never learned from the stream.
+      return;
     }
     if (event?.type === "executor_error") {
       active.rpcCoherent = false;
@@ -1585,10 +1565,25 @@ export class RuntimeStore {
       }
       return;
     }
-    if (active.runPromptInFlight || !active.runAccepted) {
+    if (active.runPromptInFlight) {
+      // A response acknowledgement is the only safe point at which a
+      // continuation's stream may enter the pending boundary buffer. Events
+      // before it may be late output from the already-settled run.
       if (metadata?.promptAcknowledged === true)
         active.pendingEvents.push({ event, metadata });
       return;
+    }
+    if (!active.runAccepted) {
+      if (metadata?.promptAcknowledged === true)
+        active.pendingEvents.push({ event, metadata });
+      return;
+    }
+    if (active.awaitingAgentStart) {
+      // Pi RPC has no request/run id on ordinary events. The first fresh
+      // agent_start after an acknowledged continuation is the only supported
+      // boundary; all other pre-boundary output is ignored fail-closed.
+      if (event?.type !== "agent_start") return;
+      active.awaitingAgentStart = false;
     }
     if (event?.type === "agent_start") active.settled = false;
     const outcome = assistantOutcome(event);
