@@ -20,7 +20,7 @@ const eventually = async (read, predicate) => {
   throw new Error("timed out waiting for deterministic runtime state");
 };
 
-async function fixture({ budget, waitClock, waitTimer } = {}) {
+async function fixture({ budget, waitClock, waitTimer, configureRuntime } = {}) {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-convergence-"));
   const source = join(parent, "source");
   const remote = join(parent, "fixture", "repository.git");
@@ -84,6 +84,7 @@ async function fixture({ budget, waitClock, waitTimer } = {}) {
       return { callbacksAttached: true, close() {} };
     },
   });
+  configureRuntime?.(runtime);
   const task = await runtime.createTask({
     goal: "verify and wait",
     cwd: source,
@@ -305,6 +306,51 @@ test("due reactor persists exact ci_not_observable control evidence and terminal
     assert.equal(blocked.attempts[0].workerTerminated, true);
   } finally {
     value.runtime.stopWaitReactor();
+    await closeFixture(value);
+  }
+});
+
+test("retirement after control race fail-closes a running Task with no false wait", async () => {
+  let injected = false;
+  const value = await fixture({
+    configureRuntime(runtime) {
+      const originalRetire = runtime.retireWorker.bind(runtime);
+      runtime.retireWorker = async (...args) => {
+        const retired = await originalRetire(...args);
+        if (retired && !injected) {
+          injected = true;
+          runtime.db
+            .prepare("UPDATE tasks SET control_version = control_version + 1")
+            .run();
+        }
+        return retired;
+      };
+    },
+  });
+  try {
+    const reconciled = await eventually(
+      () => value.runtime.getTask(value.task.id),
+      (task) => task.state !== "running",
+    );
+    assert.equal(injected, true);
+    assert.notEqual(reconciled.state, "running");
+    assert.equal(reconciled.waitSubscriptions.filter((wait) => wait.status === "active").length, 0);
+    assert.equal(reconciled.attempts[0].workerTerminated, true);
+    assert.notEqual(reconciled.attempts[0].state, "running");
+    assert.equal(value.runtime.active, null);
+    assert.equal(
+      value.runtime.db
+        .prepare("SELECT COUNT(*) AS count FROM result_deliveries WHERE task_id = ?")
+        .get(value.task.id).count,
+      1,
+    );
+    assert.equal(
+      value.runtime.db
+        .prepare("SELECT control_version FROM result_deliveries WHERE task_id = ?")
+        .get(value.task.id).control_version,
+      reconciled.controlVersion,
+    );
+  } finally {
     await closeFixture(value);
   }
 });

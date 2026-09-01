@@ -2805,6 +2805,235 @@ export class RuntimeStore {
     }
   }
 
+  #reconcileRetiredWaitRegistrationFailureClosed(fence, error) {
+    const detail = boundedDetail(
+      `Wait registration failed after the Fresh Executor was retired: ${commandError(error)} The retired Attempt was reconciled fail-closed.`,
+    );
+    const timestamp = now();
+    const workerMatches = (attempt) => {
+      if (!attempt) return false;
+      const retired = fence.retiredWorker;
+      if (!retired) {
+        return (
+          attempt.workerPid == null &&
+          attempt.workerPgid == null &&
+          (attempt.workerStartIdentity ?? null) === null &&
+          (attempt.workerBootId ?? null) === (fence.workerBootId ?? null)
+        );
+      }
+      return (
+        Number(attempt.workerPid ?? 0) === Number(retired.workerPid ?? 0) &&
+        Number(attempt.workerPgid ?? 0) === Number(retired.workerPgid ?? 0) &&
+        (attempt.workerStartIdentity ?? null) ===
+          (retired.workerStartIdentity ?? null) &&
+        (attempt.workerBootId ?? null) === (retired.workerBootId ?? null)
+      );
+    };
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#taskRow(fence.taskId);
+      const attempt = this.db
+        .prepare(`${ATTEMPT_SELECT} WHERE id = ? AND task_id = ?`)
+        .get(fence.attemptId, fence.taskId);
+      if (!task || !attempt || !workerMatches(attempt)) {
+        this.db.exec("ROLLBACK");
+        return false;
+      }
+
+      const registrationWait = this.db
+        .prepare("SELECT id FROM wait_subscriptions WHERE id = ? AND task_id = ?")
+        .get(fence.operationId, fence.taskId);
+      if (registrationWait) {
+        // The registration operation itself committed; its post-commit path
+        // must own its outcome and this compensation must not rewrite it.
+        this.db.exec("ROLLBACK");
+        return false;
+      }
+      const activeWait = this.db
+        .prepare(`SELECT id, generation, control_version AS controlVersion,
+            contract_version AS contractVersion, created_by_attempt_id AS createdByAttemptId
+          FROM wait_subscriptions WHERE task_id = ? AND status = 'active'
+          ORDER BY generation DESC, created_at DESC, id DESC LIMIT 1`)
+        .get(fence.taskId);
+      const waitIsNewer =
+        activeWait && Number(activeWait.generation) > fence.preExistingMaxWaitGeneration;
+
+      // A newer (or already-winning) wait owns the Task state. Retain it and
+      // only publish the exact retired worker fence; never cancel a wait from
+      // another operation. If the wait is current, repair the only impossible
+      // pairing left by the race: running Task + retired worker.
+      if (activeWait) {
+        const waitIdentityMatches = waitIsNewer
+          ? true
+          : activeWait.id === fence.preExistingActiveWaitId &&
+            Number(activeWait.generation) === fence.preExistingActiveWaitGeneration;
+        const waitIsCurrent =
+          waitIdentityMatches &&
+          Number(activeWait.controlVersion) === Number(task.controlVersion) &&
+          Number(activeWait.contractVersion) === Number(task.contractVersion) &&
+          activeWait.createdByAttemptId === fence.attemptId;
+        const ownsRetiredAttempt =
+          task.latestAttemptId === fence.attemptId &&
+          ['starting', 'running', 'parked_wait'].includes(attempt.state);
+        const runningPair =
+          task.latestAttemptId === fence.attemptId &&
+          ['accepted', 'running', 'waiting'].includes(task.state) &&
+          ['starting', 'running'].includes(attempt.state);
+        if (waitIsCurrent && ownsRetiredAttempt) {
+          if (task.state !== 'waiting') {
+            const taskUpdate = this.db
+              .prepare(`UPDATE tasks SET state = 'waiting', updated_at = ?
+                WHERE id = ? AND latest_attempt_id = ? AND state IN ('accepted', 'running')
+                  AND control_version = ? AND contract_version = ?`)
+              .run(
+                timestamp,
+                fence.taskId,
+                fence.attemptId,
+                task.controlVersion,
+                task.contractVersion,
+              );
+            if (taskUpdate.changes !== 1) {
+              this.db.exec("ROLLBACK");
+              return false;
+            }
+          }
+          const attemptUpdate = this.db
+            .prepare(`UPDATE attempts SET state = 'parked_wait', worker_terminated = 1,
+                gate_state = 'terminated', gate_terminated = 1
+              WHERE id = ? AND task_id = ? AND state IN ('starting', 'running', 'parked_wait')`)
+            .run(fence.attemptId, fence.taskId);
+          if (attemptUpdate.changes !== 1) {
+            this.db.exec("ROLLBACK");
+            return false;
+          }
+          this.db.exec("COMMIT");
+          return true;
+        }
+        if (runningPair && !waitIsCurrent) {
+          // An active wait that does not match the current Task versions is
+          // stale, not a winner. It may be cancelled only by this exact
+          // reconciliation; a newer valid wait takes the branch above.
+          const cancelledWait = this.db
+            .prepare(`UPDATE wait_subscriptions SET status = 'cancelled'
+              WHERE id = ? AND task_id = ? AND generation = ? AND status = 'active'`)
+            .run(activeWait.id, fence.taskId, activeWait.generation);
+          if (cancelledWait.changes !== 1) {
+            this.db.exec("ROLLBACK");
+            return false;
+          }
+          // Continue to the terminal fail-closed transition below.
+        } else {
+          const attemptUpdate = this.db
+            .prepare(`UPDATE attempts SET worker_terminated = 1
+              WHERE id = ? AND task_id = ? AND worker_terminated = 0`)
+            .run(fence.attemptId, fence.taskId);
+          if (attemptUpdate.changes !== 1 && attempt.workerTerminated !== 1) {
+            this.db.exec("ROLLBACK");
+            return false;
+          }
+          this.db.exec("COMMIT");
+          return true;
+        }
+      }
+
+      // No wait won this operation. A still-running Task must not survive the
+      // retirement of its exact worker. Use the versions that currently own
+      // the Task (not the failed registration's stale versions), and let a
+      // prior cancellation/terminal transition win by leaving it untouched.
+      if (
+        task.latestAttemptId !== fence.attemptId ||
+        !['accepted', 'running', 'waiting'].includes(task.state)
+      ) {
+        const attemptUpdate = this.db
+          .prepare(`UPDATE attempts SET state = CASE
+              WHEN state IN ('starting', 'running', 'parked_wait') THEN 'failed'
+              ELSE state END,
+            finished_at = CASE
+              WHEN state IN ('starting', 'running', 'parked_wait') THEN COALESCE(finished_at, ?)
+              ELSE finished_at END,
+            terminal_detail = CASE
+              WHEN state IN ('starting', 'running', 'parked_wait') THEN ?
+              ELSE terminal_detail END,
+            worker_terminated = 1 WHERE id = ? AND task_id = ?`)
+          .run(timestamp, detail, fence.attemptId, fence.taskId);
+        if (attemptUpdate.changes !== 1) {
+          this.db.exec("ROLLBACK");
+          return false;
+        }
+        this.db.exec("COMMIT");
+        return true;
+      }
+
+      const terminalDetail = `${detail} No valid WaitSubscription was committed; the Task is blocked.`;
+      const taskUpdate = this.db
+        .prepare(`UPDATE tasks SET state = 'blocked', updated_at = ?, final_result = NULL,
+          final_branch_head = COALESCE(final_branch_head, ?),
+          final_revision = COALESCE(final_revision, ?), terminal_detail = ?,
+          terminal_reason = ? WHERE id = ? AND latest_attempt_id = ?
+          AND state IN ('accepted', 'running', 'waiting')
+          AND control_version = ? AND contract_version = ?`)
+        .run(
+          timestamp,
+          attempt.finalBranchHead ?? task.finalBranchHead ?? null,
+          task.finalRevision ?? attempt.finalBranchHead ?? null,
+          terminalDetail,
+          'wait_registration_worker_retired',
+          fence.taskId,
+          fence.attemptId,
+          task.controlVersion,
+          task.contractVersion,
+        );
+      if (taskUpdate.changes !== 1) {
+        this.db.exec("ROLLBACK");
+        return false;
+      }
+
+      const attemptUpdate = this.db
+        .prepare(`UPDATE attempts SET state = CASE
+            WHEN state IN ('starting', 'running', 'parked_wait') THEN 'failed'
+            ELSE state END,
+          finished_at = CASE
+            WHEN state IN ('starting', 'running', 'parked_wait') THEN COALESCE(finished_at, ?)
+            ELSE finished_at END,
+          terminal_detail = CASE
+            WHEN state IN ('starting', 'running', 'parked_wait') THEN ?
+            ELSE terminal_detail END,
+          worker_terminated = 1 WHERE id = ? AND task_id = ?
+          AND state IN ('starting', 'running', 'parked_wait')`)
+        .run(timestamp, terminalDetail, fence.attemptId, fence.taskId);
+      if (attemptUpdate.changes !== 1) {
+        this.db.exec("ROLLBACK");
+        return false;
+      }
+      this.db
+        .prepare(`UPDATE attempt_runs SET state = 'aborted',
+          settled_outcome = COALESCE(settled_outcome, ?),
+          settled_at = COALESCE(settled_at, ?) WHERE attempt_id = ?
+          AND state IN ('pending', 'accepted')`)
+        .run(terminalDetail, timestamp, fence.attemptId);
+      const resultId = this.#insertResultDelivery({
+        task: this.#taskRow(fence.taskId),
+        outcome: 'failed',
+        finalResult: null,
+        terminalDetail,
+        terminalReason: 'wait_registration_worker_retired',
+        finalRevision: task.finalRevision ?? null,
+        finalBranchHead: task.finalBranchHead ?? null,
+      });
+      if (!resultId)
+        throw new Error('Blocked Task did not produce a Result delivery.');
+
+      this.db.exec("COMMIT");
+      return true;
+    } catch (reconciliationError) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      throw reconciliationError;
+    }
+  }
+
   async registerWaitSubscription({
     id,
     taskId,
@@ -3120,6 +3349,16 @@ export class RuntimeStore {
 
     const workerToRetire = active?.worker ?? attemptRow;
     const metadataToRetire = active?.workerMetadata ?? workerMetadata(attemptRow);
+    // Fence the identity actually handed to the ownership-checked retirement
+    // path, not merely the earlier database snapshot.
+    registrationFence.retiredWorker = metadataToRetire ?? {
+      workerPid: attemptRow.workerPid ?? null,
+      workerPgid: attemptRow.workerPgid ?? null,
+      workerStartIdentity: attemptRow.workerStartIdentity ?? null,
+      workerBootId: attemptRow.workerBootId ?? this.bootId ?? null,
+    };
+    registrationFence.workerBootId =
+      registrationFence.retiredWorker.workerBootId ?? null;
     let workerRetired = false;
     try {
       workerRetired = await this.retireWorker(workerToRetire, metadataToRetire);
@@ -3262,10 +3501,21 @@ export class RuntimeStore {
       } catch {}
       if (workerRetired) {
         try {
-          const reconciled = this.#reconcileRetiredWaitRegistrationFailure(
+          let reconciled = this.#reconcileRetiredWaitRegistrationFailure(
             registrationFence,
             error,
           );
+          // The strict compensation intentionally yields to a concurrent
+          // control/version or wait-generation winner. Retirement still
+          // happened, however, so leave no live in-memory worker paired with
+          // a durable running Attempt: reconcile the exact retired identity
+          // fail-closed before clearing active.
+          if (!reconciled) {
+            reconciled = this.#reconcileRetiredWaitRegistrationFailureClosed(
+              registrationFence,
+              error,
+            );
+          }
           if (reconciled && this.active?.attemptId === latestAttemptId)
             this.active = null;
         } catch (reconciliationError) {
