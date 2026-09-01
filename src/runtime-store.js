@@ -3640,6 +3640,9 @@ export class RuntimeStore {
     let effectiveThinkingLevel = null;
     let repairDetail = null;
     let targetTaskId = null;
+    let classification = null;
+    let selectorResults = [];
+    let evidenceIds = [];
 
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -3719,9 +3722,9 @@ export class RuntimeStore {
           classification: durableObservation?.classification ?? "pending",
         };
       }
-      const classification = durableObservation.classification;
-      const selectorResults = durableObservation.selectorResults;
-      const evidenceIds = durableObservation.evidenceIds;
+      classification = durableObservation.classification;
+      selectorResults = durableObservation.selectorResults;
+      evidenceIds = durableObservation.evidenceIds;
 
       // Insert/fetch immutable trigger Evidence from validated durable runtime
       // Evidence. Caller-provided classifications, observations, and ids never

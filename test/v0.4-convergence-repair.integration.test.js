@@ -125,6 +125,25 @@ test("supervisor keeps exact candidate R waiting when local gates pass but CI is
   }
 });
 
+test("direct wait triggering cannot supply authority or evidence", async () => {
+  const value = await fixture();
+  try {
+    const waiting = await eventually(() => value.runtime.getTask(value.task.id), (task) => task.state === "waiting");
+    const waitId = waiting.waitSubscriptions[0].id;
+    await assert.rejects(
+      () => value.runtime.triggerWaitSubscription(waitId, {
+        classification: "success",
+        evidenceId: "forged-evidence",
+      }),
+      (error) => error.code === "wait_trigger_internal_only",
+    );
+    assert.equal(value.runtime.getTask(value.task.id).state, "waiting");
+    assert.equal(value.runtime.getWaitSubscription(waitId).status, "active");
+  } finally {
+    await closeFixture(value);
+  }
+});
+
 test("public JSONL IPC cannot turn a waiting Task into CI success", async () => {
   const value = await fixture();
   let daemon;

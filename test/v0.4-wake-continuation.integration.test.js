@@ -209,8 +209,10 @@ async function closeFixture(value) {
 async function triggerObserved(runtime, subscriptionId, {
 classification = "success",
 skipSpawn = false,
+observationSha = null,
 } = {}) {
 const waitSubscription = runtime.getWaitSubscription(subscriptionId);
+const observedSha = observationSha ?? waitSubscription.revisionSha;
 const checkRuns = [];
 const commitStatuses = [];
 for (const [index, selector] of waitSubscription.requiredChecks.entries()) {
@@ -221,7 +223,7 @@ const slash = target.indexOf("/");
 checkRuns.push({
 id: 10000 + index,
 name: target.slice(slash + 1),
-head_sha: waitSubscription.revisionSha,
+head_sha: observedSha,
 status: "completed",
 conclusion: isFailure ? "failure" : "success",
 app: { slug: target.slice(0, slash) },
@@ -230,7 +232,7 @@ app: { slug: target.slice(0, slash) },
 commitStatuses.push({
 id: 20000 + index,
 context: selector.slice("commit_status:".length),
-sha: waitSubscription.revisionSha,
+sha: observedSha,
 state: isFailure ? "failure" : "success",
 });
 }
@@ -242,7 +244,9 @@ async fetchCommitStatuses() { return commitStatuses; },
 const results = await runtime.startWaitReactor({ observer, skipSpawn });
 runtime.stopWaitReactor();
 if (results[0]?.error) throw new Error(JSON.stringify(results[0].error));
-return results.find((result) => result.waitSubscription?.id === subscriptionId) ?? {
+const result = results.find((item) => item.waitSubscription?.id === subscriptionId);
+if (result) return { triggered: false, ...result };
+return {
   task: runtime.getTask(waitSubscription.taskId),
   waitSubscription: runtime.getWaitSubscription(subscriptionId),
   triggered: false,
@@ -512,11 +516,11 @@ test("4. Stale observation for old SHA / old generation / cancelled / completed 
       registered.waitSubscription.id,
       {
         classification: "failure",
-        observation: { sha: wrongSha },
+        observationSha: wrongSha,
       },
     );
     assert.equal(resWrongSha.triggered, false);
-    assert.equal(resWrongSha.stale, true);
+    assert.equal(resWrongSha.classification, "pending");
     assert.equal(value.runtime.getTask(value.task.id).state, "waiting");
     assert.equal(value.runtime.getWaitSubscription(registered.waitSubscription.id).status, "active");
 
