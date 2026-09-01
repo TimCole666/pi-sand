@@ -593,28 +593,41 @@ test("6. Crash after transaction commit before worker spawn: persisted Attempt w
     assert.equal(result.triggered, true);
     assert.ok(result.continuationAttemptId);
 
-    // Verify state in DB
-    const task = value.runtime.getTask(value.task.id);
-    assert.equal(task.state, "running");
-    assert.equal(task.latestAttemptId, result.continuationAttemptId);
+    // Simulate daemon crash & restart before spawn
+    value.runtime.release();
 
-    const attempt2 = task.attempts.find((a) => a.id === result.continuationAttemptId);
+    const restarted = new RuntimeStore({
+      dbPath: value.dbPath,
+      piCommand: value.piCommand,
+      worktreeRoot: value.worktreeRoot,
+      bootId: "fresh-boot-after-crash-before-spawn",
+    });
+    restarted.open();
+
+    const taskRestarted = restarted.getTask(value.task.id);
+    assert.equal(taskRestarted.state, "running");
+    assert.equal(taskRestarted.latestAttemptId, result.continuationAttemptId);
+
+    const attempt2 = taskRestarted.attempts.find((a) => a.id === result.continuationAttemptId);
     assert.ok(attempt2);
     assert.equal(attempt2.state, "starting");
+    assert.equal(attempt2.workerPid, null);
     assert.equal(attempt2.resumeWaitId, registered.waitSubscription.id);
     assert.equal(attempt2.cause, "repair");
 
-    const waitSub = value.runtime.getWaitSubscription(registered.waitSubscription.id);
+    const waitSub = restarted.getWaitSubscription(registered.waitSubscription.id);
     assert.equal(waitSub.status, "triggered");
     assert.equal(waitSub.continuationAttemptId, attempt2.id);
 
-    // Verify that the persisted Attempt is unique and second trigger is a no-op
-    const secondTrigger = await value.runtime.triggerWaitSubscription(
+    // Second trigger is a no-op
+    const secondTrigger = await restarted.triggerWaitSubscription(
       registered.waitSubscription.id,
       { classification: "failure" },
     );
     assert.equal(secondTrigger.alreadyTriggered, true);
-    assert.equal(value.runtime.getTask(value.task.id).attempts.length, 2);
+    assert.equal(restarted.getTask(value.task.id).attempts.length, 2);
+
+    restarted.release();
   } finally {
     await closeFixture(value);
   }
@@ -762,6 +775,77 @@ test("9. Attempt uniqueness constraint: UNIQUE(resume_wait_id) prevents two Atte
         );
       },
     );
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("10. Crash history A: observation seen, crash before DB transaction -> startup/reconciliation can observe it again", async () => {
+  const fake = makeFakeGitHubAdapter({
+    checkRuns: [
+      {
+        id: 101,
+        name: "ci",
+        app: { slug: "github-actions" },
+        status: "completed",
+        conclusion: "success",
+        head_sha: null,
+      },
+    ],
+  });
+  const value = await fixture({ gitHubAdapter: fake });
+  try {
+    const candidateR = await commitCandidate(
+      value.task.taskWorktree,
+      "app.js",
+      "console.log('test10');\n",
+      "feat: app",
+    );
+    fake.setCheckRuns([
+      {
+        id: 101,
+        name: "ci",
+        app: { slug: "github-actions" },
+        status: "completed",
+        conclusion: "success",
+        head_sha: candidateR,
+      },
+    ]);
+    await value.runtime.publishTask({ id: value.task.id, candidateSha: candidateR });
+
+    const registered = await value.runtime.registerWaitSubscription({
+      taskId: value.task.id,
+      revisionSha: candidateR,
+      requiredChecks: ["check_run:github-actions/ci"],
+    });
+
+    // Simulate crash before DB transaction by closing runtime while wait is active
+    value.runtime.release();
+
+    // Restart daemon / runtime: it immediately reconciles active wait and processes observation
+    const restarted = new RuntimeStore({
+      dbPath: value.dbPath,
+      piCommand: value.piCommand,
+      worktreeRoot: value.worktreeRoot,
+      gitHubAdapter: fake,
+    });
+    restarted.open();
+
+    const recon = await restarted.reconcileWaitSubscription(registered.waitSubscription.id);
+    assert.equal(recon.classification, "success");
+
+    const triggered = await restarted.triggerWaitSubscription(registered.waitSubscription.id, {
+      classification: recon.classification,
+      selectorResults: recon.selectorResults,
+      evidenceIds: recon.evidenceIds,
+    });
+    assert.equal(triggered.triggered, true);
+
+    const task = restarted.getTask(value.task.id);
+    assert.equal(task.state, "completed");
+    assert.equal(task.terminalReason, "verified_ci");
+
+    restarted.release();
   } finally {
     await closeFixture(value);
   }

@@ -1963,6 +1963,13 @@ export class RuntimeStore {
   }
 
   reconcileAttempt(attempt, { reason = null } = {}) {
+    if (
+      attempt.state === "starting" &&
+      attempt.workerPid == null &&
+      attempt.workerPgid == null
+    ) {
+      return "starting";
+    }
     const detail = reason
       ? `pi-sandd ${reason} could not prove safe worker termination; the Task is blocked and its worktree was retained.`
       : ORPHAN_DETAIL;
@@ -3484,6 +3491,19 @@ export class RuntimeStore {
           classification,
         };
       }
+      if (
+        observation?.generation != null &&
+        Number(observation.generation) !== Number(waitRow.generation)
+      ) {
+        this.db.exec("COMMIT");
+        return {
+          task: this.getTask(taskRow.id),
+          waitSubscription: waitSubscriptionSnapshot(waitRow),
+          triggered: false,
+          stale: true,
+          classification,
+        };
+      }
 
       // Insert/fetch immutable trigger Evidence using stable dedupe identity
       let triggerEvidenceId = evidenceId;
@@ -3726,20 +3746,16 @@ export class RuntimeStore {
 
     // Step 9: AFTER COMMIT: only then spawn if a new Attempt exists
     if (newAttemptId && taskToLaunch && !skipSpawn) {
-      try {
-        await this.launchAttempt({
-          task: taskToLaunch,
-          attemptId: newAttemptId,
-          number: newAttemptNumber,
-          model: effectiveModel,
-          thinkingLevel: effectiveThinkingLevel,
-          packet: launchPacket,
-          priorState: "ci_failed",
-          priorDetail: repairDetail,
-        });
-      } catch (spawnError) {
-        // If spawn fails, launchAttempt will have handled settling or error recording
-      }
+      await this.launchAttempt({
+        task: taskToLaunch,
+        attemptId: newAttemptId,
+        number: newAttemptNumber,
+        model: effectiveModel,
+        thinkingLevel: effectiveThinkingLevel,
+        packet: launchPacket,
+        priorState: "ci_failed",
+        priorDetail: repairDetail,
+      });
     }
 
     return {
