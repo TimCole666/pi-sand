@@ -951,6 +951,139 @@ test("9. unsafe same-Attempt context allocates one fresh local repair Attempt", 
 });
 
 // -----------------------------------------------------------------------------
+// Regression: a transient at the effective deadline cannot extend a CI wait
+// -----------------------------------------------------------------------------
+test("transient at the effective CI deadline produces one external-timeout Result", async () => {
+  let clock = Date.now();
+  const calls = [];
+  const outageAdapter = {
+    async fetchCheckRuns(params) {
+      calls.push({ method: "fetchCheckRuns", params });
+      throw Object.assign(new Error("provider unavailable"), {
+        code: "network_error",
+      });
+    },
+    async fetchCommitStatuses(params) {
+      calls.push({ method: "fetchCommitStatuses", params });
+      throw Object.assign(new Error("provider unavailable"), {
+        code: "network_error",
+      });
+    },
+  };
+  const value = await fixture({
+    waitClock: () => clock,
+    gitHubAdapter: outageAdapter,
+    budget: { ciWaitDeadlineMs: 1_000 },
+    completionContract: {
+      objective: "bound a CI outage",
+      requiredChecks: ["check_run:github-actions/ci"],
+    },
+  });
+  try {
+    const candidate = await commitCandidate(
+      value.task.taskWorktree,
+      "app.js",
+      "console.log('outage');\\n",
+      "outage",
+    );
+    await value.runtime.publishTask({ id: value.task.id, candidateSha: candidate });
+    const registered = await value.runtime.registerWaitSubscription({
+      taskId: value.task.id,
+      revisionSha: candidate,
+      requiredChecks: ["check_run:github-actions/ci"],
+      timeoutMs: 1_000,
+    });
+
+    clock = Date.parse(registered.waitSubscription.deadlineAt) + 1;
+    const [result] = await value.runtime.startWaitReactor({ observer: outageAdapter });
+    value.runtime.stopWaitReactor();
+
+    assert.equal(calls.length, 2, "the final reconciliation fetches each provider surface once");
+    assert.equal(result.classification, "timed_out");
+    assert.equal(result.triggered, true);
+    assert.equal(result.continuationAttemptId, null);
+    const terminal = value.runtime.getTask(value.task.id);
+    assert.equal(terminal.state, "failed");
+    assert.equal(terminal.terminalReason, "external_timeout");
+    assert.equal(value.runtime.getWaitSubscription(registered.waitSubscription.id).status, "timed_out");
+    assert.equal(value.runtime.getWaitSubscription(registered.waitSubscription.id).nextReconcileAt, null);
+    assert.equal(
+      value.runtime.db
+        .prepare("SELECT COUNT(*) AS count FROM result_deliveries WHERE task_id = ?")
+        .get(value.task.id).count,
+      1,
+    );
+    assert.equal(
+      terminal.evidence.filter((e) => e.kind === "github_check_observation").length,
+      0,
+    );
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Regression: nested remote publication authority bounds CI wake repair
+// -----------------------------------------------------------------------------
+test("exhausted nested remote publication budget does not allocate a repair Attempt", async () => {
+  const value = await fixture({
+    taskAuthority: {
+      remotePublication: {
+        ...authority.remotePublication,
+        maxPublications: 1,
+      },
+    },
+    completionContract: {
+      objective: "respect the remote publication budget",
+      requiredChecks: ["check_run:github-actions/ci"],
+    },
+  });
+  try {
+    const candidate = await commitCandidate(
+      value.task.taskWorktree,
+      "app.js",
+      "console.log('budget');\\n",
+      "budget",
+    );
+    await value.runtime.publishTask({ id: value.task.id, candidateSha: candidate });
+    const registered = await value.runtime.registerWaitSubscription({
+      taskId: value.task.id,
+      revisionSha: candidate,
+      requiredChecks: ["check_run:github-actions/ci"],
+    });
+    value.gitHubAdapter.setCheckRuns([{
+      id: 1301,
+      name: "ci",
+      head_sha: candidate,
+      status: "completed",
+      conclusion: "failure",
+      app: { slug: "github-actions" },
+    }]);
+
+    const [result] = await value.runtime.startWaitReactor();
+    value.runtime.stopWaitReactor();
+
+    assert.equal(result.classification, "failure");
+    assert.equal(result.triggered, true);
+    assert.equal(result.continuationAttemptId, null);
+    const terminal = value.runtime.getTask(value.task.id);
+    assert.equal(terminal.state, "failed");
+    assert.equal(terminal.terminalReason, "budget_exhausted");
+    assert.match(terminal.terminalDetail, /remote publication budget \(1\) exhausted/i);
+    assert.equal(terminal.attempts.length, 1);
+    assert.equal(value.runtime.getWaitSubscription(registered.waitSubscription.id).status, "triggered");
+    assert.equal(
+      value.runtime.db
+        .prepare("SELECT COUNT(*) AS count FROM result_deliveries WHERE task_id = ?")
+        .get(value.task.id).count,
+      1,
+    );
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+// -----------------------------------------------------------------------------
 // Scenario 10: known same-Attempt repair rejection retires the worker and
 // falls through to a fresh repair Attempt
 // -----------------------------------------------------------------------------

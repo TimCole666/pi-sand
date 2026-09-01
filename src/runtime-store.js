@@ -672,6 +672,21 @@ function attemptRunLimit(task) {
   );
 }
 
+function effectiveMaxPublications(authority, budget) {
+  const authorityObject =
+    typeof authority === "string" ? parsed(authority, {}) : authority ?? {};
+  const remoteAuthority =
+    authorityObject.remotePublication ?? authorityObject.remote_publication;
+  const authorityMax =
+    remoteAuthority?.maxPublications ??
+    remoteAuthority?.max_publications ??
+    remoteAuthority?.publicationBudget;
+  return Math.min(
+    Number(authorityMax ?? DEFAULT_BUDGET.maxRemotePublications),
+    Number(budget?.maxRemotePublications ?? DEFAULT_BUDGET.maxRemotePublications),
+  );
+}
+
 function continuationAcknowledgementStatus(acknowledgement) {
   if (acknowledgement === false) return "rejected";
   if (
@@ -2720,9 +2735,9 @@ export class RuntimeStore {
         throw new Error(reservationFailure.message);
       }
       const taskBudget = normalizeBudget(taskRow.budget);
-      const effectiveMaxPubs = Math.min(
-        Number(authority.maxPublications ?? DEFAULT_BUDGET.maxRemotePublications),
-        Number(taskBudget.maxRemotePublications ?? DEFAULT_BUDGET.maxRemotePublications),
+      const effectiveMaxPubs = effectiveMaxPublications(
+        { remotePublication: authority },
+        taskBudget,
       );
       if (Number(taskRow.publicationCount) >= effectiveMaxPubs) {
         reservationFailure = {
@@ -3876,13 +3891,19 @@ export class RuntimeStore {
         ["ECONNREFUSED", "ETIMEDOUT", "ENOTFOUND"].includes(error.code) ||
         ["ECONNREFUSED", "ETIMEDOUT", "ENOTFOUND"].includes(error.cause?.code);
 
+      const atOrAfterEffectiveDeadline =
+        Number.isFinite(effectiveDeadline) && nowTime >= effectiveDeadline;
+
       if (isAuth) {
         this.db
           .prepare(
             "UPDATE wait_subscriptions SET last_reconciled_at = ?, deadline_at = MIN(deadline_at, ?) WHERE id = ?",
           )
           .run(nowIso, effectiveDeadlineIso, id);
-        if (markBlockedOnAuth) {
+        // Before the deadline, preserve the caller's choice to leave an auth
+        // failure for user handling. At the deadline, however, that choice
+        // cannot leave the daemon-owned wait replayable forever.
+        if (markBlockedOnAuth || atOrAfterEffectiveDeadline) {
           this.markBlocked(
             subscription.taskId,
             subscription.createdByAttemptId,
@@ -3901,6 +3922,43 @@ export class RuntimeStore {
       }
 
       if (isRateLimit || isNetwork) {
+        const transientError = {
+          code:
+            error.code || (isRateLimit ? "rate_limited" : "network_error"),
+          message: bounded(error.message, MAX_TASK_DETAIL_LENGTH),
+        };
+        if (atOrAfterEffectiveDeadline) {
+          // This provider request is the one final exact reconciliation. A
+          // transient failure cannot establish CI truth, so fail closed as an
+          // external timeout rather than scheduling a retry beyond the bound.
+          if (
+            capability === WAIT_RECONCILE_CAPABILITY &&
+            (trigger || autoTrigger)
+          ) {
+            return await this.#triggerWaitSubscription(
+              id,
+              {
+                model: options.model,
+                thinkingLevel: options.thinkingLevel,
+                timedOut: true,
+                now: nowOverride,
+                skipSpawn: options.skipSpawn === true,
+              },
+              WAIT_TRIGGER_CAPABILITY,
+            );
+          }
+          this.db
+            .prepare(
+              "UPDATE wait_subscriptions SET status = 'timed_out', last_reconciled_at = ?, next_reconcile_at = NULL, deadline_at = MIN(deadline_at, ?) WHERE id = ? AND status = 'active'",
+            )
+            .run(nowIso, effectiveDeadlineIso, id);
+          return {
+            task: this.getTask(subscription.taskId),
+            waitSubscription: this.getWaitSubscription(id),
+            classification: "timed_out",
+            transientError,
+          };
+        }
         const retryDelay =
           error.retryAfterMs ?? (isRateLimit ? 60_000 : 15_000);
         const nextReconcileIso = new Date(nowTime + retryDelay).toISOString();
@@ -3913,11 +3971,7 @@ export class RuntimeStore {
           task: this.getTask(subscription.taskId),
           waitSubscription: this.getWaitSubscription(id),
           classification: "pending",
-          transientError: {
-            code:
-              error.code || (isRateLimit ? "rate_limited" : "network_error"),
-            message: bounded(error.message, MAX_TASK_DETAIL_LENGTH),
-          },
+          transientError,
         };
       }
 
@@ -4606,8 +4660,7 @@ export class RuntimeStore {
       } else {
         // 7B. CI Failure, ci_not_observable, timed_out, etc.
         const budget = normalizeBudget(taskRow.budget);
-        const authorityObj = parsed(taskRow.authority, {});
-        const maxPubs = authorityObj?.maxPublications ?? budget.maxRemotePublications;
+        const maxPubs = effectiveMaxPublications(taskRow.authority, budget);
         const totalAttempts = this.#getTaskAttemptsCount(taskRow.id);
         const codeAttempts = this.#getTaskCodeAttemptsCount(taskRow.id);
         const startupFailures = this.#getTaskStartupFailuresCount(taskRow.id);
@@ -6336,10 +6389,8 @@ export class RuntimeStore {
         ),
         remainingPublications: Math.max(
           0,
-          Math.min(
-            parsed(task.authority, {})?.maxPublications ?? budget.maxRemotePublications,
-            budget.maxRemotePublications,
-          ) - Number(task.publicationCount ?? 0),
+          effectiveMaxPublications(task.authority, budget) -
+            Number(task.publicationCount ?? 0),
         ),
       },
     });
@@ -7052,8 +7103,7 @@ export class RuntimeStore {
           if (canRepairSameAttempt) {
             const attemptsCount = this.#getTaskAttemptsCount(task.id);
             const ciRepairsCount = this.#getTaskCiRepairsCount(task.id);
-            const authorityObj = parsed(task.authority, {});
-            const maxPubs = authorityObj?.maxPublications ?? budget.maxRemotePublications;
+            const maxPubs = effectiveMaxPublications(task.authority, budget);
             const remainingBudget = {
               remainingRunsInAttempt: Math.max(0, budget.maxPiRunsPerAttempt - (active.runSequence + 1)),
               remainingAttempts: Math.max(0, budget.maxTotalAttempts - attemptsCount),
