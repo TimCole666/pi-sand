@@ -34,6 +34,8 @@ export const MAX_LOCAL_GATE_COUNT = 16;
 export const MAX_LOCAL_GATE_COMMAND_LENGTH = 4 * 1024;
 export const MAX_LOCAL_GATE_TIMEOUT_MS = 60_000;
 export const WORKER_STOP_TIMEOUT_MS = 2_000;
+export const MAX_ATTEMPT_RUNS_PER_ATTEMPT = 4;
+export const MAX_CONTINUATION_PROMPT_LENGTH = MAX_TASK_PACKET_LENGTH;
 export const COMMITMENT_CONTRACT_VERSION = 1;
 export const COMMITMENT_CONTROL_VERSION = 1;
 const INITIAL_ATTEMPT_RUN_SEQUENCE = 1;
@@ -166,6 +168,38 @@ function promptDigest(prompt) {
 
 function digest(value) {
   return createHash("sha256").update(String(value), "utf8").digest("hex");
+}
+
+function sortedSnapshot(value) {
+  if (Array.isArray(value)) return value.map(sortedSnapshot);
+  if (value && typeof value === "object")
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entry]) => [key, sortedSnapshot(entry)]),
+    );
+  return value;
+}
+
+function snapshotsEqual(left, right) {
+  return JSON.stringify(sortedSnapshot(left)) === JSON.stringify(sortedSnapshot(right));
+}
+
+function attemptRunLimit(task) {
+  const configured = Number(parsed(task?.budget, {})?.piRunsPerAttempt);
+  if (!Number.isInteger(configured) || configured <= 0)
+    return MAX_ATTEMPT_RUNS_PER_ATTEMPT;
+  return Math.min(configured, MAX_ATTEMPT_RUNS_PER_ATTEMPT);
+}
+
+function eventPromptGeneration(event, metadata) {
+  const value =
+    metadata?.promptGeneration ??
+    event?.promptGeneration ??
+    event?.attemptRunSequence ??
+    event?.runSequence ??
+    null;
+  return value == null ? null : Number(value);
 }
 
 function defaultCompletionContract(goal) {
@@ -1357,17 +1391,32 @@ export class RuntimeStore {
       runSequence: INITIAL_ATTEMPT_RUN_SEQUENCE,
       contractVersion: task.contractVersion ?? COMMITMENT_CONTRACT_VERSION,
       controlVersion: task.controlVersion ?? COMMITMENT_CONTROL_VERSION,
+      provider: model.provider,
+      modelId: model.id,
+      thinkingLevel,
+      taskWorktree: task.taskWorktree,
+      sourceRepoRoot: task.sourceRepoRoot,
+      taskBranch: task.taskBranch,
+      baseCommit: task.baseCommit,
       worker: null,
+      executionSnapshot: null,
+      sessionId: null,
+      eventGeneration: INITIAL_ATTEMPT_RUN_SEQUENCE,
+      pendingEventGeneration: null,
       packet: taskPacket,
       finalAssistant: null,
       settled: false,
       runAccepted: false,
       runSettled: false,
+      runPromptInFlight: false,
+      promptAmbiguous: false,
+      ambiguousHandlingPromise: null,
       rpcCoherent: true,
       finalizing: false,
       settlementPromise: null,
       pendingEvents: [],
       pendingClose: null,
+      previousRun: null,
       stopRequested: false,
       workerMetadata: null,
       gateProcess: null,
@@ -1384,7 +1433,7 @@ export class RuntimeStore {
         modelId: model.id,
         thinkingLevel,
         taskPrompt: taskPacket,
-        onEvent: (event) => this.handleWorkerEvent(active, event),
+        onEvent: (event, metadata) => this.handleWorkerEvent(active, event, metadata),
         onClose: (details) => this.handleWorkerClose(active, details),
         workerStopTimeoutMs: this.workerStopTimeoutMs,
         onWorkerSpawn: (worker) => {
@@ -1393,6 +1442,17 @@ export class RuntimeStore {
       });
       if (this.active !== active) return this.getTask(task.id);
       active.worker = worker;
+      const workerSnapshot = worker?.executionSnapshot;
+      active.executionSnapshot = workerSnapshot
+        ? sortedSnapshot(workerSnapshot)
+        : {
+            cwd: task.taskWorktree,
+            provider: model.provider,
+            modelId: model.id,
+            thinkingLevel,
+          };
+      active.sessionId = worker?.sessionId ?? null;
+      active.eventGeneration = Number(worker?.promptGeneration) || INITIAL_ATTEMPT_RUN_SEQUENCE;
       const metadata = workerMetadata(worker) ?? active.workerMetadata;
       if (metadata) {
         active.workerMetadata =
@@ -1426,16 +1486,20 @@ export class RuntimeStore {
       // Its event history covers the prompt response and agent_settled event
       // when both arrive before this startup promise resumes.
       if (!worker?.callbacksAttached) {
-        worker?.onEvent?.((event) => this.handleWorkerEvent(active, event));
+        worker?.onEvent?.((event, metadata) => this.handleWorkerEvent(active, event, metadata));
         worker?.onClose?.((details) => this.handleWorkerClose(active, details));
       }
       const replayed = new Set();
       for (const event of Array.isArray(worker?.events) ? worker.events : []) {
         replayed.add(event);
-        this.handleWorkerEvent(active, event);
+        this.handleWorkerEvent(active, event, {
+          promptGeneration: active.eventGeneration,
+          promptAcknowledged: true,
+        });
       }
-      for (const event of active.pendingEvents) {
-        if (!replayed.has(event)) this.handleWorkerEvent(active, event);
+      for (const pending of active.pendingEvents) {
+        const event = pending?.event ?? pending;
+        if (!replayed.has(event)) this.handleWorkerEvent(active, event, pending?.metadata);
       }
       active.pendingEvents = [];
       // The production Fresh Executor has already accepted its packet before
@@ -1464,23 +1528,69 @@ export class RuntimeStore {
     }
   }
 
-  handleWorkerEvent(active, event) {
-    if (this.active !== active || active.finalizing || active.runSettled) return;
+  handleWorkerEvent(active, event, metadata = null) {
+    if (this.active !== active || active.finalizing || active.runSettled || active.promptAmbiguous) return;
     if (!active.worker) {
-      active.pendingEvents.push(event);
+      active.pendingEvents.push({ event, metadata });
       return;
+    }
+    const promptGeneration = eventPromptGeneration(event, metadata);
+    const expectedGeneration = active.runPromptInFlight
+      ? active.pendingEventGeneration
+      : active.eventGeneration;
+    if (
+      promptGeneration !== null &&
+      Number(promptGeneration) !== Number(expectedGeneration)
+    )
+      return;
+    if (active.runPromptInFlight && metadata && metadata.promptAcknowledged !== true)
+      return;
+    if (event?.type === "session") {
+      const sessionId = event.id ?? event.sessionId;
+      if (typeof sessionId !== "string") return;
+      if (active.sessionId && active.sessionId !== sessionId) {
+        active.rpcCoherent = false;
+        if (active.runPromptInFlight) {
+          void this.#handleAmbiguousContinuation(
+            active,
+            new Error("Fresh Executor session identity changed before continuation acknowledgement."),
+          );
+        } else {
+          void this.settle(active, {
+            success: false,
+            result: active.finalAssistant?.result ?? null,
+            detail: "Fresh Executor session identity changed inside the Attempt.",
+            checkpoint: false,
+          });
+        }
+        return;
+      }
+      active.sessionId ??= sessionId;
     }
     if (event?.type === "executor_error") {
       active.rpcCoherent = false;
-      void this.settle(active, {
-        success: false,
-        result: active.finalAssistant?.result ?? null,
-        detail:
-          "Fresh Executor RPC lifecycle became incoherent before settlement.",
-        checkpoint: false,
-      });
+      if (active.runPromptInFlight) {
+        void this.#handleAmbiguousContinuation(
+          active,
+          new Error("Fresh Executor RPC lifecycle became incoherent before prompt acknowledgement."),
+        );
+      } else {
+        void this.settle(active, {
+          success: false,
+          result: active.finalAssistant?.result ?? null,
+          detail:
+            "Fresh Executor RPC lifecycle became incoherent before settlement.",
+          checkpoint: false,
+        });
+      }
       return;
     }
+    if (active.runPromptInFlight || !active.runAccepted) {
+      if (metadata?.promptAcknowledged === true)
+        active.pendingEvents.push({ event, metadata });
+      return;
+    }
+    if (event?.type === "agent_start") active.settled = false;
     const outcome = assistantOutcome(event);
     if (outcome) active.finalAssistant = outcome;
     if (event?.type === "agent_settled") active.settled = true;
@@ -1494,6 +1604,7 @@ export class RuntimeStore {
       this.active !== active ||
       active.finalizing ||
       active.runSettled ||
+      active.promptAmbiguous ||
       active.stopRequested
     )
       return;
@@ -1502,6 +1613,13 @@ export class RuntimeStore {
       return;
     }
     active.rpcCoherent = false;
+    if (active.runPromptInFlight) {
+      void this.#handleAmbiguousContinuation(
+        active,
+        new Error("Fresh Executor closed before continuation prompt acknowledgement."),
+      );
+      return;
+    }
     void this.settle(active, {
       success: false,
       result: active.finalAssistant?.result ?? null,
@@ -1510,7 +1628,7 @@ export class RuntimeStore {
     });
   }
 
-  async settleInitialRun(active, outcome) {
+  async settleRun(active, outcome) {
     if (
       this.active !== active ||
       active.finalizing ||
@@ -1566,6 +1684,10 @@ export class RuntimeStore {
       } catch {}
       throw error;
     }
+  }
+
+  async settleInitialRun(active, outcome) {
+    return this.settleRun(active, outcome);
   }
 
   async finishSettled(active) {
@@ -2298,6 +2420,388 @@ export class RuntimeStore {
     }
   }
 
+  #currentWorkerIsSafe(active, task) {
+    if (!active.worker || !active.rpcCoherent || active.promptAmbiguous)
+      throw new Error("Fresh Executor Attempt is not healthy/current.");
+    if (
+      task.taskWorktree !== active.taskWorktree ||
+      task.sourceRepoRoot !== active.sourceRepoRoot ||
+      task.taskBranch !== active.taskBranch ||
+      task.baseCommit !== active.baseCommit
+    )
+      throw new Error("Task worktree/environment identity changed.");
+    const recorded = active.workerMetadata;
+    if (recorded) {
+      if (processGroupStatus(recorded.workerPgid) !== "alive")
+        throw new Error("Fresh Executor process identity is no longer alive.");
+      if (!recordedWorkerIsOwned(recorded, this.bootId))
+        throw new Error("Fresh Executor process ownership is no longer proven.");
+      const durable = this.db
+        .prepare(`${ATTEMPT_SELECT} WHERE id = ? AND task_id = ?`)
+        .get(active.attemptId, active.taskId);
+      if (
+        !durable ||
+        durable.workerPid !== recorded.workerPid ||
+        durable.workerPgid !== recorded.workerPgid ||
+        durable.workerStartIdentity !== recorded.workerStartIdentity ||
+        durable.workerBootId !== recorded.workerBootId ||
+        durable.provider !== active.provider ||
+        durable.modelId !== active.modelId ||
+        durable.thinkingLevel !== active.thinkingLevel
+      )
+        throw new Error("Fresh Executor process/model identity changed.");
+    }
+    const currentSnapshot = active.worker.executionSnapshot;
+    if (
+      active.executionSnapshot &&
+      currentSnapshot &&
+      !snapshotsEqual(
+        { ...active.executionSnapshot, sessionId: undefined },
+        { ...currentSnapshot, sessionId: undefined },
+      )
+    )
+      throw new Error("Fresh Executor capability/environment snapshot changed.");
+    const currentSessionId =
+      active.worker.sessionId ?? active.worker.executionSnapshot?.sessionId;
+    if (
+      active.sessionId &&
+      currentSessionId !== undefined &&
+      currentSessionId !== active.sessionId
+    )
+      throw new Error("Fresh Executor session identity changed.");
+  }
+
+  #assertContinuationSafe(active, options) {
+    if (
+      this.active !== active ||
+      active.stopRequested ||
+      active.promptAmbiguous ||
+      active.runPromptInFlight ||
+      !active.runAccepted ||
+      !active.runSettled ||
+      !active.settled ||
+      !active.rpcCoherent
+    )
+      throw new Error("Fresh Executor Attempt is not eligible for a continuation prompt.");
+    const current = this.#supervisorState(active);
+    if (!current)
+      throw new Error("Fresh Executor Attempt is stale or its versions are no longer current.");
+    const { task } = current;
+    assertTaskWorktreeIdentity(task);
+    this.#currentWorkerIsSafe(active, task);
+    const requestedModel = options.model ?? (
+      options.provider || options.modelId
+        ? { provider: options.provider, id: options.modelId }
+        : null
+    );
+    if (
+      requestedModel &&
+      (requestedModel.provider !== active.provider || requestedModel.id !== active.modelId)
+    )
+      throw new Error("Fresh Executor model identity changed; the Attempt cannot be reused.");
+    if (options.thinkingLevel != null && options.thinkingLevel !== active.thinkingLevel)
+      throw new Error("Fresh Executor thinking level changed; the Attempt cannot be reused.");
+    const requestedControlVersion = options.controlVersion ?? options.control_version;
+    if (
+      requestedControlVersion != null &&
+      Number(requestedControlVersion) !== Number(active.controlVersion)
+    )
+      throw new Error("Fresh Executor control version is no longer current.");
+    const requestedContractVersion = options.contractVersion ?? options.contract_version;
+    if (
+      requestedContractVersion != null &&
+      Number(requestedContractVersion) !== Number(active.contractVersion)
+    )
+      throw new Error("Fresh Executor contract version is no longer current.");
+    const requestedCapabilities =
+      options.capabilitySnapshot ?? options.capabilities ?? options.capabilityPolicy;
+    const currentCapabilities =
+      active.executionSnapshot?.capabilities ?? active.worker.capabilitySnapshot;
+    if (
+      requestedCapabilities !== undefined &&
+      !snapshotsEqual(requestedCapabilities, currentCapabilities)
+    )
+      throw new Error("Fresh Executor capability snapshot changed; the Attempt cannot be reused.");
+    const requestedEnvironment =
+      options.environmentSnapshot ??
+      options.environmentGeneration ??
+      options.environment;
+    const currentEnvironment =
+      active.executionSnapshot?.environment ??
+      active.executionSnapshot?.environmentGeneration ??
+      active.worker.environmentSnapshot ??
+      active.worker.environmentGeneration;
+    if (
+      requestedEnvironment !== undefined &&
+      !snapshotsEqual(requestedEnvironment, currentEnvironment)
+    )
+      throw new Error("Task worktree/environment generation changed; the Attempt cannot be reused.");
+    const requestedWorktree = options.taskWorktree ?? options.worktree;
+    if (
+      requestedWorktree != null &&
+      requestedWorktree !== task.taskWorktree
+    )
+      throw new Error("Task worktree/environment identity changed.");
+    const nextSequence = Number(current.run.sequence) + 1;
+    if (nextSequence > attemptRunLimit(task))
+      throw new Error("Fresh Executor Attempt run budget is exhausted.");
+    if (typeof options.prompt !== "string" || !options.prompt.trim())
+      throw new Error("Continuation prompt is required.");
+    if (Buffer.byteLength(options.prompt, "utf8") > MAX_CONTINUATION_PROMPT_LENGTH)
+      throw new Error("Continuation prompt exceeds the bounded size limit.");
+    if (typeof active.worker.prompt !== "function")
+      throw new Error("Fresh Executor does not expose an acknowledged continuation prompt.");
+    return { task, current, nextSequence };
+  }
+
+  #allocateContinuationRun(active, prompt, sequence) {
+    const timestamp = now();
+    this.db.exec("BEGIN");
+    try {
+      const current = this.#supervisorState(active);
+      if (!current || Number(current.run.sequence) + 1 !== sequence)
+        throw new Error("Fresh Executor Attempt changed before continuation allocation.");
+      this.db
+        .prepare(`INSERT INTO attempt_runs (
+          attempt_id, sequence, kind, control_version, contract_version,
+          prompt_digest, state, evidence_refs, started_at
+        ) VALUES (?, ?, 'continue', ?, ?, ?, 'pending', '[]', ?)`)
+        .run(
+          active.attemptId,
+          sequence,
+          active.controlVersion,
+          active.contractVersion,
+          promptDigest(prompt),
+          timestamp,
+        );
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+    active.previousRun = {
+      runSequence: active.runSequence,
+      eventGeneration: active.eventGeneration,
+      finalAssistant: active.finalAssistant,
+      settled: active.settled,
+      runAccepted: active.runAccepted,
+      runSettled: active.runSettled,
+    };
+    active.runSequence = sequence;
+    active.pendingEventGeneration = sequence;
+    active.runPromptInFlight = true;
+    active.runAccepted = false;
+    active.runSettled = false;
+    active.settled = false;
+    active.finalAssistant = null;
+    active.settlementPromise = null;
+    active.pendingEvents = [];
+  }
+
+  #acceptContinuationRun(active, sequence, promptGeneration) {
+    this.db.exec("BEGIN");
+    try {
+      const result = this.db
+        .prepare(`UPDATE attempt_runs SET state = 'accepted'
+          WHERE attempt_id = ? AND sequence = ? AND state = 'pending'
+          AND control_version = ? AND contract_version = ?
+          AND EXISTS (
+            SELECT 1 FROM attempts AS a JOIN tasks AS t ON t.id = a.task_id
+            WHERE a.id = attempt_runs.attempt_id AND a.id = ?
+              AND a.state = 'running' AND t.latest_attempt_id = a.id
+              AND t.state IN ('accepted', 'running')
+              AND t.control_version = ? AND t.contract_version = ?
+          )`)
+        .run(
+          active.attemptId,
+          sequence,
+          active.controlVersion,
+          active.contractVersion,
+          active.attemptId,
+          active.controlVersion,
+          active.contractVersion,
+        );
+      this.db.exec("COMMIT");
+      if (result.changes !== 1) return false;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+    active.eventGeneration = promptGeneration;
+    active.pendingEventGeneration = null;
+    active.runPromptInFlight = false;
+    active.runAccepted = true;
+    return true;
+  }
+
+  #restorePreviousRun(active) {
+    const previous = active.previousRun;
+    if (!previous) return;
+    active.runSequence = previous.runSequence;
+    active.eventGeneration = previous.eventGeneration;
+    active.pendingEventGeneration = null;
+    active.finalAssistant = previous.finalAssistant;
+    active.settled = previous.settled;
+    active.runAccepted = previous.runAccepted;
+    active.runSettled = previous.runSettled;
+    active.runPromptInFlight = false;
+    active.settlementPromise = null;
+    active.pendingEvents = [];
+    active.previousRun = null;
+  }
+
+  #abortContinuationRun(active, detail) {
+    const timestamp = now();
+    this.db.exec("BEGIN");
+    try {
+      this.db
+        .prepare(`UPDATE attempt_runs SET state = 'aborted', settled_outcome = ?, settled_at = ?
+          WHERE attempt_id = ? AND sequence = ? AND state = 'pending'`)
+        .run(boundedDetail(detail), timestamp, active.attemptId, active.runSequence);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+    this.#restorePreviousRun(active);
+  }
+
+  async #handleAmbiguousContinuation(active, error) {
+    if (active.ambiguousHandlingPromise) return active.ambiguousHandlingPromise;
+    active.ambiguousHandlingPromise = (async () => {
+      active.promptAmbiguous = true;
+      active.runPromptInFlight = false;
+      active.rpcCoherent = false;
+      const detail = boundedDetail(
+        `Fresh Executor continuation prompt outcome is ambiguous; it was not replayed: ${commandError(error)}`,
+      );
+      let retired = false;
+      try {
+        retired = await this.retireWorker(active.worker, active.workerMetadata);
+      } catch {}
+      if (this.active !== active) return;
+      const timestamp = now();
+      const finalResult = active.previousRun?.finalAssistant?.result ?? null;
+      this.db.exec("BEGIN");
+      try {
+        this.db
+          .prepare(`UPDATE attempt_runs SET state = 'ambiguous', settled_outcome = COALESCE(settled_outcome, ?), settled_at = COALESCE(settled_at, ?)
+            WHERE attempt_id = ? AND sequence = ? AND state = 'pending'`)
+          .run(detail, timestamp, active.attemptId, active.runSequence);
+        this.db
+          .prepare(`UPDATE attempts SET state = ?, finished_at = ?, worker_terminated = ?, final_result = ?, terminal_detail = ?
+            WHERE id = ? AND task_id = ? AND state = 'running'`)
+          .run(
+            retired ? "failed" : "orphaned",
+            timestamp,
+            retired ? 1 : 0,
+            finalResult,
+            detail,
+            active.attemptId,
+            active.taskId,
+          );
+        this.db
+          .prepare(`UPDATE tasks SET state = ?, updated_at = ?, final_result = ?, terminal_detail = ?, terminal_reason = ?
+            WHERE id = ? AND latest_attempt_id = ? AND state IN ('accepted', 'running')
+              AND control_version = ? AND contract_version = ?`)
+          .run(
+            retired ? "failed" : "blocked",
+            timestamp,
+            finalResult,
+            detail,
+            "continuation_prompt_ambiguous",
+            active.taskId,
+            active.attemptId,
+            active.controlVersion,
+            active.contractVersion,
+          );
+        this.db.exec("COMMIT");
+      } catch (transactionError) {
+        try {
+          this.db.exec("ROLLBACK");
+        } catch {}
+        throw transactionError;
+      }
+      this.active = null;
+    })();
+    try {
+      await active.ambiguousHandlingPromise;
+    } finally {
+      active.ambiguousHandlingPromise = null;
+    }
+  }
+
+  /** Request one explicitly supervised continuation in the current Attempt. */
+  async continueAttempt(options = {}) {
+    const id = options.id ?? options.taskId;
+    if (typeof id !== "string" || !id.trim())
+      throw new Error("Continuation requires a Task id.");
+    if (this.active?.finalizing && this.active.settlementPromise) {
+      await this.active.settlementPromise.catch(() => {});
+    }
+    const active = this.active;
+    if (!active || active.taskId !== id.trim())
+      throw new Error("Fresh Executor Attempt is not eligible for a continuation prompt.");
+    this.open();
+    const prompt = options.prompt ?? options.message;
+    const { nextSequence } = this.#assertContinuationSafe(active, {
+      ...options,
+      prompt,
+    });
+    this.#allocateContinuationRun(active, prompt, nextSequence);
+    let acknowledgement;
+    try {
+      acknowledgement = await active.worker.prompt(prompt);
+    } catch (error) {
+      if (error?.code === "PROMPT_REJECTED") {
+        this.#abortContinuationRun(active, error.message);
+      } else {
+        await this.#handleAmbiguousContinuation(active, error);
+      }
+      throw error;
+    }
+    const acknowledged =
+      acknowledgement == null ||
+      acknowledgement === true ||
+      acknowledgement.accepted === true ||
+      acknowledgement.success === true;
+    if (!acknowledged) {
+      const rejection = Object.assign(
+        new Error("Fresh Executor rejected the continuation prompt."),
+        { code: "PROMPT_REJECTED", phase: "prompt" },
+      );
+      this.#abortContinuationRun(active, rejection.message);
+      throw rejection;
+    }
+    const promptGeneration = Number(
+      acknowledgement?.promptGeneration ?? active.pendingEventGeneration,
+    );
+    if (!Number.isInteger(promptGeneration) || promptGeneration !== nextSequence) {
+      const mismatch = new Error("Fresh Executor prompt acknowledgement was not correlated to the allocated AttemptRun.");
+      mismatch.code = "RPC_CORRELATION_FAILED";
+      await this.#handleAmbiguousContinuation(active, mismatch);
+      throw mismatch;
+    }
+    if (!this.#acceptContinuationRun(active, nextSequence, promptGeneration)) {
+      const stale = new Error("Fresh Executor continuation acknowledgement arrived after the Attempt versions changed.");
+      stale.code = "STALE_ATTEMPT";
+      await this.#handleAmbiguousContinuation(active, stale);
+      throw stale;
+    }
+    const pending = active.pendingEvents;
+    active.pendingEvents = [];
+    for (const item of pending)
+      this.handleWorkerEvent(active, item?.event ?? item, item?.metadata);
+    active.previousRun = null;
+    return this.getTask(id.trim());
+  }
+
   #cancelLocalGate(active) {
     if (!active?.gateCancellation) return true;
     try {
@@ -2407,7 +2911,11 @@ export class RuntimeStore {
 
     const timestamp = now();
     let runState = "ambiguous";
-    if (retired) runState = active.runAccepted ? "settled" : "aborted";
+    if (retired)
+      runState =
+        active.runAccepted && active.settled && active.finalAssistant
+          ? "settled"
+          : "aborted";
     this.db.exec("BEGIN");
     try {
       this.db

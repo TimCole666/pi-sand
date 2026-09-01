@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readProcessIdentity, stopOwnedProcessGroupSync, WORKER_STOP_TIMEOUT_MS } from "./process.js";
 
 export const FRESH_PI_VERSION = "0.84.4";
@@ -68,6 +68,19 @@ function startupError(message, options) {
   return new FreshExecutorError(message, options);
 }
 
+function environmentDigest(env) {
+  return createHash("sha256")
+    .update(
+      JSON.stringify(
+        Object.entries(env ?? {})
+          .map(([key, value]) => [key, String(value)])
+          .sort(([left], [right]) => left.localeCompare(right)),
+      ),
+      "utf8",
+    )
+    .digest("hex");
+}
+
 /**
  * One controlled Pi 0.84.4 RPC process. Configuration is deliberately not
  * exposed as fire-and-forget methods: start() is the only operation that can
@@ -87,6 +100,13 @@ class FreshExecutorClient {
   #eventHistory = [];
   #transportError;
   #metadata;
+  #promptGeneration = 0;
+  #pendingPromptGeneration = null;
+  #promptInFlight = false;
+  #promptAmbiguous = false;
+  #settled = false;
+  #sessionId = null;
+  #executionSnapshot;
 
   constructor(options) {
     this.#options = {
@@ -106,6 +126,15 @@ class FreshExecutorClient {
         throw startupError(`Fresh Executor requires ${field}.`, { code: "INVALID_CONFIGURATION" });
       }
     }
+    this.#executionSnapshot = Object.freeze({
+      command: this.#options.command,
+      cwd: this.#options.cwd,
+      args: [...FRESH_EXECUTOR_ARGS],
+      provider: this.#options.provider,
+      modelId: this.#options.modelId,
+      thinkingLevel: this.#options.thinkingLevel,
+      environmentDigest: environmentDigest(this.#options.env),
+    });
   }
 
   async start() {
@@ -153,7 +182,13 @@ class FreshExecutorClient {
         });
       }
 
-      const promptResponse = await this.#request("prompt", { message: this.#options.taskPrompt });
+      const promptGeneration = this.#promptGeneration + 1;
+      this.#pendingPromptGeneration = promptGeneration;
+      const promptResponse = await this.#request(
+        "prompt",
+        { message: this.#options.taskPrompt },
+        { promptGeneration },
+      );
       if (promptResponse.success !== true) {
         throw startupError("Fresh Executor rejected the Task prompt.", {
           code: "PROMPT_REJECTED",
@@ -259,14 +294,41 @@ class FreshExecutorClient {
       }
       this.#pending.delete(message.id);
       clearTimeout(pending.timer);
+      if (pending.command === "prompt") {
+        if (message.success === true) {
+          this.#promptGeneration = pending.promptGeneration;
+          this.#pendingPromptGeneration = null;
+          this.#settled = false;
+        } else if (this.#pendingPromptGeneration === pending.promptGeneration) {
+          this.#pendingPromptGeneration = null;
+        }
+      }
       pending.resolve(message);
       return;
     }
+    const metadata = this.#eventMetadata();
+    if (message.type === "session") {
+      const sessionId = message.id ?? message.sessionId;
+      if (typeof sessionId === "string") this.#sessionId ??= sessionId;
+    }
+    if (metadata.promptAcknowledged && message.type === "agent_start")
+      this.#settled = false;
+    if (metadata.promptAcknowledged && message.type === "agent_settled")
+      this.#settled = true;
     this.#eventHistory.push(message);
-    for (const listener of this.#eventListeners) listener(message);
+    for (const listener of this.#eventListeners) listener(message, metadata);
   }
 
-  #request(command, payload) {
+  #eventMetadata() {
+    const promptGeneration = this.#pendingPromptGeneration ?? this.#promptGeneration;
+    return {
+      promptGeneration,
+      promptAcknowledged:
+        promptGeneration > 0 && promptGeneration === this.#promptGeneration,
+    };
+  }
+
+  #request(command, payload, { promptGeneration = null } = {}) {
     if (this.#transportError) return Promise.reject(this.#transportError);
     if (this.#closed || this.#closing) {
       return Promise.reject(startupError("Fresh Executor is closed.", { code: "WORKER_CLOSED", phase: "transport" }));
@@ -276,12 +338,14 @@ class FreshExecutorClient {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.#pending.delete(id);
+        if (command === "prompt" && this.#pendingPromptGeneration === promptGeneration)
+          this.#pendingPromptGeneration = null;
         reject(startupError(`Fresh Executor ${command} acknowledgement timed out.`, {
           code: "RPC_TIMEOUT",
           phase: command,
         }));
       }, this.#options.timeoutMs);
-      this.#pending.set(id, { command, resolve, reject, timer });
+      this.#pending.set(id, { command, resolve, reject, timer, promptGeneration });
       try {
         this.#child.stdin.write(`${JSON.stringify(request)}\n`);
       } catch (error) {
@@ -308,10 +372,70 @@ class FreshExecutorClient {
   #transportFailure(error) {
     if (this.#closed || this.#closing) return;
     this.#transportError ??= error;
+    if (this.#promptInFlight) this.#promptAmbiguous = true;
     this.#rejectPending(error);
     if (this.#ready) {
       this.#eventHistory.push({ type: "executor_error", code: error.code });
-      for (const listener of this.#eventListeners) listener(this.#eventHistory.at(-1));
+      const metadata = this.#eventMetadata();
+      for (const listener of this.#eventListeners)
+        listener(this.#eventHistory.at(-1), metadata);
+    }
+  }
+
+  async #prompt(message) {
+    if (typeof message !== "string" || message.length === 0)
+      throw startupError("Fresh Executor continuation prompt is required.", {
+        code: "INVALID_PROMPT",
+        phase: "prompt",
+      });
+    if (!this.#ready)
+      throw startupError("Fresh Executor is not ready for a continuation prompt.", {
+        code: "WORKER_NOT_READY",
+        phase: "prompt",
+      });
+    if (this.#promptAmbiguous)
+      throw startupError("Fresh Executor cannot reuse an ambiguous prompt outcome.", {
+        code: "PROMPT_AMBIGUOUS",
+        phase: "prompt",
+      });
+    if (this.#promptInFlight)
+      throw startupError("Fresh Executor already has a prompt in flight.", {
+        code: "PROMPT_IN_FLIGHT",
+        phase: "prompt",
+      });
+    if (!this.#settled)
+      throw startupError("Fresh Executor is not settled for a continuation prompt.", {
+        code: "PROMPT_NOT_SETTLED",
+        phase: "prompt",
+      });
+
+    const promptGeneration = this.#promptGeneration + 1;
+    this.#pendingPromptGeneration = promptGeneration;
+    this.#promptInFlight = true;
+    this.#settled = false;
+    try {
+      const response = await this.#request(
+        "prompt",
+        { message },
+        { promptGeneration },
+      );
+      if (response.success !== true)
+        throw startupError("Fresh Executor rejected the continuation prompt.", {
+          code: "PROMPT_REJECTED",
+          phase: "prompt",
+        });
+      this.#promptInFlight = false;
+      return { accepted: true, promptGeneration };
+    } catch (error) {
+      if (this.#pendingPromptGeneration === promptGeneration)
+        this.#pendingPromptGeneration = null;
+      this.#promptInFlight = false;
+      if (error.code === "PROMPT_REJECTED") {
+        this.#settled = true;
+      } else {
+        this.#promptAmbiguous = true;
+      }
+      throw error;
     }
   }
 
@@ -352,6 +476,12 @@ class FreshExecutorClient {
       ...this.#metadata,
       callbacksAttached: typeof this.#options.onEvent === "function" || typeof this.#options.onClose === "function",
       get events() { return [...client.#eventHistory]; },
+      get sessionId() { return client.#sessionId; },
+      get promptGeneration() { return client.#promptGeneration; },
+      get executionSnapshot() {
+        return { ...client.#executionSnapshot, args: [...client.#executionSnapshot.args], sessionId: client.#sessionId };
+      },
+      prompt: (message) => client.#prompt(message),
       onEvent: (listener) => {
         client.#eventListeners.add(listener);
         return () => client.#eventListeners.delete(listener);
@@ -361,7 +491,7 @@ class FreshExecutorClient {
         return () => client.#closeListeners.delete(listener);
       },
       close: () => {
-        client.#terminate(startupError("Fresh Executor was closed by its owner.", {
+        void client.#terminate(startupError("Fresh Executor was closed by its owner.", {
           code: "WORKER_CLOSED",
           phase: "transport",
         }));
