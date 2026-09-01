@@ -3423,16 +3423,7 @@ export class RuntimeStore {
     const timestamp = now();
     this.db.exec("BEGIN");
     try {
-      this.db
-        .prepare(
-          "UPDATE attempts SET state = 'stopped', finished_at = ?, worker_terminated = 1, terminal_detail = ? WHERE id = ? AND state IN ('starting', 'running') AND gate_terminated = 1",
-        )
-        .run(
-          timestamp,
-          "The Task was intentionally stopped by the user.",
-          attempt.id,
-        );
-      this.db
+      const taskUpdate = this.db
         .prepare(
           "UPDATE tasks SET state = 'stopped', terminal_detail = ?, terminal_reason = ?, updated_at = ? WHERE id = ? AND state IN ('accepted', 'running')",
         )
@@ -3442,21 +3433,34 @@ export class RuntimeStore {
           timestamp,
           task.id,
         );
-      this.db
-        .prepare(`UPDATE attempt_runs SET state = 'aborted', settled_outcome = COALESCE(settled_outcome, ?),
-          settled_at = COALESCE(settled_at, ?) WHERE attempt_id = ? AND state IN ('pending', 'accepted')`)
-        .run(
-          "The Task was intentionally stopped by the user.",
-          timestamp,
-          attempt.id,
-        );
-      const resultId = this.#insertResultDelivery({
-        task: this.#taskRow(task.id),
-        outcome: "cancelled",
-        terminalDetail: "The Task was intentionally stopped by the user.",
-        terminalReason: "user_stopped",
-      });
-      if (!resultId) throw new Error("Stopped Task did not produce a Result delivery.");
+      if (taskUpdate.changes === 1) {
+        const attemptUpdate = this.db
+          .prepare(
+            "UPDATE attempts SET state = 'stopped', finished_at = ?, worker_terminated = 1, terminal_detail = ? WHERE id = ? AND state IN ('starting', 'running') AND gate_terminated = 1",
+          )
+          .run(
+            timestamp,
+            "The Task was intentionally stopped by the user.",
+            attempt.id,
+          );
+        if (attemptUpdate.changes !== 1)
+          throw new Error("Stopped Task Attempt transition was not recorded.");
+        this.db
+          .prepare(`UPDATE attempt_runs SET state = 'aborted', settled_outcome = COALESCE(settled_outcome, ?),
+            settled_at = COALESCE(settled_at, ?) WHERE attempt_id = ? AND state IN ('pending', 'accepted')`)
+          .run(
+            "The Task was intentionally stopped by the user.",
+            timestamp,
+            attempt.id,
+          );
+        const resultId = this.#insertResultDelivery({
+          task: this.#taskRow(task.id),
+          outcome: "cancelled",
+          terminalDetail: "The Task was intentionally stopped by the user.",
+          terminalReason: "user_stopped",
+        });
+        if (!resultId) throw new Error("Stopped Task did not produce a Result delivery.");
+      }
       this.db.exec("COMMIT");
     } catch (error) {
       try {

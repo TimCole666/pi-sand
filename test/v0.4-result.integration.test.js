@@ -6,7 +6,9 @@ import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { startRuntimeDaemon } from "../src/daemon.js";
 import { RuntimeClient } from "../src/runtime-client.js";
+import { RuntimeStore } from "../src/runtime-store.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const wait = (milliseconds) =>
@@ -172,6 +174,23 @@ async function completedFixture(options = {}) {
   return { parent, source, env, started, completed, daemonPid };
 }
 
+class StopBarrierRuntimeStore extends RuntimeStore {
+  constructor(options) {
+    super(options);
+    this.stopArrivals = 0;
+    this.stopBarrier = new Promise((resolveBarrier) => {
+      this.releaseStopBarrier = resolveBarrier;
+    });
+  }
+
+  async terminateOwnedWorker() {
+    this.stopArrivals += 1;
+    if (this.stopArrivals === 2) this.releaseStopBarrier();
+    await this.stopBarrier;
+    return true;
+  }
+}
+
 test("completion survives zero clients and daemon restart before a later public Result claim", {
   skip: process.platform === "linux" ? false : "Linux-only",
 }, async () => {
@@ -314,6 +333,92 @@ test("stopping a Task creates a cancelled Result without changing the Task workt
     assert.equal((await runClient(env, "task.get", { id: stopped.id })).task.state, "stopped");
   } finally {
     await stopDaemon(daemonPid).catch(() => {});
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("concurrent public Stop requests create one cancelled Result", {
+  skip: process.platform === "linux" ? false : "Linux-only",
+}, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-result-stop-race-"));
+  const source = await repository(parent);
+  const env = environment(parent, await fakePi(parent), { noSettle: true });
+  const socketPath = join(parent, "runtime", "pi-sand", "pi-sand.sock");
+  const store = new StopBarrierRuntimeStore({
+    dbPath: env.PI_SAND_RUNTIME_DB,
+    piCommand: env.PI_BIN,
+    worktreeRoot: env.PI_SAND_TASK_WORKTREE_ROOT,
+    workerFactory: async () => ({ callbacksAttached: true, close() {} }),
+  });
+  let daemon;
+  try {
+    daemon = await startRuntimeDaemon({
+      dbPath: env.PI_SAND_RUNTIME_DB,
+      socketPath,
+      store,
+    });
+    const client = new RuntimeClient({
+      env,
+      socketPath,
+      dbPath: env.PI_SAND_RUNTIME_DB,
+    });
+    const started = await client.createTask({
+      goal: "cancel one durable result",
+      cwd: source,
+      trusted: true,
+      model: { provider: "provider", id: "model" },
+      thinkingLevel: "high",
+    });
+    const outcomes = await Promise.allSettled([
+      client.stopTask(started.id),
+      client.stopTask(started.id),
+    ]);
+    assert.equal(
+      outcomes.filter(({ status }) => status === "fulfilled").length,
+      2,
+    );
+    assert.equal(
+      outcomes.filter(({ status }) => status === "rejected").length,
+      0,
+    );
+    for (const outcome of outcomes)
+      assert.equal(outcome.value.state, "stopped");
+
+    const stopped = await client.getTask(started.id);
+    assert.equal(stopped.state, "stopped");
+    assert.equal(stopped.attempts[0].state, "stopped");
+
+    const db = new DatabaseSync(env.PI_SAND_RUNTIME_DB);
+    try {
+      assert.equal(
+        db
+          .prepare(
+            "SELECT COUNT(*) AS count FROM result_deliveries WHERE task_id = ?",
+          )
+          .get(started.id).count,
+        1,
+      );
+      assert.equal(
+        db
+          .prepare(
+            "SELECT COUNT(*) AS count FROM result_deliveries WHERE task_id = ? AND state = 'pending'",
+          )
+          .get(started.id).count,
+        1,
+      );
+      assert.equal(
+        db
+          .prepare(
+            "SELECT outcome FROM result_deliveries WHERE task_id = ?",
+          )
+          .get(started.id).outcome,
+        "cancelled",
+      );
+    } finally {
+      db.close();
+    }
+  } finally {
+    await daemon?.close().catch(() => {});
     await rm(parent, { recursive: true, force: true });
   }
 });
