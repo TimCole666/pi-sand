@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -24,7 +24,8 @@ async function eventually(read, predicate, timeoutMs = 2_000) {
 
 async function repository(parent) {
   const source = join(parent, "source");
-  const remote = join(parent, "remote.git");
+  const remote = join(parent, "fixture", "repository.git");
+  await mkdir(join(parent, "fixture"), { recursive: true });
   execFileSync("git", ["init", "-q", "--bare", remote]);
   execFileSync("git", ["init", "-q", source]);
   execFileSync("git", ["-C", source, "config", "user.email", "test@example.com"]);
@@ -70,14 +71,25 @@ function remoteRef(remote, ref) {
   }
 }
 
-function makeTransport(remote, { throwAfterPush = false, leaveUnchanged = false } = {}) {
+function makeTransport(
+  expectedEndpoint,
+  { throwAfterPush = false, leaveUnchanged = false, afterPush } = {},
+) {
   let pushCount = 0;
+  const endpoints = [];
   const transport = {
+    endpoints,
     get pushCount() {
       return pushCount;
     },
-    readRef: ({ ref }) => remoteRef(remote, ref),
-    push: ({ cwd, ref, expectedOldOid, newOid }) => {
+    readRef: ({ endpoint, ref }) => {
+      endpoints.push(endpoint);
+      assert.equal(endpoint, expectedEndpoint);
+      return remoteRef(endpoint, ref);
+    },
+    push: ({ cwd, endpoint, ref, expectedOldOid, newOid }) => {
+      endpoints.push(endpoint);
+      assert.equal(endpoint, expectedEndpoint);
       pushCount += 1;
       if (leaveUnchanged) {
         const error = new Error("simulated transport ambiguity");
@@ -91,12 +103,13 @@ function makeTransport(remote, { throwAfterPush = false, leaveUnchanged = false 
           cwd,
           "push",
           "--porcelain",
-          remote,
+          endpoint,
           `${newOid}:${ref}`,
           `--force-with-lease=${ref}:${expectedOldOid ?? ""}`,
         ],
         { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
       );
+      afterPush?.({ cwd, endpoint, ref, expectedOldOid, newOid });
       if (throwAfterPush) {
         const error = new Error("simulated post-transmit transport ambiguity");
         error.code = "transport";
@@ -180,6 +193,8 @@ function authorityWithBudget(maxPublications) {
 
 test("first publication creates only the dedicated ref with the exact candidate SHA", async () => {
   const value = await fixture();
+  const transport = makeTransport(value.remote);
+  value.runtime.remoteTransport = transport;
   try {
     const sourceHead = git(value.source, ["rev-parse", "HEAD"]);
     const candidate = await commitCandidate(
@@ -209,6 +224,13 @@ test("first publication creates only the dedicated ref with the exact candidate 
     assert.equal(git(value.source, ["rev-parse", "HEAD"]), sourceHead);
     assert.equal(git(value.source, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
     assert.equal(published.task.remoteEffects.length, 1);
+    assert.ok(transport.endpoints.length >= 3);
+    assert.ok(transport.endpoints.every((endpoint) => endpoint === value.remote));
+    assert.equal(published.task.authority.remotePublication.repositoryId, "fixture/repository");
+    assert.match(published.task.authority.remotePublication.remoteUrlDigest, /^[0-9a-f]{64}$/);
+    assert.equal(JSON.stringify(published.task.authority).includes(value.remote), false);
+    assert.equal(published.remoteEffect.repository, "fixture/repository");
+    assert.equal(published.remoteEffect.endpoint, undefined);
   } finally {
     await closeFixture(value);
   }
@@ -216,6 +238,8 @@ test("first publication creates only the dedicated ref with the exact candidate 
 
 test("second publication is a fast-forward from the confirmed SHA", async () => {
   const value = await fixture();
+  const transport = makeTransport(value.remote);
+  value.runtime.remoteTransport = transport;
   try {
     const first = await commitCandidate(value.task.taskWorktree, "one.txt", "one\n", "one");
     await value.runtime.publishTask({ id: value.task.id, candidateSha: first });
@@ -230,6 +254,7 @@ test("second publication is a fast-forward from the confirmed SHA", async () => 
       published.task.remoteEffects.map((effect) => effect.state),
       ["confirmed", "confirmed"],
     );
+    assert.ok(transport.endpoints.every((endpoint) => endpoint === value.remote));
   } finally {
     await closeFixture(value);
   }
@@ -277,9 +302,17 @@ test("out-of-band remote drift is a conflict and is never overwritten", async ()
   }
 });
 
-test("post-transmit ambiguity is confirmed by exact readback without a second push", async () => {
+test("post-transmit ambiguity keeps the authorized exact endpoint for readback", async () => {
   const value = await fixture();
-  const transport = makeTransport(value.remote, { throwAfterPush: true });
+  const unauthorized = join(value.parent, "unauthorized", "fixture", "repository.git");
+  await mkdir(join(value.parent, "unauthorized", "fixture"), { recursive: true });
+  execFileSync("git", ["init", "-q", "--bare", unauthorized]);
+  const transport = makeTransport(value.remote, {
+    throwAfterPush: true,
+    afterPush: ({ cwd }) => {
+      execFileSync("git", ["-C", cwd, "remote", "set-url", "origin", unauthorized]);
+    },
+  });
   value.runtime.remoteTransport = transport;
   try {
     const candidate = await commitCandidate(value.task.taskWorktree, "one.txt", "one\n", "one");
@@ -288,6 +321,9 @@ test("post-transmit ambiguity is confirmed by exact readback without a second pu
     assert.equal(published.remoteEffect.state, "confirmed");
     assert.equal(transport.pushCount, 1);
     assert.equal(published.task.remoteEffects[0].attemptCount, 1);
+    assert.equal(remoteRef(value.remote, taskRef(value.task)), candidate);
+    assert.equal(remoteRef(unauthorized, taskRef(value.task)), null);
+    assert.ok(transport.endpoints.every((endpoint) => endpoint === value.remote));
   } finally {
     await closeFixture(value);
   }
@@ -298,8 +334,12 @@ test("unchanged ambiguous publication retries the same prepared effect within it
   let pushCount = 0;
   let firstPush = true;
   value.runtime.remoteTransport = {
-    readRef: ({ ref }) => remoteRef(value.remote, ref),
-    push: ({ cwd, ref, expectedOldOid, newOid }) => {
+    readRef: ({ endpoint, ref }) => {
+      assert.equal(endpoint, value.remote);
+      return remoteRef(endpoint, ref);
+    },
+    push: ({ cwd, endpoint, ref, expectedOldOid, newOid }) => {
+      assert.equal(endpoint, value.remote);
       pushCount += 1;
       if (firstPush) {
         firstPush = false;
@@ -314,7 +354,7 @@ test("unchanged ambiguous publication retries the same prepared effect within it
           cwd,
           "push",
           "--porcelain",
-          value.remote,
+          endpoint,
           `${newOid}:${ref}`,
           `--force-with-lease=${ref}:${expectedOldOid ?? ""}`,
         ],
@@ -344,7 +384,10 @@ test("changed control_version immediately before transmission prevents the push"
   const value = await fixture();
   let pushes = 0;
   value.runtime.remoteTransport = {
-    readRef: ({ ref }) => remoteRef(value.remote, ref),
+    readRef: ({ endpoint, ref }) => {
+      assert.equal(endpoint, value.remote);
+      return remoteRef(endpoint, ref);
+    },
     push: () => {
       pushes += 1;
     },
@@ -366,13 +409,11 @@ test("changed control_version immediately before transmission prevents the push"
   }
 });
 
-test("string authority canonicalization does not persist top-level secrets or unknown fields", async () => {
-  const secret = "do-not-persist-top-level";
+test("string authority canonicalization persists only supported fields", async () => {
   const value = await fixture({
     taskAuthority: JSON.stringify({
       ...authority,
-      token: secret,
-      metadata: { password: secret },
+      metadata: { label: "ignored" },
     }),
   });
   try {
@@ -382,9 +423,8 @@ test("string authority canonicalization does not persist top-level secrets or un
       .get(value.task.id).authority;
 
     assert.deepEqual(Object.keys(task.authority), ["remotePublication"]);
-    assert.equal(task.authority.token, undefined);
     assert.equal(task.authority.metadata, undefined);
-    assert.equal(storedAuthority.includes(secret), false);
+    assert.equal(storedAuthority.includes("ignored"), false);
   } finally {
     await closeFixture(value);
   }
@@ -443,8 +483,12 @@ test("maxPublications is shared by distinct candidates and ambiguous retries", a
   let pushCount = 0;
   let ambiguous = true;
   value.runtime.remoteTransport = {
-    readRef: ({ ref }) => remoteRef(value.remote, ref),
-    push: ({ cwd, ref, expectedOldOid, newOid }) => {
+    readRef: ({ endpoint, ref }) => {
+      assert.equal(endpoint, value.remote);
+      return remoteRef(endpoint, ref);
+    },
+    push: ({ cwd, endpoint, ref, expectedOldOid, newOid }) => {
+      assert.equal(endpoint, value.remote);
       pushCount += 1;
       if (ambiguous) {
         ambiguous = false;
@@ -459,7 +503,7 @@ test("maxPublications is shared by distinct candidates and ambiguous retries", a
           cwd,
           "push",
           "--porcelain",
-          value.remote,
+          endpoint,
           `${newOid}:${ref}`,
           `--force-with-lease=${ref}:${expectedOldOid ?? ""}`,
         ],
@@ -596,6 +640,149 @@ test("publication_count migration sums historic attempts and preserves nonzero c
     assert.equal(value.runtime.getTask(value.task.id).publicationCount, 1);
   } finally {
     await closeFixture(value);
+  }
+});
+
+test("retargeting origin before transmission changes neither bare remote nor publication budget", async () => {
+  const value = await fixture();
+  const unauthorized = join(value.parent, "unauthorized", "fixture", "repository.git");
+  await mkdir(join(value.parent, "unauthorized", "fixture"), { recursive: true });
+  execFileSync("git", ["init", "-q", "--bare", unauthorized]);
+  execFileSync(
+    "git",
+    ["-C", value.source, "push", unauthorized, `${value.base}:${taskRef(value.task)}`],
+    { stdio: "ignore" },
+  );
+  const transport = makeTransport(value.remote);
+  value.runtime.remoteTransport = transport;
+  value.runtime.beforeRemotePush = () => {
+    execFileSync("git", ["-C", value.source, "remote", "set-url", "origin", unauthorized]);
+  };
+  try {
+    const candidate = await commitCandidate(value.task.taskWorktree, "one.txt", "one\n", "one");
+
+    await assert.rejects(
+      () => value.runtime.publishTask({ id: value.task.id, candidateSha: candidate }),
+      (error) => error.code === "stale_remote_publication",
+    );
+
+    const task = value.runtime.getTask(value.task.id);
+    assert.equal(transport.pushCount, 0);
+    assert.equal(remoteRef(value.remote, taskRef(value.task)), null);
+    assert.equal(remoteRef(unauthorized, taskRef(value.task)), value.base);
+    assert.equal(task.publicationCount, 0);
+    assert.equal(task.remoteEffects[0].attemptCount, 0);
+    assert.equal(task.remoteEffects[0].state, "failed");
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("invalid URL-shaped repository IDs fail before persistence", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-remote-identity-"));
+  try {
+    const { source } = await repository(parent);
+    const piCommand = await versionCommand(parent);
+    const invalidRepositoryIds = [
+      "https://github.com/fixture/repository",
+      "https://token@github.com/fixture/repository",
+      "fixture/repository?token=secret",
+      "fixture/repository#fragment",
+      " fixture/repository",
+      "fixture/repo\nsitory",
+      "fixture/../repository",
+    ];
+
+    for (const [index, repositoryId] of invalidRepositoryIds.entries()) {
+      const runtime = new RuntimeStore({
+        dbPath: join(parent, `${index}.sqlite`),
+        piCommand,
+      });
+      await assert.rejects(
+        () => runtime.createTask({
+          goal: "reject invalid repository identity",
+          cwd: source,
+          trusted: true,
+          model: { provider: "provider", id: "model" },
+          thinkingLevel: "high",
+          authority: {
+            remotePublication: {
+              ...authority.remotePublication,
+              repositoryId,
+            },
+          },
+        }),
+        /repository identity|credentials/,
+      );
+      assert.equal(runtime.db, null);
+      runtime.close();
+    }
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("credential-named authority fields anywhere fail before persistence", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-remote-credentials-"));
+  try {
+    const { source } = await repository(parent);
+    const piCommand = await versionCommand(parent);
+    const invalidAuthorities = [
+      { ...authority, token: "do-not-persist" },
+      { ...authority, metadata: { password: "do-not-persist" } },
+      JSON.stringify({
+        ...authority,
+        metadata: { endpoint: "https://token@github.com/fixture/repository" },
+      }),
+    ];
+
+    for (const [index, taskAuthority] of invalidAuthorities.entries()) {
+      const runtime = new RuntimeStore({
+        dbPath: join(parent, `${index}.sqlite`),
+        piCommand,
+      });
+      await assert.rejects(
+        () => runtime.createTask({
+          goal: "reject credentials",
+          cwd: source,
+          trusted: true,
+          model: { provider: "provider", id: "model" },
+          thinkingLevel: "high",
+          authority: taskAuthority,
+        }),
+        /credential|embedded credentials/,
+      );
+      assert.equal(runtime.db, null);
+      runtime.close();
+    }
+
+    execFileSync("git", [
+      "-C",
+      source,
+      "remote",
+      "set-url",
+      "origin",
+      "https://token@github.com/fixture/repository.git",
+    ]);
+    const runtime = new RuntimeStore({
+      dbPath: join(parent, "credential-endpoint.sqlite"),
+      piCommand,
+    });
+    await assert.rejects(
+      () => runtime.createTask({
+        goal: "reject credential endpoint",
+        cwd: source,
+        trusted: true,
+        model: { provider: "provider", id: "model" },
+        thinkingLevel: "high",
+        authority,
+      }),
+      /credential-free/,
+    );
+    assert.equal(runtime.db, null);
+    runtime.close();
+  } finally {
+    await rm(parent, { recursive: true, force: true });
   }
 });
 

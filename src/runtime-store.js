@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { acquireDatabaseLock } from "./database-lock.js";
 import {
   checkFreshExecutorCompatibility,
@@ -235,7 +236,7 @@ function assertNoRemoteCredentials(value, path = "authority") {
       throw new Error(`${path} contains a credential field.`);
     if (
       typeof entry === "string" &&
-      /:\/\/[^/\s:@]+:[^@\s]+@/.test(entry)
+      /[a-z][a-z0-9+.-]*:\/\/[^/\s]+@/i.test(entry)
     )
       throw new Error(`${path}.${key} contains embedded credentials.`);
     assertNoRemoteCredentials(entry, `${path}.${key}`);
@@ -243,16 +244,146 @@ function assertNoRemoteCredentials(value, path = "authority") {
 }
 
 function boundedRemoteRepositoryId(value) {
-  if (typeof value !== "string" || !value.trim()) return null;
-  const repository = value.trim();
+  if (typeof value !== "string" || !value) return null;
   if (
-    repository.includes("\0") ||
-    Buffer.byteLength(repository, "utf8") > MAX_REMOTE_REPOSITORY_ID_LENGTH
+    value !== value.trim() ||
+    /[\s\u0000-\u001f\u007f]/u.test(value) ||
+    Buffer.byteLength(value, "utf8") > MAX_REMOTE_REPOSITORY_ID_LENGTH
   )
-    throw new Error("Remote publication repository identity is bounded.");
-  if (/:[^/\s:@]+@/.test(repository))
-    throw new Error("Remote publication repository identity cannot contain credentials.");
-  return repository;
+    throw new Error("Remote publication repository identity is invalid or bounded.");
+  const parts = value.split("/");
+  if (
+    parts.length !== 2 ||
+    !/^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$/i.test(parts[0]) ||
+    !/^[a-z0-9][a-z0-9_.-]{0,99}$/i.test(parts[1]) ||
+    parts.some((part) => part === "." || part === "..") ||
+    parts[1].toLowerCase().endsWith(".git")
+  )
+    throw new Error(
+      "Remote publication repository identity must be canonical owner/name.",
+    );
+  return `${parts[0].toLowerCase()}/${parts[1].toLowerCase()}`;
+}
+
+function repositoryIdFromRemotePath(pathname) {
+  const parts = pathname.split("/").filter(Boolean);
+  if (parts.length < 2)
+    throw new Error("Remote publication endpoint has no repository identity.");
+  const repository = parts.at(-1).replace(/\.git$/i, "");
+  return boundedRemoteRepositoryId(`${parts.at(-2)}/${repository}`);
+}
+
+function credentialFreeRemoteEndpoint(cwd, value) {
+  if (
+    typeof value !== "string" ||
+    !value ||
+    value !== value.trim() ||
+    /[\s\u0000-\u001f\u007f]/u.test(value)
+  )
+    throw new Error("Remote publication endpoint is not credential-free.");
+
+  if (/^file:/i.test(value)) {
+    let url;
+    try {
+      url = new URL(value);
+    } catch (error) {
+      throw new Error("Remote publication endpoint is invalid.", { cause: error });
+    }
+    if (url.username || url.password || url.search || url.hash)
+      throw new Error("Remote publication endpoint is not credential-free.");
+    const endpoint = canonicalPath(fileURLToPath(url));
+    return {
+      endpoint,
+      repositoryId: repositoryIdFromRemotePath(endpoint),
+      remoteUrlDigest: digest(endpoint),
+    };
+  }
+
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
+    let url;
+    try {
+      url = new URL(value);
+    } catch (error) {
+      throw new Error("Remote publication endpoint is invalid.", { cause: error });
+    }
+    const supportedSshUser =
+      url.protocol === "ssh:" && url.username === "git" && !url.password;
+    if (
+      !["https:", "ssh:"].includes(url.protocol) ||
+      (url.username && !supportedSshUser) ||
+      url.password ||
+      url.search ||
+      url.hash ||
+      !url.hostname
+    )
+      throw new Error("Remote publication endpoint is not credential-free.");
+    return {
+      endpoint: value,
+      repositoryId: repositoryIdFromRemotePath(url.pathname),
+      remoteUrlDigest: digest(value),
+    };
+  }
+
+  const scpEndpoint = value.match(/^(?:(git)@)?([^/:@]+):(.+)$/);
+  if (scpEndpoint) {
+    if (value.includes("?") || value.includes("#"))
+      throw new Error("Remote publication endpoint is not credential-free.");
+    return {
+      endpoint: value,
+      repositoryId: repositoryIdFromRemotePath(scpEndpoint[3]),
+      remoteUrlDigest: digest(value),
+    };
+  }
+  if (value.includes("@") || value.includes("?") || value.includes("#"))
+    throw new Error("Remote publication endpoint is not credential-free.");
+  const endpoint = canonicalPath(resolve(cwd, value));
+  return {
+    endpoint,
+    repositoryId: repositoryIdFromRemotePath(endpoint),
+    remoteUrlDigest: digest(endpoint),
+  };
+}
+
+function resolveRemotePublicationEndpoint(cwd, authority) {
+  let configuredEndpoint;
+  try {
+    configuredEndpoint = git(cwd, [
+      "remote",
+      "get-url",
+      "--push",
+      authority.remote,
+    ]);
+  } catch (error) {
+    throw new Error("Remote publication remote identity could not be read.", {
+      cause: error,
+    });
+  }
+  const resolved = credentialFreeRemoteEndpoint(cwd, configuredEndpoint);
+  if (resolved.repositoryId !== authority.repositoryId)
+    throw new Error(
+      "Remote publication endpoint does not match the canonical repository identity.",
+    );
+  if (
+    authority.remoteUrlDigest &&
+    resolved.remoteUrlDigest !== authority.remoteUrlDigest
+  )
+    throw new Error("Remote publication remote identity does not match authority.");
+  return resolved;
+}
+
+function bindRemotePublicationAuthority(authority, cwd) {
+  if (!authority.remotePublication) return authority;
+  const resolved = resolveRemotePublicationEndpoint(
+    cwd,
+    authority.remotePublication,
+  );
+  return {
+    ...authority,
+    remotePublication: {
+      ...authority.remotePublication,
+      remoteUrlDigest: resolved.remoteUrlDigest,
+    },
+  };
 }
 
 function remotePublicationAuthority(authority) {
@@ -331,6 +462,7 @@ function normalizeAuthority(authority) {
     Array.isArray(parsedAuthority)
   )
     throw new Error("Task authority must be a JSON object.");
+  assertNoRemoteCredentials(parsedAuthority);
 
   const normalized = {};
   if (Object.hasOwn(parsedAuthority, "owner")) {
@@ -345,12 +477,12 @@ function normalizeAuthority(authority) {
   return normalized;
 }
 
-function readExactRemoteRef({ cwd, remote, ref }) {
+function readExactRemoteRef({ cwd, endpoint, ref }) {
   let output;
   try {
     output = execFileSync(
       "git",
-      ["ls-remote", "--exit-code", "--refs", remote, ref],
+      ["ls-remote", "--exit-code", "--refs", endpoint, ref],
       { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
     );
   } catch (error) {
@@ -368,13 +500,13 @@ function readExactRemoteRef({ cwd, remote, ref }) {
   return rows[0][0].toLowerCase();
 }
 
-function pushExactRemoteRef({ cwd, remote, ref, expectedOldOid, newOid }) {
+function pushExactRemoteRef({ cwd, endpoint, ref, expectedOldOid, newOid }) {
   execFileSync(
     "git",
     [
       "push",
       "--porcelain",
-      remote,
+      endpoint,
       `${newOid}:${ref}`,
       `--force-with-lease=${ref}:${expectedOldOid ?? ""}`,
     ],
@@ -1642,18 +1774,12 @@ export class RuntimeStore {
       );
     }
     const task = taskSnapshot(taskRow);
-    if (authority.remoteUrlDigest) {
-      let remoteUrl;
-      try {
-        remoteUrl = git(task.sourceRepoRoot, ["remote", "get-url", authority.remote]);
-      } catch (error) {
-        throw new Error("Remote publication remote identity could not be read.", {
-          cause: error,
-        });
-      }
-      if (digest(remoteUrl) !== authority.remoteUrlDigest)
-        throw new Error("Remote publication remote identity does not match authority.");
-    }
+    if (!authority.remoteUrlDigest)
+      throw new Error("Remote publication authority has no bound remote identity.");
+    const authorizedRemote = resolveRemotePublicationEndpoint(
+      task.sourceRepoRoot,
+      authority,
+    );
     const newOid = this.#assertRemoteCandidate(task, candidateSha);
     const ref = `${REMOTE_REF_PREFIX}${taskId}`;
     const transport = this.remoteTransport;
@@ -1661,7 +1787,7 @@ export class RuntimeStore {
       normalizedRemoteOid(
         await transport.readRef({
           cwd: task.taskWorktree,
-          remote: authority.remote,
+          endpoint: authorizedRemote.endpoint,
           repository: authority.repositoryId,
           ref,
         }),
@@ -1834,6 +1960,18 @@ export class RuntimeStore {
         effect: remoteEffectSnapshot(effect),
       });
 
+    let currentRemote = null;
+    try {
+      currentRemote = resolveRemotePublicationEndpoint(
+        task.sourceRepoRoot,
+        authority,
+      );
+    } catch {}
+    const remoteStillAuthorized =
+      currentRemote?.endpoint === authorizedRemote.endpoint &&
+      currentRemote?.remoteUrlDigest === authorizedRemote.remoteUrlDigest &&
+      currentRemote?.repositoryId === authorizedRemote.repositoryId;
+
     let reservationFailure = null;
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -1844,6 +1982,7 @@ export class RuntimeStore {
         currentAuthority = remotePublicationAuthority(taskRow?.authority);
       } catch {}
       const staleReservation =
+        !remoteStillAuthorized ||
         !taskRow ||
         !REMOTE_PUBLICATION_TASK_STATES.has(taskRow.state) ||
         !currentAuthority ||
@@ -1929,7 +2068,7 @@ export class RuntimeStore {
     try {
       await transport.push({
         cwd: task.taskWorktree,
-        remote: authority.remote,
+        endpoint: authorizedRemote.endpoint,
         repository: authority.repositoryId,
         ref,
         expectedOldOid,
@@ -2216,9 +2355,13 @@ export class RuntimeStore {
     const requestedCompletionContract =
       completionContract ?? defaultCompletionContract(goal.trim());
     localGatesFromContract(requestedCompletionContract);
-    const requestedAuthority = normalizeAuthority(authority);
+    const normalizedAuthority = normalizeAuthority(authority);
 
     const preflight = preflightGitWorkspace(cwd);
+    const requestedAuthority = bindRemotePublicationAuthority(
+      normalizedAuthority,
+      preflight.sourceRepoRoot,
+    );
     const compatibility = checkFreshExecutorCompatibility({
       command: this.piCommand,
       cwd: preflight.sourceRepoRoot,
