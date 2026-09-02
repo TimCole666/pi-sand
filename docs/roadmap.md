@@ -1,198 +1,129 @@
 # Roadmap: reuse-first path to v1
 
 - **Status:** Future-facing planning document
-- **Written against:** `main` at `1caed4014b3552d0d12791489122daef7dfaceff` while v0.4 is in progress
 - **Current release authority:** Issue #48 is the v0.4 architecture/spec authority; current source/tests and PR #62 are authoritative for current implementation facts
+- **Proposed next release:** PR #73 / `docs/specs/v0.5-one-chat-responsibility.md`
 
-This roadmap describes desired product capabilities and the pi-sand-specific semantic surface. Infrastructure candidates are intentionally non-authoritative and must be revalidated when each version is specified.
+The product target is no longer a plan to build another full Agent runtime or a simpler clone of Grok Bot.
 
-The product target is:
+It is:
 
-> **One Chat Box Autonomous Agent Runtime**
+> **One chat box that accepts responsibility while reusing existing Agent/Computer/host mechanics.**
 
-Normal user-facing primitives should trend toward:
-
-```text
-Message
-Question
-Approval
-Result
-Artifact
-```
-
-The primary product metric is how often the user must re-enter the loop before the requested outcome is actually complete.
+The primary product metric remains how often the user must re-enter the loop before the requested outcome is actually complete.
 
 ## v0.4 — Leave-and-return Coding Commitment
 
-Finish the current architecture without using this roadmap to reopen it.
+Treat v0.4 as correctness/implementation evidence, not automatic architectural inheritance.
 
-The release should preserve the v0.3 lifetime/process/Git/IPC invariants while establishing the v0.4 responsibility kernel required by Issue #48: Commitment, Completion Contract, exact candidate verification, Evidence, external wait/wake, bounded continuation/repair, and durable Result delivery.
+Issue #48 and PR #62 explored a broad failure-semantics design: Commitment, Completion Contract, Evidence, Wait/RemoteEffect/ResultDelivery, repair and recovery. Those semantics remain useful evidence, but later versions must re-justify each concept rather than preserve it by sunk cost.
 
-No post-v0.4 dependency or framework migration is a release requirement.
+## v0.5 — One-Chat Responsibility Boundary
 
-## Post-v0.4 bridge — isolate mechanics without relocating semantics
+**Product capability:** through one Telegram private chat, a user can hand over one coding outcome, correct it while work is live, leave and return, and trust that stale execution cannot newly publish to GitHub or authoritatively say the old request is complete.
 
-Before large new capabilities, prefer small refactors that make reuse safe while preserving the authoritative database and correctness transactions.
-
-Candidate work:
-
-- isolate GitHub transport behind a narrow observation adapter, after a small `gh api` vs Octokit spike;
-- split the growing runtime store by semantic/integration boundary without changing critical transaction ownership;
-- add explicit database doctor/integrity/migration discipline;
-- evolve durable Result delivery toward typed communication records as real use cases appear;
-- introduce execution/environment interfaces only when a second implementation is imminent.
-
-These are sequencing candidates, not v0.4 requirements.
-
-## v0.5 — Environment + Browser + Download + Artifact
-
-**Product capability:** pi-sand can perform supported browser work, preserve the relevant workspace/profile state, collect downloads/evidence, and return durable Artifacts without making browser-process lifetime equal responsibility lifetime.
-
-pi-sand should own only:
-
-- durable Environment identity/lifecycle/reconciliation needed by the supported journey;
-- browser/profile ownership semantics;
-- Artifact identity, hash, provenance, media type, retention, and delivery semantics;
-- Evidence binding to exact browser/environment work;
-- human takeover/credential gates required by supported flows;
-- a minimal deterministic execution-strategy choice once more than one strategy exists.
-
-Current infrastructure candidates include Playwright for browser mechanics and host/container/VM backends for Environment mechanics. The v0.5 spec must choose the smallest operationally credible combination; this roadmap does not lock Docker, Gondolin, or any other backend as mandatory.
-
-Do not build a custom browser driver, browser platform, container runtime, generic plugin system, or large execution router.
-
-## v0.6 — Automatic Admission + Context Reconstruction + Human Gates
-
-**Product capability:** a normal user can hand over an eligible goal without manually constructing runtime objects, and pi-sand can reconstruct the durable responsibility context after waits/restarts without replaying a Manager transcript.
-
-Prefer Pi ResourceLoader, AGENTS/context discovery, Skills, prompts, Session behavior, and compaction for ordinary live context mechanics.
-
-pi-sand should own only:
-
-- automatic Commitment admission policy;
-- Completion Contract synthesis/validation policy;
-- a bounded Context Receipt describing selected durable facts/resources;
-- wake-reason identity;
-- typed human-gate semantics;
-- typed communication envelopes;
-- secret/redaction policy.
-
-Do not build a second Skills loader, context graph, transcript store, compactor, or prompt registry.
-
-## v0.7 — Dynamic Work Ledger + External Wake/Routine
-
-**Product capability:** one accepted responsibility can evolve into bounded dependent work and resume from deterministic external/timed conditions without exposing a workflow system to the user.
-
-pi-sand should own:
-
-- remaining responsibility and durable work identity;
-- dependency/readiness semantics;
-- parent/child responsibility relation;
-- responsible AttemptRun/worker association;
-- budgets and bounded retries;
-- exact external wait identity;
-- due/wake claims and catch-up semantics;
-- effect of child work on the parent Completion Contract.
-
-Reuse SQLite transaction/index mechanics, Pi fresh workers, and proven scheduler claim/catch-up designs. If human recurrence expressions are needed, use a focused parser rather than building cron grammar.
-
-The v0.7 release spec must choose the smallest product journey that proves bounded dependent work plus one deterministic timed or external wake path. Recurrence grammar is optional unless that journey requires it.
-
-Do not introduce a generic workflow engine, distributed queue, or scheduler service.
-
-## v0.8 — Experience + Knowledge + Search
-
-**Product capability:** verified outcomes can inform later work through inspectable, provenance-bearing knowledge rather than opaque transcript replay.
-
-pi-sand should own:
-
-- Experience event semantics;
-- Knowledge claim/provenance/confidence/supersession;
-- scope and retention policy;
-- retrieval policy and evaluation;
-- feedback from verified outcomes.
-
-Prefer authoritative rows/documents plus rebuildable derived indexes. Current candidates are SQLite FTS5/trigram first, with vector indexing only if measured retrieval failures justify it.
-
-Do not build an "AI memory platform" or make a derived vector index the sole source of truth.
-
-## v0.9 — Gated Skill Promotion
-
-**Product capability:** repeated verified experience can become a reusable procedure without silently granting the model authority to mutate its active operating rules.
-
-Pi remains the canonical Skill representation/discovery/loading layer.
-
-pi-sand should own the promotion pipeline:
+The v0.5 correctness stack is intentionally specific:
 
 ```text
-verified outcome / Experience
--> candidate Skill change
--> versioned evaluation / evidence
--> risk/policy gate
--> versioned promotion
--> rollback / disable
+Telegram 1:1
+-> OpenClaw protected host contract
+-> official Codex app-server under a pinned descendant-containing execution profile
+-> one protected GitHub publication path
+-> Telegram authoritative final delivery
 ```
 
-Do not create a parallel Skills runtime or allow unconstrained self-modification of active Skills.
+OpenClaw is a correctness/enforcement testbed, not the permanent product host. Codex is an executor, not the product identity.
 
-## v0.10 — Bounded Multi-worker + Retained Computer + Optional Channels
+pi-sand should own only the irreducible responsibility semantics proven necessary by the release:
 
-**Product capability:** pi-sand can fan a responsibility out to a small number of explicit worker roles, retain useful Environment/Computer state where justified, mediate collaboration, and optionally communicate through one additional surface without exposing worker topology as the product.
+```text
+Obligation
+current_revision
+InputDecision
+```
 
-Reuse fresh Pi subprocess/subagent mechanics for worker execution.
+The host should own durable ingress generation, current canonical turn identity, writer containment/quiescence, GitHub capability/reconciliation, and final delivery.
 
-pi-sand should own:
+A responsibility-changing correction uses a fresh canonical Codex turn because same-turn steer does not currently provide sufficient descendant provenance for protected authority.
 
-- durable child responsibility;
-- budgets and capability constraints;
-- allowed inter-worker communication;
-- worktree/Environment leases;
-- merge/join/conflict policy;
-- shared Evidence and Supervisor completion authority;
-- retained Environment/Computer ownership and manual-takeover semantics;
-- durable channel delivery policy/receipts if a channel ships.
+The protected workspace writer surface is closed-world. Codex-native shell/file execution is allowed only under a pinned process-containment profile whose teardown proves that no descendant workspace writer survives old-turn retirement. Uncontained profiles fail closed. Unknown workspace-mutating dynamic tools are incompatible with protected mode.
 
-Start with a few explicit roles such as researcher, implementer, and verifier/reviewer. "Emergence" is not a release criterion.
+GitHub publication is the only protected consequential-effect family in v0.5. Local publication-side Git mutations, remote push, and PR creation must be current-authority fenced at their actual mutation boundary or isolated from the current authoritative workspace. Pending recovery state capable of later mutation counts as a live writer capability.
 
-A remote/channel path is optional, not a v0.10 release criterion. If demonstrated demand justifies one, add at most one path and do not import a broad channel/Gateway runtime by default.
+Completion stays thin: reuse existing facilities to observe explicit required facts (for example CI pass), and gate only whether the current completion candidate may authoritatively represent the current responsibility. Actual Telegram final dispatch is host-gated under current authority.
 
-## v1 — One Chat Box outcome UX and hardening
+Do not add/revive:
 
-Focus on the product promise rather than another infrastructure layer:
+```text
+scheduler / DAG / worker pool
+multi-Goal queue
+generic multi-agent runtime
+generic Effect/Evidence/Result frameworks
+Supervisor daemon
+generic filesystem/process-containment runtime
+second transcript/context system
+GitHub transport/credential stack
+host portability framework
+```
 
-- high-quality default admission;
-- reliable leave-and-return execution;
-- quiet/progress communication policy;
-- precise Questions/Approvals/HumanGates;
-- Artifact and verified Result delivery;
-- crash/restart recovery and acknowledgement;
-- packaging and doctor tooling;
-- observability that never becomes business authority;
-- measured reduction in user re-entry.
+## After v0.5 — evidence-driven, not capability-ladder driven
 
-## Roadmap consolidation
+Do not precommit pi-sand to building Browser, Computer, Memory, Skills, multi-agent orchestration, scheduler, knowledge platform, or channel SDK releases merely because those capabilities might be useful in an Agent product.
 
-The previous future roadmap treated Persistent Environment/Native Computer and ExecutionStrategyRouter as standalone late releases.
+Those capabilities already exist in hosts such as OpenClaw, Hermes, Grok Bot and other Agent/Computer systems. Prefer using them.
 
-This roadmap folds those concepts into the versions where they first become necessary:
+For every future proposal, ask in this order:
 
-- Environment/Computer semantics begin with v0.5 browser work and mature incrementally.
-- Execution strategy selection is a small deterministic policy introduced when the second strategy exists; it is not a standalone subsystem/release.
-- Scheduling is part of the narrow v0.7 wake model, not a general scheduler.
-- v0.8 is semantics plus search/index reuse, not a memory platform.
-- v0.9 is promotion authority over Pi Skills, not a Skills runtime.
+1. What user responsibility invariant is missing from existing hosts/executors?
+2. Can the host/runtime own the required mechanic instead?
+3. Can pi-sand own only the semantic decision and delete everything else?
+4. What evidence would prove pi-sand itself is no longer necessary?
 
-## Persistent non-goals through v1
+A future host may be OpenClaw, Hermes, Grok Bot, or something else. Host selection is an independent axis from the responsibility semantics and executor choice. Do not design a Universal Host Interface before a second concrete host proves a real shared seam.
 
-Unless a concrete release requirement proves otherwise, do not build:
+## Long-term product shape
 
-- a second Agent Engine or provider/model stack beside Pi;
-- a custom browser driver;
-- a container/VM/isolation runtime;
-- a generic workflow engine or distributed queue;
-- a generic cron scheduler;
+The desired experience remains extremely small:
+
+```text
+User: 帮我把这个修好，CI 过了告诉我。
+System: 好。
+
+User: 不要改 schema。
+System: 收到。
+
+... user leaves ...
+
+System: 已完成。
+```
+
+The user should not have to understand:
+
+```text
+Agent identity
+dataflow/workflow
+runtime
+worker topology
+computer placement
+model routing
+scheduler
+```
+
+If a future host natively provides durable responsibility admission, correction/current-authority semantics, stale capability fencing and truthful completion behind this one-chat UX, pi-sand should shrink further or disappear.
+
+## Persistent non-goals
+
+Unless concrete release evidence proves otherwise, do not build:
+
+- another general Agent Engine;
+- a custom browser/computer platform;
+- a container/VM/process-containment runtime;
+- a generic workflow engine or scheduler;
+- a broad provider/router abstraction;
 - a broad plugin/channel SDK;
 - a custom Skills loader;
 - a vector-first memory platform;
 - open-ended multi-agent societies;
-- a desktop shell before the autonomous runtime itself is reliable.
+- a rich internal tracker/workboard;
+- generic Effect/Evidence/Result/Reviewer frameworks;
+- a desktop shell merely to own the product surface.
