@@ -1,0 +1,5 @@
+Probe Timestamp: 2026-09-02T17:47:21.368Z
+OpenClaw Commit: ff63da7237e5f99e9fc03a86daf56e3c3e8f5356
+Codex Commit: a0dcfe2ada3f5bbd5059a34c0fc6fac244741a67
+Node Version: v26.8.1
+OS / Kernel: Linux 7.1.11-arch1-1 x64

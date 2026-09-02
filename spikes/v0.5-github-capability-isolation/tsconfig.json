@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "baseUrl": "/home/tiancaijb/tmp/pi-sand-openclaw",
+    "lib": ["DOM", "ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "noEmit": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "target": "ES2023",
+    "types": ["node"],
+    "paths": {
+      "openclaw/plugin-sdk/*": ["src/plugin-sdk/*.ts"]
+    }
+  },
+  "include": ["./*.mts"]
+}

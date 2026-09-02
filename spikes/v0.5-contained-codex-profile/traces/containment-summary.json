@@ -1,0 +1,40 @@
+{
+  "negativeControl": {
+    "scenario": "negative-control",
+    "sandboxMode": "danger-full-access",
+    "effectiveSandbox": {
+      "type": "dangerFullAccess"
+    },
+    "bgBeforeCount": 1,
+    "bgAfterCount": 0,
+    "results": {
+      "child": false,
+      "grandchild": false,
+      "background": false,
+      "new_pgroup": true,
+      "setsid": true,
+      "double_fork": true
+    }
+  },
+  "containedProfile": {
+    "scenario": "contained-profile",
+    "sandboxMode": "workspace-write",
+    "effectiveSandbox": {
+      "type": "workspaceWrite",
+      "writableRoots": [],
+      "networkAccess": false,
+      "excludeTmpdirEnvVar": false,
+      "excludeSlashTmp": false
+    },
+    "bgBeforeCount": 1,
+    "bgAfterCount": 0,
+    "results": {
+      "child": false,
+      "grandchild": false,
+      "background": false,
+      "new_pgroup": false,
+      "setsid": false,
+      "double_fork": false
+    }
+  }
+}

@@ -1,0 +1,72 @@
+{
+  "verdict": "FALSIFIED",
+  "justification": "OpenClaw native mechanisms (channel_ingress_events SQLite queue, sessionWriterDeliveryAuthority, and WorkerSessionTurnClaim) are completely decoupled. Committing durable ingress I2 does not invalidate T1 session writer authority or placement turn claim. In the PAUSE window between I2 commit and T2 admission, stale T1 retains full authority to dispatch to Telegram and mutate GitHub. Crash/restart fails wide open. Therefore, OpenClaw native mechanisms CANNOT be reused as-is for Issue #66.",
+  "metrics": {
+    "metric_1_commits": {
+      "openclaw": "ff63da7237e5f99e9fc03a86daf56e3c3e8f5356",
+      "codex": "a0dcfe2ada3f5bbd5059a34c0fc6fac244741a67"
+    },
+    "metric_2_pause_injection_point": {
+      "file": "src/channels/message/ingress-queue.ts",
+      "function": "createChannelIngressQueue.enqueue",
+      "boundary": "Immediately after runOpenClawStateWriteTransaction commits the INSERT into channel_ingress_events to SQLite, before monitor.claimNext or responsibility admission / T2 establishment."
+    },
+    "metric_3_facts_read_by_authority_checks": {
+      "telegram_final_dispatch_check": {
+        "caller": "assertSessionWriterDeliveryAuthorized / isAuthorityCurrent",
+        "source": "sessions.json (or openclaw-agent SQLite session store)",
+        "facts": [
+          "current.sessionId === authority.expectedSessionId",
+          "current.lifecycleRevision === authority.expectedLifecycleRevision",
+          "current.activeWriterRunId === authority.expectedWriterRunId"
+        ],
+        "inspects_ingress_queue": false,
+        "reads_sqlite_channel_ingress_events": false
+      },
+      "github_publication_authority_check": {
+        "caller": "validateTurnClaim / isCurrentPlacementTurnClaim",
+        "source": "openclaw.sqlite -> worker_session_placements table",
+        "facts": [
+          "turn_claim_id === claim.claimId",
+          "turn_claim_run_id === claim.runId",
+          "turn_claim_generation === claim.placementGeneration",
+          "turn_claim_owner === claim.owner.kind",
+          "state === 'active' || state === 'draining'",
+          "environment_id === claim.owner.environmentId",
+          "active_owner_epoch === claim.owner.ownerEpoch"
+        ],
+        "inspects_ingress_queue": false,
+        "reads_sqlite_channel_ingress_events": false
+      }
+    },
+    "metric_4_ingress_row_queryable": {
+      "queryable": true,
+      "query": "SELECT * FROM channel_ingress_events WHERE status = 'pending'",
+      "persisted_row": {
+        "queue_name": "[\"telegram\",\"default\"]",
+        "event_id": "0000000000002001",
+        "status": "pending"
+      }
+    },
+    "metric_5_ingress_row_consumption_timing": {
+      "enqueued_status": "pending",
+      "claim_time": "createChannelIngressMonitor poll loop (queue.claimNext) sets status to 'claimed'",
+      "dispatch_time": "Dispatched to bot / agent runner via runWithTelegramSpooledReplayUpdate",
+      "completion_time": "Only after turn execution finishes/settles, lifecycle.onAdopted() calls queue.complete(claim), updating status to 'completed' with completed_at timestamp."
+    },
+    "metric_6_crash_restart_stale_fence": {
+      "fenced": false,
+      "analysis": "Crash and restart preserves the pending ingress row in channel_ingress_events, but reloaded placement and session stores evaluate T1 authority purely against the persisted placement and sessions.json rows. Stale T1 retains full authority after restart; the system fails wide open.",
+      "post_restart_telegram_dispatch_allowed": true,
+      "post_restart_github_claim_valid": true
+    },
+    "metric_7_status_query_behavior": {
+      "closes_protected_window_in_openclaw_native": false,
+      "spec_requirement_v05": "v0.5 spec requires accepted_generation G -> G+1 upon durable acceptance of ANY input, establishing input_pending := accepted_generation != admitted_generation, which immediately closes the protected action window until classification completes.",
+      "openclaw_native_reality": "OpenClaw native does not track accepted/admitted generation or gate any authority check on pending ingress. Status queries leave the protected window completely open, exactly like corrections.",
+      "status_query_telegram_allowed": true,
+      "status_query_github_claim_valid": true
+    }
+  },
+  "recommendation": "Implement a dedicated, minimal Session Authority Seam in OpenClaw/pi-sand (Issue #66): (1) Enqueue in channel_ingress_events must atomically increment accepted_generation in a unified SQLite transaction; (2) assertSessionWriterDeliveryAuthorized and validateTurnClaim must verify accepted_generation == admitted_generation (input_pending == false); (3) Crash/restart must observe accepted_generation > admitted_generation and refuse all protected dispatches and mutations until fresh admission occurs."
+}
