@@ -1,204 +1,129 @@
-# Roadmap: one chat, borrowed machinery
+# Roadmap: reuse-first path to v1
 
 - **Status:** Future-facing planning document
-- **Architecture:** ADR-0001 reuse-first + ADR-0002 one-chat responsibility boundary
-- **Current implementation evidence:** Issue #48 / PR #62 remain v0.4 facts until superseded by implemented evidence
-- **v0.5 spec:** `docs/specs/v0.5-one-chat-responsibility.md`
+- **Current release authority:** Issue #48 is the v0.4 architecture/spec authority; current source/tests and PR #62 are authoritative for current implementation facts
+- **Proposed next release:** PR #73 / `docs/specs/v0.5-one-chat-responsibility.md`
 
-## Product target
+The product target is no longer a plan to build another full Agent runtime or a simpler clone of Grok Bot.
 
-> **The user gives responsibility, not workflow.**
+It is:
 
-> **One Chat Box != One Agent != One Runtime. It is one responsibility interface.**
+> **One chat box that accepts responsibility while reusing existing Agent/Computer/host mechanics.**
 
-The product should feel simpler than a general agent platform:
+The primary product metric remains how often the user must re-enter the loop before the requested outcome is actually complete.
 
-```text
-User: 帮我把 #123 修好，CI 过了以后告诉我。
+## v0.4 — Leave-and-return Coding Commitment
 
-User later: 不要改数据库 schema。
+Treat v0.4 as correctness/implementation evidence, not automatic architectural inheritance.
 
-System eventually: ✓ 已完成
-```
-
-The user should not need to choose or understand agents, computers, models, runtimes, work graphs, handoffs, or orchestration topology.
-
-## Historical direction
-
-pi-sand began close to the idea of building a simpler Grok-Bot-like autonomous product.
-
-The project progressively learned that the surrounding machinery should usually be reused rather than rebuilt:
-
-```text
-agent loop
-computer / browser / terminal
-memory / skills
-channels
-background execution
-multi-agent delegation
-Git/GitHub mechanics
-```
-
-The roadmap therefore no longer treats those capabilities as things pi-sand should eventually implement by default.
-
-The governing question is now:
-
-> **What responsibility/authority semantic remains necessary after mature hosts and executors provide all ordinary mechanics?**
-
-If the answer becomes "none", delete pi-sand instead of preserving a runtime for project identity.
-
-## v0.4 — failure-semantics laboratory
-
-v0.4 explores leave-and-return coding responsibility with a comparatively rich kernel: Commitment, Completion Contract, Evidence, external wait/wake, RemoteEffect, ResultDelivery, repair, and recovery semantics.
-
-Issue #48 / PR #62 remain the authority for what v0.4 actually means and implements.
-
-v0.4 is valuable evidence, but its abstractions are **not automatically the v0.5 foundation**. Later source review and prototypes have shown that many mechanics can be delegated to an existing host/runtime.
+Issue #48 and PR #62 explored a broad failure-semantics design: Commitment, Completion Contract, Evidence, Wait/RemoteEffect/ResultDelivery, repair and recovery. Those semantics remain useful evidence, but later versions must re-justify each concept rather than preserve it by sunk cost.
 
 ## v0.5 — One-Chat Responsibility Boundary
 
-**Product capability:** one Telegram private 1:1 chat can hold one coding responsibility while official Codex works through OpenClaw, and a new durable user message can make stale execution physically unable to publish or authoritatively finish for the current request.
+**Product capability:** through one Telegram private chat, a user can hand over one coding outcome, correct it while work is live, leave and return, and trust that stale execution cannot newly publish to GitHub or authoritatively say the old request is complete.
 
-v0.5 assumes:
+The v0.5 correctness stack is intentionally specific:
 
 ```text
-one Telegram 1:1 conversation
-one active Goal / Obligation
-OpenClaw as correctness/enforcement testbed
-official Codex app-server as executor
-GitHub publication as the only protected consequential-effect family
-one pinned OpenClaw + Codex capability contract
+Telegram 1:1
+-> OpenClaw protected host contract
+-> official Codex app-server under a pinned descendant-containing execution profile
+-> one protected GitHub publication path
+-> Telegram authoritative final delivery
 ```
 
-pi-sand itself should own only:
+OpenClaw is a correctness/enforcement testbed, not the permanent product host. Codex is an executor, not the product identity.
+
+pi-sand should own only the irreducible responsibility semantics proven necessary by the release:
 
 ```text
 Obligation
-current revision
-idempotent InputDecision
-responsibility classification
+current_revision
+InputDecision
 ```
 
-OpenClaw should own the operational mechanics:
+The host should own durable ingress generation, current canonical turn identity, writer containment/quiescence, GitHub capability/reconciliation, and final delivery.
+
+A responsibility-changing correction uses a fresh canonical Codex turn because same-turn steer does not currently provide sufficient descendant provenance for protected authority.
+
+The protected workspace writer surface is closed-world. Codex-native shell/file execution is allowed only under a pinned process-containment profile whose teardown proves that no descendant workspace writer survives old-turn retirement. Uncontained profiles fail closed. Unknown workspace-mutating dynamic tools are incompatible with protected mode.
+
+GitHub publication is the only protected consequential-effect family in v0.5. Local publication-side Git mutations, remote push, and PR creation must be current-authority fenced at their actual mutation boundary or isolated from the current authoritative workspace. Pending recovery state capable of later mutation counts as a live writer capability.
+
+Completion stays thin: reuse existing facilities to observe explicit required facts (for example CI pass), and gate only whether the current completion candidate may authoritatively represent the current responsibility. Actual Telegram final dispatch is host-gated under current authority.
+
+Do not add/revive:
 
 ```text
-Telegram durable custody
-accepted/admitted authority generation
-required authority-owner dependency
-canonical Codex turn binding/lifecycle
-protected writer/quiescence contract
-GitHub credential + publication/reconciliation
-final Telegram dispatch
-```
-
-Codex should own coding execution, thread context, native tools, tests, and ordinary runtime mechanics.
-
-### v0.5 hard proofs
-
-The release must physically prove:
-
-1. durable Telegram acceptance fences protected publication/final before classification;
-2. a correction advances responsibility revision before execution control;
-3. same-turn steer is never treated as protected authority proof;
-4. a retired canonical turn remains stale forever;
-5. fresh-turn authority is granted only after the prior verified workspace-writer surface is quiescent/isolated;
-6. unknown direct workspace-mutating dynamic tools are incompatible with protected mode;
-7. Codex has no independent GitHub write credential/path;
-8. GitHub mutation and final delivery revalidate current authority at their actual irrevocable boundaries;
-9. restart never silently downgrades a protected session when the required authority owner/contract is missing.
-
-Prototype #65 returned bounded `REVISE`: keyed routing and Codex-owned background cleanup worked, while an arbitrary abort-ignoring dynamic-tool handler could still write the shared workspace late. v0.5 therefore uses a **closed verified writer surface**, not a new generic pi-sand mutation framework.
-
-## After v0.5 — evidence-driven, not a capability ladder
-
-There is intentionally no fixed `v0.6 -> v0.10` plan for Browser, Computer, Memory, Skills, scheduler, or multi-agent features.
-
-Those are primarily host/executor capabilities. Add pi-sand semantics only when a concrete product journey demonstrates a responsibility invariant that the chosen host cannot provide.
-
-Examples of future questions, not promised releases:
-
-```text
-Can Grok Bot/Hermes/OpenClaw natively replace more of the responsibility boundary?
-
-Does a second consequential-effect family reveal a semantic that GitHub-only v0.5 cannot express?
-
-Does more than one simultaneous Goal force real scheduling semantics, or should the product still refuse/avoid it?
-
-Does another product host make pi-sand state unnecessary altogether?
-```
-
-Each such question should start with falsification and reuse research, not a precommitted subsystem.
-
-## Capabilities that are host concerns by default
-
-Do not put these back onto the pi-sand roadmap without concrete evidence:
-
-```text
-cloud computer
-browser automation
-image/video generation
-memory platform
-Skills runtime
-cron/routines
-multi-agent delegation
-worker pool
-scheduler / DAG
-provider/model router
-channel SDK
-GitHub transport
-credential broker
-container/VM runtime
+scheduler / DAG / worker pool
+multi-Goal queue
+generic multi-agent runtime
+generic Effect/Evidence/Result frameworks
+Supervisor daemon
+generic filesystem/process-containment runtime
 second transcript/context system
+GitHub transport/credential stack
+host portability framework
 ```
 
-A host may expose these behind the one chat box without changing the product abstraction.
+## After v0.5 — evidence-driven, not capability-ladder driven
 
-## Long-term product-host posture
+Do not precommit pi-sand to building Browser, Computer, Memory, Skills, multi-agent orchestration, scheduler, knowledge platform, or channel SDK releases merely because those capabilities might be useful in an Agent product.
 
-OpenClaw is selected for v0.5 because its durable ingress, trusted run identity, Gateway-owned capability mechanics, GitHub publisher, and Codex harness make it a useful responsibility-correctness testbed.
+Those capabilities already exist in hosts such as OpenClaw, Hermes, Grok Bot and other Agent/Computer systems. Prefer using them.
 
-It is **not** frozen as the permanent product host.
+For every future proposal, ask in this order:
 
-Grok Bot and Hermes are important product-shape references/candidates because they already provide persistent computers/agents, broad capabilities, and delegation. Their existence is a reason not to rebuild those layers.
+1. What user responsibility invariant is missing from existing hosts/executors?
+2. Can the host/runtime own the required mechanic instead?
+3. Can pi-sand own only the semantic decision and delete everything else?
+4. What evidence would prove pi-sand itself is no longer necessary?
 
-A future host wins if it can preserve the one-chat product shape while making more pi-sand-specific authority state deletable.
+A future host may be OpenClaw, Hermes, Grok Bot, or something else. Host selection is an independent axis from the responsibility semantics and executor choice. Do not design a Universal Host Interface before a second concrete host proves a real shared seam.
 
-## v1 condition
+## Long-term product shape
 
-`v1` is not "pi-sand implements every autonomous-agent capability."
-
-The product is ready when the experience is reliably:
+The desired experience remains extremely small:
 
 ```text
-one chat box
--> user delegates an outcome
--> user can leave
--> user can correct it later
--> hidden execution may change behind the scenes
--> stale authority cannot silently act
--> the system only says done when the current responsibility is actually eligible to be called done
+User: 帮我把这个修好，CI 过了告诉我。
+System: 好。
+
+User: 不要改 schema。
+System: 收到。
+
+... user leaves ...
+
+System: 已完成。
 ```
 
-The strongest acceptable v1 outcome is still deletion:
+The user should not have to understand:
 
-> **If a mature host natively provides this responsibility contract, pi-sand should shrink to an adapter or disappear.**
+```text
+Agent identity
+dataflow/workflow
+runtime
+worker topology
+computer placement
+model routing
+scheduler
+```
+
+If a future host natively provides durable responsibility admission, correction/current-authority semantics, stale capability fencing and truthful completion behind this one-chat UX, pi-sand should shrink further or disappear.
 
 ## Persistent non-goals
 
-Unless a concrete falsifying implementation result proves one necessary, do not build:
+Unless concrete release evidence proves otherwise, do not build:
 
-```text
-second Agent Engine
-standalone general agent runtime
-generic workflow engine / DAG
-generic scheduler / worker pool
-generic capability broker
-generic Effect framework
-generic Evidence/Reviewer/Completion framework
-generic filesystem mutation framework
-browser/computer platform
-memory platform
-Skills loader
-open-ended multi-agent society
-Universal Host Interface
-```
+- another general Agent Engine;
+- a custom browser/computer platform;
+- a container/VM/process-containment runtime;
+- a generic workflow engine or scheduler;
+- a broad provider/router abstraction;
+- a broad plugin/channel SDK;
+- a custom Skills loader;
+- a vector-first memory platform;
+- open-ended multi-agent societies;
+- a rich internal tracker/workboard;
+- generic Effect/Evidence/Result/Reviewer frameworks;
+- a desktop shell merely to own the product surface.
