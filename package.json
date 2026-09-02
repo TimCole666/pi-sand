@@ -1,7 +1,7 @@
 {
   "name": "pi-sand",
-  "version": "0.3.0",
-  "description": "v0.3 persistent local Task Runtime for Pi 0.84.4",
+  "version": "0.5.0",
+  "description": "v0.5 One-Chat Responsibility runtime",
   "private": true,
   "keywords": ["pi-package"],
   "peerDependencies": {
