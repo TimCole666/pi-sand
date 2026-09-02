@@ -201,30 +201,43 @@ Prototype #65 proved two different facts:
 1. OpenClaw keyed routing can keep stale T1 protocol/tool/final traffic from impersonating T2.
 2. An arbitrary OpenClaw dynamic-tool handler can ignore cancellation and continue mutating the shared workspace after T2 completes.
 
-v0.5 does **not** answer the second fact by building a generic mutation framework.
+A later architecture review found one additional containment requirement: #65 proved Codex-owned background-terminal cleanup, but did not prove that every descendant spawned through a Codex-native shell is necessarily represented by that inventory. "Codex-native" alone is therefore too broad to define a physically closed writer class.
 
-Instead the protected profile is closed-world.
+v0.5 does **not** answer either fact by building a generic mutation framework.
+
+Instead the protected profile is closed-world and pinned to a verified process-containment shape.
 
 ### Allowed authoritative workspace writers
 
-Only writer classes explicitly verified by the pinned host contract may exist.
+Only writer classes explicitly verified by the pinned host/runtime contract may exist.
 
 For v0.5:
 
-1. **Codex-native workspace/file/shell execution**, including its host-observed cleanup of Codex-owned background terminals.
+1. **Codex-native workspace/file/shell execution only under a pinned process-containment profile** whose teardown mechanically proves that no descendant process retaining workspace write capability can survive T1 retirement. The verification must cover descendants, not only Codex's named background-terminal inventory. A profile such as unrestricted `danger-full-access` is incompatible unless an equivalent descendant-containment guarantee is independently proved.
 2. **The dedicated Gateway GitHub publication path**, whose local/remote mutation steps are separately authority-fenced or isolated from the authoritative working tree.
+
+The exact containment mechanism is host/runtime-owned. A Linux PID-namespace/process-lifetime sandbox may satisfy the contract if the pinned implementation proves descendant containment and teardown; pi-sand does not prescribe or implement a general sandbox.
 
 ### Forbidden in protected mode
 
 ```text
+uncontained Codex shell/file execution profiles
 unknown/third-party dynamic tools with direct workspace write capability
 arbitrary host callbacks that can mutate the authoritative workspace
 unverified app/MCP/plugin write paths
 ```
 
-An unknown writer is a startup/configuration incompatibility, not something pi-sand attempts to supervise.
+An unknown or uncontained writer is a startup/configuration incompatibility, not something pi-sand attempts to supervise.
 
-Before a fresh turn can gain authority over the same authoritative workspace, the host must establish quiescence for every allowed prior-turn writer class. If quiescence cannot be proven, protected authority remains closed or the old execution placement must be isolated/retired by host mechanics.
+Before a fresh turn can gain authority over the same authoritative workspace, the host must establish quiescence for every allowed prior-turn writer capability, including:
+
+```text
+Codex process descendants
+Codex-owned background terminals
+pending publication/recovery state capable of later local workspace mutation
+```
+
+If quiescence/containment cannot be proven, protected authority remains closed or the old execution/publication placement must be isolated/retired by host mechanics.
 
 This rule is intentionally narrower than a universal generation-checked filesystem.
 
@@ -261,7 +274,9 @@ The Codex-facing `github_publish` tool is only a Gateway request boundary; it mu
 
 Creating a durable publication request is not blanket authorization for all later mutations.
 
-Each actual protected mutation step must re-enter current host authority immediately before the step becomes irrevocable. Examples include a remote push and a later PR creation.
+Each actual protected mutation step must re-enter current host authority immediately before the step becomes irrevocable. This includes publication-side **local Git mutations** that can alter the authoritative working state, not only remote push/PR creation.
+
+A durable pending publication/recovery record that can later finish a local ref/index/worktree mutation is itself a live writer capability for quiescence purposes; "no publisher process is currently running" is not sufficient.
 
 Conceptually:
 
@@ -278,7 +293,7 @@ If a newer Telegram admission wins first, the claim fails. If the mutation claim
 
 Recovery uses OpenClaw/GitHub durable publication state and remote readback; pi-sand does not build an Effect journal or GitHub reconciliation engine.
 
-`effect_key` remains only the logical identity of the same operation across ambiguous recovery.
+`effect_key` remains only the logical/idempotency identity of the same Gateway publication operation across ambiguous recovery. It is not additional pi-sand durable state.
 
 ## Completion is a thin semantic gate
 
@@ -311,7 +326,7 @@ protected mode refuses to operate
 
 Never silently fall back to ordinary hooks or ordinary Codex execution.
 
-v0.5 pins one verified OpenClaw + Codex app-server combination and an explicit capability contract. Portability is not promised.
+v0.5 pins one verified OpenClaw + Codex app-server combination **and one verified process-containment profile** for protected workspace execution. Portability is not promised.
 
 Prototype #65 tested:
 
@@ -321,7 +336,7 @@ Codex    a0dcfe2ada3f5bbd5059a34c0fc6fac244741a67
 codex-cli 0.151.0
 ```
 
-These are evidence coordinates, not a permanent compatibility promise.
+These are evidence coordinates, not a permanent compatibility promise. The release implementation may pin newer revisions, but the authority and containment contract must be re-proved.
 
 ## Prototype #65 consequence
 
@@ -335,9 +350,11 @@ It proved:
 - an abort-ignoring arbitrary dynamic-tool callback can still write the workspace late;
 - cancellation/route release alone is therefore not a universal side-effect fence.
 
-The architecture revision is deliberately bounded:
+The follow-up architecture review narrowed the remaining hole further: Codex background-terminal inventory is useful evidence but cannot, by itself, define the whole shell writer class. Protected mode must pin a descendant-containing execution profile and fail closed on uncontained profiles.
 
-> **Protected mode uses a verified closed writer surface and requires host-proven quiescence/isolation before fresh-turn authority admission. pi-sand does not become a runtime supervisor.**
+The architecture revision remains deliberately bounded:
+
+> **Protected mode uses a pinned contained Codex execution profile plus a verified closed writer surface, and requires host-proven quiescence/isolation before fresh-turn authority admission. pi-sand does not become a runtime supervisor.**
 
 ## Explicit non-goals
 
@@ -352,6 +369,7 @@ generic multi-agent runtime
 provider router
 standalone pi-sand daemon as a required boundary
 generic capability broker
+generic process-containment runtime
 generic dynamic-tool mutation framework
 generic Effect framework
 generic Evidence/Reviewer framework
