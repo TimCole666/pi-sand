@@ -73,8 +73,49 @@ async function handleRequest(request, store) {
       return { task: await store.createTask(params) };
     case "task.stop":
       return { task: await store.stopTask(params.id) };
+    case "task.correct":
+      return { task: await store.correctTask(params) };
     case "task.retry":
       return { task: await store.retryTask(params) };
+    case "task.wait":
+    case "wait.register":
+      return await store.registerWaitSubscription(params);
+    case "wait.reconcile": {
+      // Reconciliation is an observation request, not a caller-supplied wake.
+      // Classification and terminal action belong to the daemon-owned reactor.
+      const {
+        trigger: _trigger,
+        autoTrigger: _autoTrigger,
+        classification: _classification,
+        observation: _observation,
+        evidenceId: _evidenceId,
+        evidenceIds: _evidenceIds,
+        selectorResults: _selectorResults,
+        ...observationParams
+      } = params;
+      return await store.reconcileWaitSubscription(
+        params.id ?? params.subscriptionId ?? params.waitId,
+        observationParams,
+      );
+    }
+    case "result.claim": {
+      const result = store.claimResult(
+        params.clientInstanceId ?? params.client_instance_id,
+      );
+      return {
+        result,
+        resultId: result?.id ?? null,
+        claimHandle: result?.claimHandle ?? null,
+        claimExpiresAt: result?.claimExpiresAt ?? null,
+      };
+    }
+    case "result.ack": {
+      const result = store.ackResult(
+        params.resultId ?? params.result_id,
+        params.claimHandle ?? params.claim_handle,
+      );
+      return { result, acknowledged: true, resultId: result.id };
+    }
     default:
       throw Object.assign(new Error(`unknown protocol method: ${request.method}`), { code: "unknown_method" });
   }
@@ -152,7 +193,10 @@ export async function startRuntimeDaemon({
   // after the runtime DB lock is acquired, so a stale socket is never removed
   // by a process that failed to become the runtime owner.
   ensureRuntimeDirectoryForSocket(socketPath);
+  // Acquire DB ownership before swallowing an observer/provider startup error;
+  // a losing daemon must never reclaim the live owner's socket.
   store.open();
+  await store.startWaitReactor().catch(() => {});
   const connections = new Set();
   const server = createServer((socket) => {
     connections.add(socket);

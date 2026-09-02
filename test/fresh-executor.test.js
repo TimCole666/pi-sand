@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startFreshExecutor, FRESH_EXECUTOR_ARGS } from "../src/fresh-executor.js";
+import { startFreshExecutor, FRESH_EXECUTOR_ARGS, FRESH_REVIEWER_ARGS } from "../src/fresh-executor.js";
 import { processGroupStatus } from "../src/process.js";
 
 const FAKE_PI_SOURCE = `#!/usr/bin/env node
@@ -17,6 +18,13 @@ if (process.argv.includes("--version")) {
   process.exit(0);
 }
 record({ type: "spawn", args: process.argv.slice(2), cwd: process.cwd() });
+if (process.env.FAKE_PI_CAPABILITY_PROBE) {
+  const capabilityNames = ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"];
+  const status = fs.readFileSync("/proc/self/status", "utf8");
+  const capabilities = Object.fromEntries(capabilityNames.map((name) => [name, status.match(new RegExp("^" + name + ":\\\\s+([0-9a-f]+)$", "m"))?.[1] ?? null]));
+  record({ type: "capabilities", capabilities });
+}
+if (process.env.FAKE_PI_ENV_PROBE) record({ type: "env", runtimeDb: process.env.PI_SAND_RUNTIME_DB || null, socket: process.env.PI_SAND_SOCKET || null, taskWorktreeRoot: process.env.PI_SAND_TASK_WORKTREE_ROOT || null });
 let buffer = "";
 const send = (value, delay = 0) => setTimeout(() => process.stdout.write(JSON.stringify(value) + "\\n"), delay);
 process.stdin.setEncoding("utf8");
@@ -49,6 +57,22 @@ process.stdin.on("data", (chunk) => {
         thinkingLevel: behavior.stateThinkingLevel || behavior.thinkingLevel || "medium",
       } }, Number(behavior.stateDelay || 0));
     } else if (command.type === "prompt") {
+      if (process.env.FAKE_PI_ATTACK) {
+        const fs = require("node:fs");
+        const { spawnSync } = require("node:child_process");
+        const targets = [process.env.FAKE_PI_ATTACK_TASK, process.env.FAKE_PI_ATTACK_SOURCE].filter(Boolean);
+        const writes = targets.map((target) => {
+          try { fs.writeFileSync(target + "/reviewer-mutated.txt", "must not persist"); return "write"; }
+          catch (error) { return error.code; }
+        });
+        const chmods = targets.map((target) => {
+          try { fs.chmodSync(target, 0o755); return "chmod"; }
+          catch (error) { return error.code; }
+        });
+        const unmount = spawnSync("umount", [process.env.FAKE_PI_ATTACK_SOURCE], { encoding: "utf8" });
+        const push = spawnSync("git", ["-C", process.env.FAKE_PI_ATTACK_SOURCE, "push"], { encoding: "utf8" });
+        record({ type: "attack", writes, chmods, unmount: unmount.status, push: push.status, pushStderr: push.stderr?.slice(0, 256) });
+      }
       if (behavior.promptRejected) {
         send({ type: "response", command: "prompt", success: false, id: command.id });
       } else {
@@ -160,6 +184,116 @@ test("Fresh Executor callback failure after spawn is captured and safely retires
       return /RPC startup failed/.test(error.message);
     });
     assert.equal(processGroupStatus(spawned.processGroupId), "gone");
+  });
+});
+
+test("Fresh Executor runs the synchronous initial-prompt fence after setup and before prompt transmission", async () => {
+  await withExecutor({}, async ({ fake, taskCwd }) => {
+    let commandsAtFence;
+    const handle = await start(fake, taskCwd, {
+      beforeInitialPrompt: () => {
+        commandsAtFence = readFileSync(fake.log, "utf8")
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map(JSON.parse);
+      },
+    });
+    assert.deepEqual(commandsAtFence.slice(1).map(({ type }) => type), [
+      "set_model",
+      "set_thinking_level",
+      "get_state",
+    ]);
+    assert.equal(commandsAtFence.some(({ type }) => type === "prompt"), false);
+    assert.equal((await readCommands(fake.log)).filter(({ type }) => type === "prompt").length, 1);
+    return handle;
+  });
+});
+
+test("Fresh Executor refuses a stale initial prompt without transmitting it", async () => {
+  await withExecutor({}, async ({ fake, taskCwd }) => {
+    await assert.rejects(
+      start(fake, taskCwd, {
+        beforeInitialPrompt: () => {
+          const stale = new Error("stale launch");
+          stale.code = "STALE_ATTEMPT";
+          throw stale;
+        },
+      }),
+      (error) => error.code === "RPC_STARTUP_FAILED" && error.cause?.code === "STALE_ATTEMPT",
+    );
+    assert.equal((await readCommands(fake.log)).filter(({ type }) => type === "prompt").length, 0);
+  });
+});
+
+test("Fresh Executor reviewer profile exposes only read-only Pi tools", async () => {
+  await withExecutor({}, async ({ fake, taskCwd }) => {
+    const handle = await start(fake, taskCwd, { role: "reviewer" });
+    const commands = await readCommands(fake.log);
+    assert.deepEqual(commands[0], { type: "spawn", args: FRESH_REVIEWER_ARGS, cwd: taskCwd });
+    assert.equal(FRESH_REVIEWER_ARGS.includes("--tools"), true);
+    assert.equal(FRESH_REVIEWER_ARGS.at(-1), "read,grep,find,ls");
+    assert.equal(FRESH_REVIEWER_ARGS.some((arg) => /bash|write|edit|task|daemon|push/i.test(arg)), false);
+    assert.equal(FRESH_REVIEWER_ARGS.includes("--approve"), true);
+    return handle;
+  });
+});
+
+test("Fresh Executor reviewer process has zero Linux capabilities", { skip: process.platform === "linux" ? false : "Linux-only" }, async () => {
+  await withExecutor({}, async ({ fake, taskCwd }) => {
+    const handle = await start(fake, taskCwd, {
+      role: "reviewer",
+      env: { ...process.env, ...fake.env, FAKE_PI_CAPABILITY_PROBE: "1" },
+    });
+    const capabilityRecord = (await readCommands(fake.log)).find(({ type }) => type === "capabilities");
+    assert.ok(capabilityRecord);
+    for (const [name, value] of Object.entries(capabilityRecord.capabilities)) {
+      assert.equal(typeof value, "string", `${name} must be reported by /proc/self/status`);
+      assert.equal(BigInt(`0x${value}`), 0n, `${name} must be zero`);
+    }
+    return handle;
+  });
+});
+
+test("Fresh Executor reviewer process cannot mutate accepted paths, refs, or its mount namespace", async () => {
+  await withExecutor({}, async ({ directory, fake }) => {
+    const source = join(directory, "source");
+    const review = join(directory, "review");
+    await mkdir(source);
+    await mkdir(review);
+    execFileSync("git", ["init", "-q", source]);
+    execFileSync("git", ["-C", source, "config", "user.email", "test@example.com"]);
+    execFileSync("git", ["-C", source, "config", "user.name", "Test"]);
+    await writeFile(join(source, "accepted.txt"), "accepted\n");
+    execFileSync("git", ["-C", source, "add", "."]);
+    execFileSync("git", ["-C", source, "commit", "-qm", "accepted"]);
+    const handle = await start(fake, review, {
+      role: "reviewer",
+      taskWorktree: source,
+      sourceRepoRoot: source,
+      reviewWorktree: review,
+      env: { ...process.env, ...fake.env, FAKE_PI_ATTACK: "1", FAKE_PI_ATTACK_TASK: source, FAKE_PI_ATTACK_SOURCE: source },
+    });
+    const attack = (await readCommands(fake.log)).find(({ type }) => type === "attack");
+    assert.deepEqual(attack.writes, ["EROFS", "EROFS"]);
+    assert.deepEqual(attack.chmods, ["EROFS", "EROFS"]);
+    assert.notEqual(attack.unmount, 0);
+    assert.notEqual(attack.push, 0);
+    assert.equal(existsSync(join(source, "reviewer-mutated.txt")), false);
+    assert.equal(execFileSync("git", ["-C", source, "status", "--porcelain"], { encoding: "utf8" }).trim(), "");
+    return handle;
+  });
+});
+
+test("Fresh Executor reviewer process does not inherit daemon authority", async () => {
+  await withExecutor({}, async ({ fake, taskCwd }) => {
+    const handle = await start(fake, taskCwd, {
+      role: "reviewer",
+      env: { ...process.env, ...fake.env, FAKE_PI_ENV_PROBE: "1", PI_SAND_RUNTIME_DB: "/shared/runtime.sqlite", PI_SAND_SOCKET: "/shared/runtime.sock", PI_SAND_TASK_WORKTREE_ROOT: "/shared/worktrees" },
+    });
+    const envRecord = (await readCommands(fake.log)).find(({ type }) => type === "env");
+    assert.deepEqual(envRecord, { type: "env", runtimeDb: null, socket: null, taskWorktreeRoot: null });
+    return handle;
   });
 });
 

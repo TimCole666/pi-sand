@@ -96,6 +96,13 @@ test("official Extension checks trust/auth and every Pi client lifecycle is a Ta
   assert.equal(createCalls.length, 0);
   assert.equal((await harness.commands.get("task").handler("do it", { ...base, isProjectTrusted: () => true, modelRegistry: { hasConfiguredAuth: () => true } })).ok, true);
   assert.deepEqual(createCalls[0].model, { provider: "p", id: "m" });
+  const structured = JSON.stringify({
+    goal: "do it with an explicit gate",
+    completionContract: { localGates: [{ id: "release", command: ["node", "-e", "process.exit(0)"] }] },
+  });
+  assert.equal((await harness.commands.get("task").handler(structured, { ...base, isProjectTrusted: () => true, modelRegistry: { hasConfiguredAuth: () => true } })).ok, true);
+  assert.equal(createCalls[1].goal, "do it with an explicit gate");
+  assert.deepEqual(createCalls[1].completionContract.localGates[0].command, ["node", "-e", "process.exit(0)"]);
 
   for (const reason of ["quit", "reload", "new", "resume", "fork"]) {
     const context = { ...base, ...harness.context(reason) };
@@ -103,6 +110,6 @@ test("official Extension checks trust/auth and every Pi client lifecycle is a Ta
     await harness.invoke("agent_start", { type: "agent_start" }, context);
     await harness.invoke("session_shutdown", { type: "session_shutdown", reason }, context);
   }
-  assert.equal(createCalls.length, 1);
+  assert.equal(createCalls.length, 2);
   assert.deepEqual(controlCalls, [], "Pi client lifecycle must not stop or retry a daemon-owned Task");
 });

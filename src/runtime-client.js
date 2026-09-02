@@ -17,7 +17,14 @@ export const RUNTIME_UNAVAILABLE_ERROR =
   "The pi-sand runtime could not be reached.";
 export const MUTATION_OUTCOME_UNKNOWN_ERROR =
   "The Task mutation outcome is unknown; inspect /tasks before trying again.";
-const MUTATING_METHODS = new Set(["task.create", "task.stop", "task.retry"]);
+const MUTATING_METHODS = new Set([
+  "task.create",
+  "task.stop",
+  "task.correct",
+  "task.retry",
+  "result.claim",
+  "result.ack",
+]);
 const DEFAULT_START_TIMEOUT_MS = 10_000;
 // A mutating task.create/task.retry request includes the Fresh Executor's
 // acknowledged startup window, so the whole IPC request must not time out
@@ -34,7 +41,9 @@ function messageFromError(error) {
 }
 
 function protocolMismatch(detail) {
-  return new Error(`${CLIENT_PROTOCOL_MISMATCH_ERROR} ${detail}`.trim());
+  const error = new Error(`${CLIENT_PROTOCOL_MISMATCH_ERROR} ${detail}`.trim());
+  error.code = "protocol_mismatch";
+  return error;
 }
 
 function responseError(response) {
@@ -112,11 +121,40 @@ export class RuntimeClient {
     return result.task;
   }
 
+  async correctTask(params) {
+    const result = await this.request("task.correct", params);
+    if (!result?.task)
+      throw new Error("The runtime returned an invalid corrected Task.");
+    return result.task;
+  }
+
   async retryTask(params) {
     const result = await this.request("task.retry", params);
     if (!result?.task)
       throw new Error("The runtime returned an invalid retried Task.");
     return result.task;
+  }
+
+  async claimResult(clientInstanceId) {
+    const params =
+      clientInstanceId && typeof clientInstanceId === "object"
+        ? clientInstanceId
+        : { clientInstanceId };
+    const result = await this.request("result.claim", params);
+    if (!Object.hasOwn(result ?? {}, "result"))
+      throw new Error("The runtime returned an invalid Result claim.");
+    return result.result;
+  }
+
+  async ackResult(resultId, claimHandle) {
+    const params =
+      resultId && typeof resultId === "object"
+        ? resultId
+        : { resultId, claimHandle };
+    const result = await this.request("result.ack", params);
+    if (!result?.result)
+      throw new Error("The runtime returned an invalid Result acknowledgement.");
+    return result.result;
   }
 
   async request(method, params = {}, { version = PROTOCOL_VERSION } = {}) {
@@ -255,6 +293,7 @@ export class RuntimeClient {
         validateRuntimeStatus(response.data);
         return response;
       } catch (error) {
+        if (error.code === "protocol_mismatch") throw error;
         lastError = error;
         const remaining = deadline - Date.now();
         if (remaining <= 0) break;

@@ -232,7 +232,7 @@ test("RuntimeClient allows the acknowledged startup window to exceed one slow mo
   }
 });
 
-test("daemon completes a Task after the submitting client disappears", {
+test("daemon settles the initial AttemptRun after the submitting client disappears without completing the Task", {
   skip: process.platform === "linux" ? false : "Linux-only",
 }, async () => {
   const parent = await mkdtemp(
@@ -261,11 +261,18 @@ test("daemon completes a Task after the submitting client disappears", {
     assert.equal(started.task.state, "running");
     await wait(2_500);
     const shown = await runClient(env, "task.get", { id: started.task.id });
-    if (shown.task.state !== "completed")
+    if (shown.task.attempts[0]?.attemptRuns[0]?.state !== "settled")
       console.error(await readFile(fake.log, "utf8"));
-    assert.equal(shown.task.state, "completed");
-    assert.equal(shown.task.finalResult, "completed with zero clients");
-    assert.match(shown.task.finalBranchHead, /^[0-9a-f]{40}$/);
+    assert.equal(shown.task.state, "running");
+    assert.equal(shown.task.finalResult, null);
+    assert.equal(shown.task.finalBranchHead, null);
+    assert.equal(shown.task.attempts[0].state, "running");
+    assert.equal(shown.task.attempts[0].attemptRuns.length, 1);
+    assert.equal(shown.task.attempts[0].attemptRuns[0].state, "settled");
+    assert.equal(
+      shown.task.attempts[0].attemptRuns[0].settledOutcome,
+      "completed with zero clients",
+    );
     assert.equal(
       await readFile(
         join(shown.task.taskWorktree, "daemon-result.txt"),
@@ -279,7 +286,7 @@ test("daemon completes a Task after the submitting client disappears", {
         "--porcelain=v1",
         "--untracked-files=all",
       ]),
-      "",
+      "?? daemon-result.txt",
     );
     assert.equal(
       git(source, ["status", "--porcelain=v1", "--untracked-files=all"]),
@@ -291,7 +298,7 @@ test("daemon completes a Task after the submitting client disappears", {
   }
 });
 
-test("Fresh Executor history settles when prompt acceptance and agent_settled share startup", async () => {
+test("Fresh Executor history records an accepted and settled AttemptRun when prompt acceptance and agent_settled share startup", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-history-settle-"));
   const source = await repository(parent);
   const piCommand = await versionCommand(parent);
@@ -316,19 +323,23 @@ test("Fresh Executor history settles when prompt acceptance and agent_settled sh
   });
   try {
     const started = await runtime.createTask(optionsFor(source));
-    const completed = await eventually(
+    const settled = await eventually(
       () => runtime.getTask(started.id),
-      (task) => task.state !== "running",
+      (task) => task.attempts[0].attemptRuns[0].state === "settled",
     );
-    assert.equal(completed.state, "completed");
-    assert.equal(completed.finalResult, "history result");
+    assert.equal(settled.state, "running");
+    assert.equal(settled.finalResult, null);
+    assert.equal(
+      settled.attempts[0].attemptRuns[0].settledOutcome,
+      "history result",
+    );
   } finally {
     runtime.close();
     await rm(parent, { recursive: true, force: true });
   }
 });
 
-test("settlement rules preserve commits, checkpoint residual changes, avoid empty commits, and retain failed worktrees", {
+test("initial AttemptRun settlement leaves candidate work for Supervisor verification", {
   skip: process.platform === "linux" ? false : "Linux-only",
 }, async () => {
   const cases = [
@@ -338,20 +349,23 @@ test("settlement rules preserve commits, checkpoint residual changes, avoid empt
         events: [{ type: "agent_end" }],
         change: true,
       }),
-      state: "completed",
-      commits: 2,
+      state: "running",
+      commits: 1,
+      status: "?? worker.txt",
     },
     {
       name: "worker-commit",
       worker: deterministicWorker({ events: [], change: true, commit: true }),
-      state: "completed",
-      commits: 3,
+      state: "running",
+      commits: 2,
+      status: "?? residual.txt",
     },
     {
       name: "clean",
       worker: deterministicWorker({ events: [] }),
-      state: "completed",
+      state: "running",
       commits: 1,
+      status: "",
     },
   ];
   for (const scenario of cases) {
@@ -366,32 +380,27 @@ test("settlement rules preserve commits, checkpoint residual changes, avoid empt
     });
     try {
       const result = await runtime.createTask(optionsFor(source));
-      const completed = await eventually(
+      const settled = await eventually(
         () => runtime.getTask(result.id),
-        (task) => task.state !== "running",
+        (task) => task.attempts[0].attemptRuns[0].state === "settled",
       );
-      assert.equal(completed.state, scenario.state);
+      assert.equal(settled.state, scenario.state);
       assert.equal(
-        git(completed.taskWorktree, ["rev-list", "--count", "HEAD"]),
+        git(settled.taskWorktree, ["rev-list", "--count", "HEAD"]),
         String(scenario.commits),
       );
       assert.equal(
-        git(completed.taskWorktree, [
+        git(settled.taskWorktree, [
           "status",
           "--porcelain=v1",
           "--untracked-files=all",
         ]),
-        "",
+        scenario.status,
       );
-      assert.equal(
-        completed.finalBranchHead,
-        git(completed.taskWorktree, ["rev-parse", "HEAD"]),
-      );
-      assert.equal(
-        completed.attempts[0].finalBranchHead,
-        completed.finalBranchHead,
-      );
-      assert.equal(git(source, ["rev-parse", "HEAD"]), completed.baseCommit);
+      assert.equal(settled.finalBranchHead, null);
+      assert.equal(settled.finalRevision, null);
+      assert.equal(settled.attempts[0].finalBranchHead, null);
+      assert.equal(git(source, ["rev-parse", "HEAD"]), settled.baseCommit);
       assert.equal(
         git(source, ["status", "--porcelain=v1", "--untracked-files=all"]),
         "",
@@ -451,7 +460,7 @@ test("settlement rules preserve commits, checkpoint residual changes, avoid empt
   }
 });
 
-test("unsafe worker retirement keeps the result inspectable and blocks capacity", {
+test("settled nonterminal work keeps the active worker and blocks capacity", {
   skip: process.platform === "linux" ? false : "Linux-only",
 }, async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v03-retirement-"));
@@ -477,14 +486,14 @@ test("unsafe worker retirement keeps the result inspectable and blocks capacity"
   });
   try {
     const task = await runtime.createTask(optionsFor(source));
-    const blocked = await eventually(
+    const settled = await eventually(
       () => runtime.getTask(task.id),
-      (value) => value.state !== "running",
+      (value) => value.attempts[0].attemptRuns[0].state === "settled",
     );
-    assert.equal(blocked.state, "blocked");
-    assert.equal(blocked.attempts[0].state, "orphaned");
-    assert.equal(blocked.attempts[0].workerTerminated, false);
-    assert.match(blocked.finalResult, /bounded/);
+    assert.equal(settled.state, "running");
+    assert.equal(settled.attempts[0].state, "running");
+    assert.equal(settled.attempts[0].workerTerminated, false);
+    assert.equal(settled.finalResult, null);
     await assert.rejects(
       () => runtime.createTask(optionsFor(source)),
       /already active/,

@@ -32,6 +32,7 @@ const commonArgs = ["--mode", "rpc", "--no-session", "--approve"];
 
 export {
   FRESH_EXECUTOR_ARGS,
+  FRESH_REVIEWER_ARGS,
   FRESH_EXECUTOR_VERSION_ERROR,
   FRESH_PI_VERSION,
   FreshExecutorError,

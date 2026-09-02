@@ -1,7 +1,7 @@
 {
   "name": "pi-sand",
-  "version": "0.3.0",
-  "description": "v0.3 persistent local Task Runtime for Pi 0.84.4",
+  "version": "0.4.0",
+  "description": "v0.4 leave-and-return Coding Commitment runtime for Pi 0.84.4",
   "private": true,
   "keywords": ["pi-package"],
   "peerDependencies": {
@@ -17,8 +17,10 @@
     "start": "node src/server.js",
     "launch": "node src/launcher.js",
     "test": "node --test --test-concurrency=1",
+    "test:v0.4-release": "node --test test/v0.4-release.integration.test.js",
     "test:real-pi": "PI_SAND_REAL_PI=1 node --test test/real-pi.acceptance.test.js",
     "test:real-runtime": "PI_SAND_REAL_RUNTIME=1 node --test test/v0.3-real-pi.acceptance.test.js",
+    "test:real-github": "PI_SAND_REAL_GITHUB=1 node --test test/real-github.acceptance.test.js",
     "spike:self-test": "node spikes/pi-contract.mjs self-test"
   }
 }

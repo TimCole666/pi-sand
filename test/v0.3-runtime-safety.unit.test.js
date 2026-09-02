@@ -272,13 +272,13 @@ test("Stop wins over a concurrent settled completion", linuxOnly, async () => {
   const source = await repository(parent);
   let child;
   let emit;
-  let releaseRetirement;
-  let enterRetirement;
-  const retirement = new Promise((resolveRetirement) => {
-    releaseRetirement = resolveRetirement;
+  let releaseSettlement;
+  let enterSettlement;
+  const settlement = new Promise((resolveSettlement) => {
+    releaseSettlement = resolveSettlement;
   });
-  const retirementEntered = new Promise((resolveRetirement) => {
-    enterRetirement = resolveRetirement;
+  const settlementEntered = new Promise((resolveSettlement) => {
+    enterSettlement = resolveSettlement;
   });
   const runtime = new TaskRuntime({
     dbPath: join(parent, "runtime.sqlite"),
@@ -296,10 +296,11 @@ test("Stop wins over a concurrent settled completion", linuxOnly, async () => {
     worktreeRoot: join(parent, "worktrees"),
     workerStopTimeoutMs: 100,
   });
-  runtime.retireWorker = async () => {
-    enterRetirement();
-    await retirement;
-    return true;
+  const settleInitialRun = runtime.settleInitialRun.bind(runtime);
+  runtime.settleInitialRun = async (...args) => {
+    enterSettlement();
+    await settlement;
+    return settleInitialRun(...args);
   };
   try {
     const started = await runtime.createTask(taskOptions(source));
@@ -312,14 +313,16 @@ test("Stop wins over a concurrent settled completion", linuxOnly, async () => {
       },
     });
     emit({ type: "agent_settled" });
-    await retirementEntered;
+    await settlementEntered;
     const stopped = await runtime.stopTask(started.id);
     assert.equal(stopped.state, "stopped");
-    releaseRetirement();
+    releaseSettlement();
     await new Promise((resolveWait) => setImmediate(resolveWait));
-    assert.equal(runtime.getTask(started.id).state, "stopped");
+    const afterSettlement = runtime.getTask(started.id);
+    assert.equal(afterSettlement.state, "stopped");
+    assert.equal(afterSettlement.attempts[0].attemptRuns[0].state, "aborted");
   } finally {
-    releaseRetirement?.();
+    releaseSettlement?.();
     killGroup(child);
     await waitForExit(child).catch(() => {});
     runtime.close();
@@ -337,13 +340,13 @@ test(
     const source = await repository(parent);
     let child;
     let emit;
-    let releaseRetirement;
-    let enterRetirement;
-    const retirement = new Promise((resolveRetirement) => {
-      releaseRetirement = resolveRetirement;
+    let releaseSettlement;
+    let enterSettlement;
+    const settlement = new Promise((resolveSettlement) => {
+      releaseSettlement = resolveSettlement;
     });
-    const retirementEntered = new Promise((resolveRetirement) => {
-      enterRetirement = resolveRetirement;
+    const settlementEntered = new Promise((resolveSettlement) => {
+      enterSettlement = resolveSettlement;
     });
     const runtime = new TaskRuntime({
       dbPath: join(parent, "runtime.sqlite"),
@@ -365,10 +368,11 @@ test(
       worktreeRoot: join(parent, "worktrees"),
       workerStopTimeoutMs: 100,
     });
-    runtime.retireWorker = async () => {
-      enterRetirement();
-      await retirement;
-      return true;
+    const settleInitialRun = runtime.settleInitialRun.bind(runtime);
+    runtime.settleInitialRun = async (...args) => {
+      enterSettlement();
+      await settlement;
+      return settleInitialRun(...args);
     };
     try {
       const started = await runtime.createTask(taskOptions(source));
@@ -381,16 +385,17 @@ test(
         },
       });
       emit({ type: "agent_settled" });
-      await retirementEntered;
+      await settlementEntered;
       assert.equal(await runtime.shutdown("daemon-shutdown"), "interrupted");
-      releaseRetirement();
+      releaseSettlement();
       await new Promise((resolveWait) => setImmediate(resolveWait));
       const interrupted = runtime.getTask(started.id);
       assert.equal(interrupted.state, "interrupted");
       assert.equal(interrupted.shutdownReason, "daemon-shutdown");
       assert.equal(interrupted.attempts[0].state, "interrupted");
+      assert.equal(interrupted.attempts[0].attemptRuns[0].state, "aborted");
     } finally {
-      releaseRetirement?.();
+      releaseSettlement?.();
       killGroup(child);
       await waitForExit(child).catch(() => {});
       runtime.close();
@@ -476,7 +481,7 @@ test(
 );
 
 test(
-  "checkpoint failure retains the failed Task worktree",
+  "healthy settlement defers Git checkpointing until Supervisor verification",
   linuxOnly,
   async () => {
     const parent = await mkdtemp(
@@ -507,20 +512,25 @@ test(
     });
     try {
       const task = await runtime.createTask(taskOptions(source));
-      const failed = await eventually(
+      const settled = await eventually(
         () => runtime.getTask(task.id),
-        (value) => value.state !== "running",
+        (value) => value.attempts[0].attemptRuns[0].state === "settled",
       );
-      assert.equal(failed.state, "failed");
-      assert.match(failed.terminalDetail, /Task Git finalization failed/);
+      assert.equal(settled.state, "running");
+      assert.equal(settled.finalResult, null);
       assert.equal(
-        await readFile(join(failed.taskWorktree, "partial.txt"), "utf8"),
+        await readFile(join(settled.taskWorktree, "partial.txt"), "utf8"),
         "partial\n",
       );
-      assert.equal(
-        failed.finalBranchHead,
-        git(failed.taskWorktree, ["rev-parse", "HEAD"]),
+      assert.match(
+        git(settled.taskWorktree, [
+          "status",
+          "--porcelain=v1",
+          "--untracked-files=all",
+        ]),
+        /partial\.txt/,
       );
+      assert.equal(settled.finalBranchHead, null);
     } finally {
       runtime.close();
       await rm(parent, { recursive: true, force: true });

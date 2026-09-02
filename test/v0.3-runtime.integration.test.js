@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { registerPiSandExtension } from "../extensions/runtime.js";
 import { createExtensionHarness } from "./helpers/v0.2-extension-harness.js";
 import { RuntimeClient } from "../src/runtime-client.js";
-import { runtimeSocketPath } from "../src/runtime-ipc.js";
+import { PROTOCOL_VERSION, runtimeSocketPath } from "../src/runtime-ipc.js";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 function runClient(environment) {
@@ -88,7 +88,7 @@ async function terminateRuntimes(env, knownPid) {
       const response = await new RuntimeClient({
         env,
         requestTimeoutMs: 100,
-      }).requestSocket("runtime.status", {}, 1);
+      }).requestSocket("runtime.status", {}, PROTOCOL_VERSION);
       pid = response.data?.daemonPid;
     } catch {
       pid = null;
@@ -105,7 +105,7 @@ test("a detached daemon survives a client process and a fresh client reconnects 
   try {
     const first = await runClient(env);
     daemonPid = first.status.daemonPid;
-    assert.equal(first.status.protocolVersion, 1);
+    assert.equal(first.status.protocolVersion, PROTOCOL_VERSION);
     assert.deepEqual(first.tasks, []);
     assert.doesNotThrow(() => process.kill(daemonPid, 0));
 
@@ -170,7 +170,7 @@ test("singleton races converge, stale sockets are reclaimed only after DB owners
       return /unknown protocol method/.test(error.message);
     });
     await assert.rejects(
-      client.request("runtime.status", {}, { version: 2 }),
+      client.request("runtime.status", {}, { version: 1 }),
       (error) => /protocol is incompatible/.test(error.message),
     );
   } finally {
@@ -227,6 +227,8 @@ test("autostart does not replay a transmitted mutation after the daemon disconne
     ["task.create", { goal: "create once" }],
     ["task.stop", { id: "task-1" }],
     ["task.retry", { id: "task-1" }],
+    ["result.claim", { clientInstanceId: "manager-a" }],
+    ["result.ack", { resultId: "result-1", claimHandle: "claim-1" }],
   ]) {
     const parent = await mkdtemp(
       join(tmpdir(), `pi-sand-v03-autostart-${method.replace(".", "-")}-`),
@@ -252,10 +254,10 @@ test("autostart does not replay a transmitted mutation after the daemon disconne
               socket.end(
                 `${JSON.stringify({
                   id: request.id,
-                  version: 1,
+                  version: PROTOCOL_VERSION,
                   success: true,
                   data: {
-                    protocolVersion: 1,
+                    protocolVersion: PROTOCOL_VERSION,
                     daemonPid: process.pid,
                     state: "ready",
                   },
@@ -351,10 +353,10 @@ test("autostart allows a long mutation to use the request timeout instead of the
             socket.end(
               `${JSON.stringify({
                 id: request.id,
-                version: 1,
+                version: PROTOCOL_VERSION,
                 success: true,
                 data: {
-                  protocolVersion: 1,
+                  protocolVersion: PROTOCOL_VERSION,
                   daemonPid: process.pid,
                   state: "ready",
                 },
@@ -365,7 +367,7 @@ test("autostart allows a long mutation to use the request timeout instead of the
               socket.end(
                 `${JSON.stringify({
                   id: request.id,
-                  version: 1,
+                  version: PROTOCOL_VERSION,
                   success: true,
                   data: {
                     task: {
@@ -373,7 +375,7 @@ test("autostart allows a long mutation to use the request timeout instead of the
                       state: "running",
                     },
                   },
-                })}\n`,
+                })}\n`
               );
             }, 120);
           } else {

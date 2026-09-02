@@ -2,7 +2,7 @@ import { chmodSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { isAbsolute, join } from "node:path";
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 export const SOCKET_NAME = "pi-sand.sock";
 export const SOCKET_DIRECTORY_NAME = "pi-sand";
 export const MAX_PROTOCOL_LINE_LENGTH = 64 * 1024;
