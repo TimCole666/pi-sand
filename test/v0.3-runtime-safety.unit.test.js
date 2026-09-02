@@ -207,6 +207,56 @@ test(
 );
 
 test(
+  "terminal Attempts with an unretired worker are recovered without rewriting Task truth",
+  linuxOnly,
+  async () => {
+    const parent = await mkdtemp(
+      join(tmpdir(), "pi-sand-runtime-terminal-retirement-"),
+    );
+    const source = await repository(parent);
+    const command = await versionCommand(parent);
+    const dbPath = join(parent, "runtime.sqlite");
+    const first = new TaskRuntime({
+      dbPath,
+      piCommand: command,
+      workerFactory: async () => ({ callbacksAttached: true, close() {} }),
+      worktreeRoot: join(parent, "worktrees"),
+      bootId: "boot-A",
+    });
+    let replacement;
+    try {
+      const started = await first.createTask(taskOptions(source));
+      const stopped = await first.stopTask(started.id);
+      const attemptId = stopped.attempts[0].id;
+      first.db
+        .prepare("UPDATE attempts SET worker_pid = 999999, worker_pgid = 999999, worker_boot_id = 'boot-A', worker_terminated = 0 WHERE id = ?")
+        .run(attemptId);
+      first.release();
+
+      replacement = new TaskRuntime({
+        dbPath,
+        piCommand: command,
+        workerFactory: async () => ({ callbacksAttached: true, close() {} }),
+        worktreeRoot: join(parent, "worktrees"),
+        bootId: "boot-B",
+      });
+      const recovered = replacement.getTask(started.id);
+      assert.equal(recovered.state, "stopped");
+      assert.equal(recovered.attempts[0].state, "stopped");
+      assert.equal(recovered.attempts[0].workerTerminated, true);
+      assert.equal(
+        replacement.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE worker_terminated = 0").get().count,
+        0,
+      );
+    } finally {
+      replacement?.close();
+      first.close();
+      await rm(parent, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   "recovery state changes keep Task and Attempt updates atomic",
   linuxOnly,
   async () => {

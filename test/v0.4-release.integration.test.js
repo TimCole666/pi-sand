@@ -449,8 +449,8 @@ async function runJourney({ repair = false } = {}) {
     if (!repair) {
       assert.equal(current.finalRevision, candidateR);
       assert.equal(current.attempts.length, 1);
-      assert.equal(readFileSync(pi.counter, "utf8"), "1");
     }
+    assert.equal(readFileSync(pi.counter, "utf8"), repair ? "2" : "1");
     await managerB.invoke("session_shutdown", { type: "session_shutdown" }, managerBContext);
     return { current, candidateR, parent, github, env };
   } finally {

@@ -198,6 +198,12 @@ export async function startRuntimeDaemon({
   // Acquire DB ownership before swallowing an observer/provider startup error;
   // a losing daemon must never reclaim the live owner's socket.
   store.open();
+  try {
+    await store.recoverPersistedAttempts();
+  } catch (error) {
+    store.release();
+    throw error;
+  }
   await store.startWaitReactor().catch(() => {});
   const connections = new Set();
   const server = createServer((socket) => {

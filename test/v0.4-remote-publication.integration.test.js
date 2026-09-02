@@ -120,7 +120,13 @@ function makeTransport(
   return transport;
 }
 
-async function fixture({ remoteTransport, beforeRemotePush, taskAuthority = authority } = {}) {
+async function fixture({
+  remoteTransport,
+  beforeRemotePush,
+  taskAuthority = authority,
+  workerFactory,
+  awaitSettlement = true,
+} = {}) {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-remote-publication-"));
   const { source, remote, base } = await repository(parent);
   const dbPath = join(parent, "runtime.sqlite");
@@ -132,14 +138,14 @@ async function fixture({ remoteTransport, beforeRemotePush, taskAuthority = auth
     worktreeRoot,
     remoteTransport,
     beforeRemotePush,
-    workerFactory: async ({ onEvent }) => {
+    workerFactory: workerFactory ?? (async ({ onEvent }) => {
       onEvent({
         type: "message_end",
         message: { role: "assistant", content: "candidate ready", stopReason: "stop" },
       });
       onEvent({ type: "agent_settled" });
       return { callbacksAttached: true, close() {} };
-    },
+    }),
   });
   const task = await runtime.createTask({
     goal: "publish one exact candidate",
@@ -149,10 +155,12 @@ async function fixture({ remoteTransport, beforeRemotePush, taskAuthority = auth
     thinkingLevel: "high",
     authority: taskAuthority,
   });
-  await eventually(
-    () => runtime.getTask(task.id),
-    (current) => current.attempts[0]?.attemptRuns[0]?.state === "settled",
-  );
+  if (awaitSettlement) {
+    await eventually(
+      () => runtime.getTask(task.id),
+      (current) => current.attempts[0]?.attemptRuns[0]?.state === "settled",
+    );
+  }
   return {
     parent,
     source,
@@ -255,6 +263,121 @@ test("second publication is a fast-forward from the confirmed SHA", async () => 
       ["confirmed", "confirmed"],
     );
     assert.ok(transport.endpoints.every((endpoint) => endpoint === value.remote));
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("a publication after correction fast-forwards from the prior confirmed SHA", async () => {
+  const value = await fixture({
+    workerFactory: async () => ({ callbacksAttached: true, close() {} }),
+    awaitSettlement: false,
+  });
+  const transport = makeTransport(value.remote);
+  value.runtime.remoteTransport = transport;
+  try {
+    const first = await commitCandidate(value.task.taskWorktree, "one.txt", "one\n", "one");
+    await value.runtime.publishTask({ id: value.task.id, candidateSha: first });
+    await value.runtime.correctTask({ id: value.task.id, objective: "publish the corrected candidate" });
+    const second = await commitCandidate(value.task.taskWorktree, "two.txt", "two\n", "two");
+    const published = await value.runtime.publishTask({ id: value.task.id, candidateSha: second });
+
+    assert.equal(published.remoteEffect.state, "confirmed");
+    assert.equal(published.remoteEffect.expectedOldOid, first);
+    assert.equal(published.remoteEffect.newOid, second);
+    assert.equal(remoteRef(value.remote, taskRef(value.task)), second);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("publication admitted after a correction fence is rejected until the new Attempt exists", async () => {
+  const value = await fixture({
+    workerFactory: async () => ({ callbacksAttached: true, close() {} }),
+    awaitSettlement: false,
+  });
+  let releaseTermination;
+  const terminationGate = new Promise((resolve) => {
+    releaseTermination = resolve;
+  });
+  let terminationStarted;
+  const terminationStartedPromise = new Promise((resolve) => {
+    terminationStarted = resolve;
+  });
+  value.runtime.terminateOwnedWorker = async () => {
+    terminationStarted();
+    await terminationGate;
+    return true;
+  };
+  let correction;
+  try {
+    correction = value.runtime.correctTask({
+      id: value.task.id,
+      objective: "publish only after correction",
+    });
+    await terminationStartedPromise;
+    await eventually(
+      () => value.runtime.getTask(value.task.id),
+      (current) => current.controlVersion === 2 && current.attempts[0].state === "superseded",
+    );
+    const candidate = await commitCandidate(
+      value.task.taskWorktree,
+      "during-correction.txt",
+      "during correction\n",
+      "during correction",
+    );
+    await assert.rejects(
+      () => value.runtime.publishTask({ id: value.task.id, candidateSha: candidate }),
+      (error) => error.code === "remote_task_ineligible",
+    );
+    assert.equal(remoteRef(value.remote, taskRef(value.task)), null);
+    releaseTermination();
+    await correction;
+    assert.equal(value.runtime.getTask(value.task.id).attempts.length, 2);
+  } finally {
+    releaseTermination?.();
+    await correction?.catch(() => {});
+    await closeFixture(value);
+  }
+});
+
+test("correction reconciles remote ambiguity before allocating another Attempt", async () => {
+  const value = await fixture({
+    workerFactory: async () => ({ callbacksAttached: true, close() {} }),
+    awaitSettlement: false,
+  });
+  let pushed = false;
+  value.runtime.remoteTransport = {
+    readRef: ({ endpoint }) => {
+      assert.equal(endpoint, value.remote);
+      if (!pushed) return null;
+      const error = new Error("exact readback unavailable");
+      error.code = "transport";
+      throw error;
+    },
+    push: () => {
+      pushed = true;
+      const error = new Error("post-transmit outcome is unknown");
+      error.code = "transport";
+      throw error;
+    },
+  };
+  try {
+    const candidate = await commitCandidate(value.task.taskWorktree, "one.txt", "one\n", "one");
+    await assert.rejects(
+      () => value.runtime.publishTask({ id: value.task.id, candidateSha: candidate }),
+      (error) => error.code === "remote_readback_unknown",
+    );
+    assert.equal(value.runtime.getTask(value.task.id).remoteEffects[0].state, "transmitted_unknown");
+
+    await assert.rejects(
+      () => value.runtime.correctTask({ id: value.task.id, objective: "corrected objective" }),
+      (error) => error.code === "remote_readback_unknown",
+    );
+    const task = value.runtime.getTask(value.task.id);
+    assert.equal(task.state, "blocked");
+    assert.equal(task.attempts.length, 1);
+    assert.equal(task.attempts[0].state, "superseded");
   } finally {
     await closeFixture(value);
   }

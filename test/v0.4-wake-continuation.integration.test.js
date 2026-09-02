@@ -887,8 +887,18 @@ test("6. Crash after transaction commit before worker spawn: persisted Attempt w
       piCommand: value.piCommand,
       worktreeRoot: value.worktreeRoot,
       bootId: "fresh-boot-after-crash-before-spawn",
+      workerFactory: async ({ onEvent }) => {
+        onEvent({
+          type: "message_end",
+          message: { role: "assistant", content: "recovered wake", stopReason: "stop" },
+        });
+        onEvent({ type: "agent_settled" });
+        return { callbacksAttached: true, close() {} };
+      },
     });
     restarted.open();
+    const recovery = await restarted.recoverPersistedAttempts();
+    assert.equal(recovery.length, 1);
 
     const taskRestarted = restarted.getTask(value.task.id);
     assert.equal(taskRestarted.state, "running");
@@ -896,7 +906,8 @@ test("6. Crash after transaction commit before worker spawn: persisted Attempt w
 
     const attempt2 = taskRestarted.attempts.find((a) => a.id === result.continuationAttemptId);
     assert.ok(attempt2);
-    assert.equal(attempt2.state, "starting");
+    assert.equal(attempt2.state, "running");
+    assert.equal(attempt2.launchPhase, "recorded");
     assert.equal(attempt2.workerPid, null);
     assert.equal(attempt2.resumeWaitId, registered.waitSubscription.id);
     assert.equal(attempt2.cause, "repair");
@@ -975,6 +986,53 @@ test("7. Crash after process start before prompt: reconciles process group; no s
     assert.equal(taskReconciled.attempts.length, 2);
 
     reopened.release();
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("a PID-less launch after the spawn boundary is blocked rather than blindly relaunched", async () => {
+  const value = await fixture();
+  try {
+    const candidateR = await commitCandidate(
+      value.task.taskWorktree,
+      "spawn-boundary.js",
+      "console.log('spawn boundary');\n",
+      "spawn boundary",
+    );
+    await value.runtime.publishTask({ id: value.task.id, candidateSha: candidateR });
+    const registered = await value.runtime.registerWaitSubscription({
+      taskId: value.task.id,
+      revisionSha: candidateR,
+      requiredChecks: ["check_run:github-actions/ci"],
+    });
+    const triggerRes = await triggerObserved(value.runtime, registered.waitSubscription.id, {
+      classification: "failure",
+      skipSpawn: true,
+    });
+    const attemptId = triggerRes.continuationAttemptId;
+    value.runtime.db
+      .prepare("UPDATE attempts SET launch_phase = 'spawning' WHERE id = ?")
+      .run(attemptId);
+    value.runtime.release();
+
+    const restarted = new RuntimeStore({
+      dbPath: value.dbPath,
+      piCommand: value.piCommand,
+      worktreeRoot: value.worktreeRoot,
+      workerFactory: async () => {
+        throw new Error("must not relaunch an ambiguous spawn");
+      },
+    });
+    restarted.open();
+    const task = restarted.getTask(value.task.id);
+    const attempt = task.attempts.find(({ id }) => id === attemptId);
+    assert.equal(task.state, "blocked");
+    assert.equal(attempt.state, "orphaned");
+    const recovery = await restarted.recoverPersistedAttempts();
+    assert.equal(recovery.length, 0);
+    assert.equal(task.attempts.length, 2);
+    restarted.release();
   } finally {
     await closeFixture(value);
   }

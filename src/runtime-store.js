@@ -26,6 +26,7 @@ export const TASK_RUNTIME_UNSUPPORTED_ERROR =
   "Fresh Executor Tasks are supported only on Linux.";
 export const MAX_TASK_GOAL_LENGTH = 8 * 1024;
 export const MAX_TASK_PACKET_LENGTH = 16 * 1024;
+const MAX_PENDING_ATTEMPT_LENGTH = MAX_TASK_PACKET_LENGTH + 4 * 1024;
 export const MAX_TASK_RESULT_LENGTH = 4 * 1024;
 export const MAX_TASK_DETAIL_LENGTH = 2 * 1024;
 export const MAX_TERMINAL_DETAIL_LENGTH = 1_000;
@@ -211,10 +212,16 @@ const TASK_SELECT = `SELECT id, source_repo_root AS sourceRepoRoot, base_commit 
   contract_version AS contractVersion, control_version AS controlVersion, authority,
   budget, return_route AS returnRoute, accepted_at AS acceptedAt,
   final_revision AS finalRevision, completion_evidence_ref AS completionEvidenceRef,
-  terminal_reason AS terminalReason, publication_count AS publicationCount
+  terminal_reason AS terminalReason, publication_count AS publicationCount,
+  pending_attempt AS pendingAttempt
   FROM tasks`;
-const ATTEMPT_SELECT = `SELECT id, task_id AS taskId, number, role, applied_provider AS provider, applied_model_id AS modelId,
-  applied_thinking_level AS thinkingLevel, control_version AS controlVersion,
+const ATTEMPT_SELECT = `SELECT id, task_id AS taskId, number, role,
+  applied_provider AS provider, applied_model_id AS modelId,
+  applied_thinking_level AS thinkingLevel,
+  launch_provider AS configuredProvider, launch_model_id AS configuredModelId,
+  launch_thinking_level AS configuredThinkingLevel,
+  launch_phase AS launchPhase, launch_packet AS launchPacket,
+  control_version AS controlVersion,
   contract_version AS contractVersion, state, started_at AS startedAt, finished_at AS finishedAt,
   worker_pid AS workerPid, worker_pgid AS workerPgid, worker_terminated AS workerTerminated,
   worker_start_identity AS workerStartIdentity, worker_boot_id AS workerBootId,
@@ -1000,6 +1007,7 @@ function attemptSnapshot(row, attemptRuns = []) {
     provider: row.provider,
     modelId: row.modelId,
     thinkingLevel: row.thinkingLevel,
+    launchPhase: row.launchPhase ?? "legacy",
     controlVersion: Number(row.controlVersion ?? 1),
     contractVersion: Number(row.contractVersion ?? 1),
     state: row.state,
@@ -1253,13 +1261,16 @@ function delayHeaderMs(value, now = Date.now()) {
 }
 
 function providerGuidanceMs(response) {
-  return Math.max(
-    0,
-    ...[
-      delayHeaderMs(headerValue(response, "retry-after")),
-      delayHeaderMs(headerValue(response, "x-poll-interval")),
-    ].filter((value) => value != null),
-  ) || null;
+  const values = [
+    delayHeaderMs(headerValue(response, "retry-after")),
+    delayHeaderMs(headerValue(response, "x-poll-interval")),
+  ].filter((value) => value != null);
+  if (headerValue(response, "x-ratelimit-remaining") === "0") {
+    const resetSeconds = Number(headerValue(response, "x-ratelimit-reset"));
+    if (Number.isFinite(resetSeconds) && resetSeconds >= 0)
+      values.push(Math.max(0, resetSeconds * 1000 - Date.now()));
+  }
+  return Math.max(0, ...values) || null;
 }
 
 function decorateProviderItems(items, guidanceMs) {
@@ -1267,12 +1278,13 @@ function decorateProviderItems(items, guidanceMs) {
   if (sanitizedGuidance == null) return items;
   const descriptor = Object.getOwnPropertyDescriptor(items, "providerGuidanceMs");
   if (descriptor && !descriptor.configurable) return items;
-  Object.defineProperty(items, "providerGuidanceMs", {
+  const target = Object.isExtensible(items) ? items : items.slice();
+  Object.defineProperty(target, "providerGuidanceMs", {
     value: sanitizedGuidance,
     enumerable: false,
     configurable: true,
   });
-  return items;
+  return target;
 }
 
 function readResponseBody(response, method, signal) {
@@ -1339,12 +1351,15 @@ async function fetchGitHubJson(url, token, { deadlineAt = Number.POSITIVE_INFINI
         const remainingHeader = headerValue(res, "x-ratelimit-remaining");
         const retryAfterMs = delayHeaderMs(headerValue(res, "retry-after"));
         const resetHeader = headerValue(res, "x-ratelimit-reset");
-        const resetMs = Number(resetHeader) * 1000 - Date.now();
+        const resetSeconds = Number(resetHeader);
+        const resetMs = Number.isFinite(resetSeconds) && resetSeconds >= 0
+          ? resetSeconds * 1000 - Date.now()
+          : null;
         if (status === 429 || remainingHeader === "0" || retryAfterMs != null) {
           throw Object.assign(new Error("GitHub API rate limit exceeded"), {
             code: "rate_limited",
             retryAfterMs: finiteNonNegativeMs(
-              retryAfterMs ?? (Number.isFinite(resetMs) ? Math.max(0, resetMs) : 60_000),
+              retryAfterMs ?? (resetMs == null ? null : Math.max(0, resetMs)),
             ) ?? 60_000,
             providerGuidanceMs: guidanceMs,
             status,
@@ -1402,6 +1417,51 @@ function nextLink(response) {
   return null;
 }
 
+function exactGitHubPageUrl(link, { apiBase, repository, sha, path }) {
+  let expected;
+  let candidate;
+  try {
+    expected = new URL(`${apiBase}/repos/${repository}/commits/${sha}/${path}`);
+    candidate = new URL(link);
+  } catch (error) {
+    throw Object.assign(new Error("GitHub pagination link is invalid."), {
+      code: "provider_error",
+      cause: error,
+    });
+  }
+  if (
+    candidate.origin !== expected.origin ||
+    candidate.username ||
+    candidate.password ||
+    candidate.hash ||
+    candidate.pathname !== expected.pathname
+  )
+    throw Object.assign(
+      new Error("GitHub pagination link changed the exact repository, SHA, or endpoint."),
+      { code: "provider_error" },
+    );
+  const allowedQuery = new Set(["page", "per_page"]);
+  if (candidate.searchParams.getAll("page").length !== 1)
+    throw Object.assign(
+      new Error("GitHub pagination link contains an invalid pagination value."),
+      { code: "provider_error" },
+    );
+  for (const key of candidate.searchParams.keys()) {
+    if (!allowedQuery.has(key) || candidate.searchParams.getAll(key).length !== 1)
+      throw Object.assign(
+        new Error("GitHub pagination link contains an unsupported query parameter."),
+        { code: "provider_error" },
+      );
+    const value = Number(candidate.searchParams.get(key));
+    if (!Number.isSafeInteger(value) || value < (key === "page" ? 2 : 1) || (key === "per_page" && value > 100))
+      throw Object.assign(
+        new Error("GitHub pagination link contains an invalid pagination value."),
+        { code: "provider_error" },
+      );
+  }
+  return candidate.toString();
+}
+
 async function fetchGitHubPages({ apiBase, repository, sha, path, key, deadlineAt }) {
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   const items = [];
@@ -1416,9 +1476,7 @@ async function fetchGitHubPages({ apiBase, repository, sha, path, key, deadlineA
     guidanceMs = Math.max(guidanceMs ?? 0, result.guidanceMs ?? 0) || null;
     const linkedNext = nextLink(result.response);
     if (linkedNext) {
-      if (!linkedNext.startsWith(`${apiBase}/`))
-        throw Object.assign(new Error("GitHub pagination link escaped the configured API host."), { code: "provider_error" });
-      url = linkedNext;
+      url = exactGitHubPageUrl(linkedNext, { apiBase, repository, sha, path });
     } else if (pageItems.length < 100) {
       url = null;
     } else {
@@ -1862,16 +1920,29 @@ export class RuntimeStore {
     this.waitReactorRunning = false;
     this.waitReactorPromise = null;
     this.waitReactorRequested = false;
+    this.controlMutationTail = null;
+    this.remotePublicationRuns = new Map();
+    this.runtimeOperationRuns = new Set();
+    this.recoveryPromise = null;
     this.databaseLock = null;
     this.db = null;
     this.active = null;
     this.closed = false;
     this.shuttingDown = false;
+    this.shutdownPromise = null;
   }
 
   ensureSupported() {
     if (process.platform !== "linux")
       throw new Error(TASK_RUNTIME_UNSUPPORTED_ERROR);
+  }
+
+  #assertNotShuttingDown() {
+    if (this.shuttingDown)
+      throw Object.assign(
+        new Error("The pi-sand runtime is shutting down."),
+        { code: "runtime_shutting_down" },
+      );
   }
 
   ensureCompletionColumns() {
@@ -1956,6 +2027,7 @@ export class RuntimeStore {
             gate_terminated INTEGER NOT NULL DEFAULT 1,
             final_result TEXT, terminal_detail TEXT, final_branch_head TEXT, shutdown_reason TEXT,
             applied_provider TEXT, applied_model_id TEXT, applied_thinking_level TEXT,
+            launch_phase TEXT NOT NULL DEFAULT 'legacy', launch_packet TEXT,
             control_version INTEGER NOT NULL DEFAULT 1, contract_version INTEGER NOT NULL DEFAULT 1,
             resume_wait_id TEXT UNIQUE REFERENCES wait_subscriptions(id),
             cause TEXT CHECK(cause IN ('initial', 'continuation', 'repair', 'review', 'retry')),
@@ -2000,6 +2072,11 @@ export class RuntimeStore {
       ["review_worktree_root", "TEXT"],
       ["resume_wait_id", "TEXT REFERENCES wait_subscriptions(id)"],
       ["cause", "TEXT CHECK(cause IN ('initial', 'continuation', 'repair', 'review', 'retry'))"],
+      ["launch_phase", "TEXT NOT NULL DEFAULT 'legacy'"],
+      ["launch_packet", "TEXT"],
+      ["launch_provider", "TEXT"],
+      ["launch_model_id", "TEXT"],
+      ["launch_thinking_level", "TEXT"],
     ]) {
       if (!columns.has(name)) {
         this.db.exec(`ALTER TABLE attempts ADD COLUMN ${name} ${type}`);
@@ -2055,6 +2132,7 @@ export class RuntimeStore {
       ["completion_evidence_ref", "TEXT"],
       ["terminal_reason", "TEXT"],
       ["publication_count", "INTEGER NOT NULL DEFAULT 0"],
+      ["pending_attempt", "TEXT"],
     ]) {
       if (!columns.has(name))
         this.db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${type}`);
@@ -2288,7 +2366,8 @@ export class RuntimeStore {
           control_version INTEGER NOT NULL DEFAULT 1, authority TEXT, budget TEXT,
           return_route TEXT, accepted_at TEXT, final_revision TEXT,
           completion_evidence_ref TEXT, terminal_reason TEXT,
-          publication_count INTEGER NOT NULL DEFAULT 0
+          publication_count INTEGER NOT NULL DEFAULT 0,
+          pending_attempt TEXT
         );
         CREATE TABLE IF NOT EXISTS attempts (
           id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), number INTEGER NOT NULL,
@@ -2304,6 +2383,8 @@ export class RuntimeStore {
           gate_terminated INTEGER NOT NULL DEFAULT 1,
           final_result TEXT, terminal_detail TEXT, final_branch_head TEXT, shutdown_reason TEXT,
           applied_provider TEXT, applied_model_id TEXT, applied_thinking_level TEXT,
+          launch_phase TEXT NOT NULL DEFAULT 'legacy', launch_packet TEXT,
+          launch_provider TEXT, launch_model_id TEXT, launch_thinking_level TEXT,
           control_version INTEGER NOT NULL DEFAULT 1, contract_version INTEGER NOT NULL DEFAULT 1,
           resume_wait_id TEXT UNIQUE REFERENCES wait_subscriptions(id),
           cause TEXT CHECK(cause IN ('initial', 'continuation', 'repair', 'review', 'retry')),
@@ -2435,9 +2516,14 @@ export class RuntimeStore {
       worker_boot_id AS workerBootId, worker_terminated AS workerTerminated,
       review_worktree AS reviewWorktree, review_worktree_root AS reviewWorktreeRoot,
       gate_pid AS gatePid, gate_pgid AS gatePgid, gate_start_identity AS gateStartIdentity,
-      gate_boot_id AS gateBootId, gate_state AS gateState, gate_terminated AS gateTerminated
+      gate_boot_id AS gateBootId, gate_state AS gateState, gate_terminated AS gateTerminated,
+      launch_phase AS launchPhase
       FROM attempts WHERE state IN ('starting', 'running', 'orphaned')
       OR (state = 'interrupted' AND worker_terminated = 0)
+      OR (worker_terminated = 0 AND state IN ('failed', 'stopped', 'interrupted', 'superseded'))
+      OR (worker_terminated = 0 AND id IN (
+        SELECT latest_attempt_id FROM tasks WHERE pending_attempt IS NOT NULL
+      ))
       OR gate_terminated = 0 OR gate_state IN ('running', 'ambiguous')
       OR (role = 'reviewer' AND review_worktree IS NOT NULL)
       ORDER BY started_at, id`)
@@ -2510,7 +2596,16 @@ export class RuntimeStore {
     const detail = reason
       ? `pi-sandd ${reason} could not prove safe local gate termination; the Task is blocked and its worktree was retained.`
       : "The prior local gate could not be safely identified or terminated. The Task is blocked and its worktree was retained.";
-    this.markBlocked(attempt.taskId, attempt.id, detail);
+    const task = this.#taskRow(attempt.taskId);
+    const pending = this.#pendingAttemptValue(task);
+    const pendingRetirement = Boolean(
+      pending &&
+      task?.latestAttemptId === attempt.id &&
+      pending.priorAttemptId === attempt.id,
+    );
+    this.markBlocked(attempt.taskId, attempt.id, detail, {
+      retainPending: pendingRetirement,
+    });
   }
 
   #reconcileGate(attempt) {
@@ -2619,13 +2714,73 @@ export class RuntimeStore {
     }
   }
 
+  #reconcileTerminalAttempt(attempt, { reason = null } = {}) {
+    const detail = reason
+      ? `pi-sandd ${reason} could not prove safe retirement of a terminal Attempt; the Task is blocked and its worktree was retained.`
+      : "A terminal Attempt still has an unretired worker; the Task is blocked until its ownership can be proven and it is safely retired.";
+    const hasWorkerIdentity = attempt.workerPid != null || attempt.workerPgid != null ||
+      attempt.workerStartIdentity != null || attempt.workerBootId != null;
+    if (!hasWorkerIdentity) {
+      this.markBlocked(attempt.taskId, attempt.id, detail);
+      return "orphaned";
+    }
+    if (
+      attempt.workerBootId &&
+      this.bootId &&
+      attempt.workerBootId !== this.bootId
+    ) {
+      this.db
+        .prepare("UPDATE attempts SET worker_terminated = 1 WHERE id = ? AND worker_terminated = 0")
+        .run(attempt.id);
+      return "terminated";
+    }
+    const status = processGroupStatus(attempt.workerPgid);
+    if (
+      status === "gone" ||
+      (status === "alive" && stopOwnedProcessGroupSync({
+        workerPid: attempt.workerPid,
+        workerPgid: attempt.workerPgid,
+        workerStartIdentity: attempt.workerStartIdentity,
+        workerBootId: attempt.workerBootId,
+      }, {
+        timeoutMs: this.workerStopTimeoutMs,
+        currentBootId: this.bootId,
+      }))
+    ) {
+      this.db
+        .prepare("UPDATE attempts SET worker_terminated = 1 WHERE id = ? AND worker_terminated = 0")
+        .run(attempt.id);
+      return "terminated";
+    }
+    this.markBlocked(attempt.taskId, attempt.id, detail);
+    return "orphaned";
+  }
+
   reconcileAttempt(attempt, { reason = null } = {}) {
+    if (
+      !ACTIVE_ATTEMPT_STATES.has(attempt.state) &&
+      attempt.state !== "parked_wait"
+    )
+      return this.#reconcileTerminalAttempt(attempt, { reason });
     if (
       attempt.state === "starting" &&
       attempt.workerPid == null &&
       attempt.workerPgid == null
     ) {
-      return "starting";
+      // A reserved launch has not crossed the spawn boundary and may be
+      // retried for the same durable Attempt. Any other PID-less starting row
+      // has an ambiguous spawn history; fail closed instead of relaunching a
+      // possibly live process under a second identity.
+      if (attempt.launchPhase === "reserved") return "reserved";
+      this.updateTaskForAttempt(
+        attempt,
+        "orphaned",
+        reason
+          ? `pi-sandd ${reason} found an ambiguous PID-less Fresh Executor launch; the Task is blocked.`
+          : "The Fresh Executor launch crossed an unrecorded process boundary; the Task is blocked and was not relaunched.",
+        reason,
+      );
+      return "orphaned";
     }
     const detail = reason
       ? `pi-sandd ${reason} could not prove safe worker termination; the Task is blocked and its worktree was retained.`
@@ -2684,12 +2839,111 @@ export class RuntimeStore {
     return "orphaned";
   }
 
+  #finalizePendingRetirement(attempt, pending, detail) {
+    const timestamp = now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const state = pending.operation === "correction" ? "superseded" : attempt.state;
+      const attemptUpdate = this.db
+        .prepare(`UPDATE attempts SET state = ?, finished_at = COALESCE(finished_at, ?),
+          terminal_detail = ?, worker_terminated = 1 WHERE id = ? AND task_id = ?`)
+        .run(state, timestamp, boundedDetail(detail), attempt.id, attempt.taskId);
+      if (attemptUpdate.changes !== 1)
+        throw new Error("Pending control mutation could not record prior Attempt retirement.");
+      if (pending.operation === "correction") {
+        this.db
+          .prepare(`UPDATE attempt_runs SET state = 'aborted',
+            settled_outcome = COALESCE(settled_outcome, ?), settled_at = COALESCE(settled_at, ?)
+            WHERE attempt_id = ? AND state IN ('pending', 'accepted')`)
+          .run(boundedDetail(detail), timestamp, attempt.id);
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+
+  #reconcilePendingRetirement(attempt, pending, { reason = null } = {}) {
+    const detail = reason
+      ? `pi-sandd ${reason} reconciled the prior Attempt for a pending ${pending.operation}.`
+      : `The prior Attempt was safely retired for the pending ${pending.operation}.`;
+    if (this.#gateUnresolved(attempt)) {
+      const gateOutcome = this.#reconcileGate(attempt);
+      if (gateOutcome === "ambiguous") {
+        this.#markGateBlocked(attempt, { reason });
+        return "orphaned";
+      }
+    }
+    if (attempt.workerTerminated === 1) {
+      this.#finalizePendingRetirement(attempt, pending, detail);
+      return "terminated";
+    }
+    const hasWorkerIdentity = attempt.workerPid != null || attempt.workerPgid != null ||
+      attempt.workerStartIdentity != null || attempt.workerBootId != null;
+    if (
+      attempt.state === "starting" &&
+      !hasWorkerIdentity &&
+      attempt.launchPhase === "reserved"
+    ) {
+      this.#finalizePendingRetirement(attempt, pending, detail);
+      return "reserved";
+    }
+    if (!hasWorkerIdentity) {
+      this.markBlocked(
+        attempt.taskId,
+        attempt.id,
+        reason
+          ? `pi-sandd ${reason} could not prove safe retirement of the prior Attempt; the Task was blocked.`
+          : "The prior Attempt for a pending control mutation has no safe worker identity; the Task was blocked.",
+        { retainPending: true },
+      );
+      return "orphaned";
+    }
+    if (
+      attempt.workerBootId &&
+      this.bootId &&
+      attempt.workerBootId !== this.bootId
+    ) {
+      this.#finalizePendingRetirement(attempt, pending, detail);
+      return "terminated";
+    }
+    const metadata = {
+      workerPid: attempt.workerPid,
+      workerPgid: attempt.workerPgid,
+      workerStartIdentity: attempt.workerStartIdentity,
+      workerBootId: attempt.workerBootId,
+    };
+    const status = processGroupStatus(attempt.workerPgid);
+    if (
+      status === "gone" ||
+      (status === "alive" && stopOwnedProcessGroupSync(metadata, {
+        timeoutMs: this.workerStopTimeoutMs,
+        currentBootId: this.bootId,
+      }))
+    ) {
+      this.#finalizePendingRetirement(attempt, pending, detail);
+      return "terminated";
+    }
+    this.markBlocked(
+      attempt.taskId,
+      attempt.id,
+      reason
+        ? `pi-sandd ${reason} could not prove safe retirement of the prior Attempt; the Task was blocked.`
+        : "The prior Attempt for a pending control mutation could not be safely retired; the Task was blocked.",
+      { retainPending: true },
+    );
+    return "orphaned";
+  }
+
   #reconcileReviewerAttempt(attempt, { reason = null } = {}) {
     let retirement = "retained";
     const hasWorkerIdentity = attempt.workerPid != null || attempt.workerPgid != null ||
       attempt.workerStartIdentity != null || attempt.workerBootId != null;
     if (ACTIVE_ATTEMPT_STATES.has(attempt.state) || attempt.workerTerminated !== 1) {
-      if (attempt.state === "starting" && !hasWorkerIdentity) {
+      if (attempt.state === "starting" && !hasWorkerIdentity && attempt.launchPhase === "reserved") {
+        retirement = "reserved";
+      } else if (attempt.state === "starting" && !hasWorkerIdentity) {
         this.updateTaskForAttempt(attempt, "interrupted", reason
           ? `pi-sandd ${reason} interrupted an unstarted semantic reviewer.`
           : RESTART_DETAIL, reason);
@@ -2720,11 +2974,194 @@ export class RuntimeStore {
         this.#markGateBlocked(attempt, { reason });
         continue;
       }
+      const taskRow = this.#taskRow(attempt.taskId);
+      const pending = this.#pendingAttemptValue(taskRow);
+      if (
+        pending &&
+        taskRow.latestAttemptId === attempt.id &&
+        pending.priorAttemptId === attempt.id
+      ) {
+        this.#reconcilePendingRetirement(attempt, pending, { reason });
+        continue;
+      }
       if (attempt.role === "reviewer" && attempt.reviewWorktree) {
         this.#reconcileReviewerAttempt(attempt, { reason });
         continue;
       }
       this.reconcileAttempt(attempt, { reason });
+    }
+  }
+
+  async recoverPersistedAttempts() {
+    this.ensureSupported();
+    this.open();
+    this.#assertNotShuttingDown();
+    if (this.recoveryPromise) return this.recoveryPromise;
+    this.recoveryPromise = (async () => {
+      // Capture the pre-spawn rows before resuming pending control mutations;
+      // a mutation resumed below creates its own reserved row and must not be
+      // launched a second time by this pass.
+      const reserved = this.db
+        .prepare(`${ATTEMPT_SELECT} WHERE state = 'starting' AND launch_phase = 'reserved' ORDER BY started_at, id`)
+        .all();
+      const pendingTasks = this.db
+        .prepare(`${TASK_SELECT} WHERE pending_attempt IS NOT NULL ORDER BY updated_at, id`)
+        .all();
+      const recovered = [];
+
+      for (const taskRow of pendingTasks) {
+        const pending = this.#pendingAttemptValue(taskRow);
+        const task = this.getTask(taskRow.id);
+        const prior = pending?.priorAttemptId
+          ? this.db
+              .prepare(`${ATTEMPT_SELECT} WHERE id = ? AND task_id = ?`)
+              .get(pending.priorAttemptId, taskRow.id)
+          : null;
+        const pendingValid = this.#validPendingAttempt(pending);
+        const pendingRetirement = Boolean(
+          task &&
+          pendingValid &&
+          taskRow.latestAttemptId === (pending.priorAttemptId ?? null) &&
+          Number(taskRow.controlVersion) === pending.controlVersion &&
+          Number(taskRow.contractVersion) === pending.contractVersion &&
+          prior &&
+          !ACTIVE_ATTEMPT_STATES.has(prior.state),
+        );
+        // An unsafe retirement deliberately retains the pending marker while
+        // blocking the Task. Startup may retry only the retirement proof; it
+        // must never allocate a replacement for a blocked Task. Once the
+        // prior worker is proven gone, discard that now-terminal intent.
+        if (taskRow.state === "blocked" && pendingRetirement) {
+          const gateResolved =
+            prior.gateTerminated === 1 && !ACTIVE_GATE_STATES.has(prior.gateState);
+          if (prior.workerTerminated === 1 && gateResolved)
+            this.db
+              .prepare("UPDATE tasks SET pending_attempt = NULL WHERE id = ? AND pending_attempt = ?")
+              .run(taskRow.id, taskRow.pendingAttempt);
+          continue;
+        }
+        const valid =
+          task &&
+          pendingValid &&
+          taskRow.state === "accepted" &&
+          taskRow.latestAttemptId === (pending.priorAttemptId ?? null) &&
+          Number(taskRow.controlVersion) === pending.controlVersion &&
+          Number(taskRow.contractVersion) === pending.contractVersion &&
+          (!prior || !ACTIVE_ATTEMPT_STATES.has(prior.state));
+        if (!valid) {
+          const current = this.#taskRow(taskRow.id);
+          if (
+            current?.pendingAttempt === taskRow.pendingAttempt &&
+            current.latestAttemptId === taskRow.latestAttemptId &&
+            Number(current.controlVersion) === Number(taskRow.controlVersion) &&
+            Number(current.contractVersion) === Number(taskRow.contractVersion)
+          )
+            this.markBlocked(
+              current.id,
+              current.latestAttemptId,
+              "A pending control mutation could not be safely reconstructed; the Task was blocked and no replacement Attempt was allocated.",
+            );
+          continue;
+        }
+        try {
+          await this.#waitForRemotePublications(taskRow.id);
+          this.#assertCommitmentActive(this.getTask(taskRow.id));
+          if (this.#hasUnknownRemoteEffects(taskRow.id))
+            await this.#reconcileUnknownRemoteEffects(taskRow.id);
+          this.#assertCommitmentActive(this.getTask(taskRow.id));
+          const allocation = this.#allocatePendingAttempt(taskRow.id, taskRow.pendingAttempt);
+          try {
+            recovered.push(await this.launchAttempt({
+              task: allocation.task,
+              attemptId: allocation.pending.attemptId,
+              number: allocation.pending.number,
+              model: { provider: allocation.pending.provider, id: allocation.pending.modelId },
+              thinkingLevel: allocation.pending.thinkingLevel,
+              packet: allocation.pending.packet,
+              priorState: allocation.pending.priorState ?? allocation.pending.operation,
+              priorDetail: allocation.pending.priorDetail,
+            }));
+          } catch (error) {
+            recovered.push({ attemptId: allocation.pending.attemptId, error });
+          }
+        } catch (error) {
+          const current = this.#taskRow(taskRow.id);
+          if (
+            current?.pendingAttempt === taskRow.pendingAttempt &&
+            current.latestAttemptId === taskRow.latestAttemptId &&
+            Number(current.controlVersion) === Number(taskRow.controlVersion) &&
+            Number(current.contractVersion) === Number(taskRow.contractVersion) &&
+            current.state === "accepted" &&
+            error?.code !== "runtime_shutting_down"
+          )
+            this.markBlocked(current.id, current.latestAttemptId, error.message);
+        }
+      }
+
+      for (const attempt of reserved) {
+        const taskRow = this.#taskRow(attempt.taskId);
+        const task = taskRow ? this.getTask(attempt.taskId) : null;
+        const configuredProvider = attempt.configuredProvider;
+        const configuredModelId = attempt.configuredModelId;
+        const configuredThinkingLevel = attempt.configuredThinkingLevel;
+        const wait = attempt.resumeWaitId
+          ? this.db.prepare(`${WAIT_SUBSCRIPTION_SELECT} WHERE id = ?`).get(attempt.resumeWaitId)
+          : null;
+        const ownsReservedAttempt =
+          taskRow &&
+          taskRow.latestAttemptId === attempt.id &&
+          Number(taskRow.controlVersion) === Number(attempt.controlVersion) &&
+          Number(taskRow.contractVersion) === Number(attempt.contractVersion);
+        const valid =
+          ownsReservedAttempt &&
+          task &&
+          ["accepted", "running"].includes(taskRow.state) &&
+          typeof configuredProvider === "string" && configuredProvider &&
+          typeof configuredModelId === "string" && configuredModelId &&
+          typeof configuredThinkingLevel === "string" && configuredThinkingLevel &&
+          typeof attempt.launchPacket === "string" &&
+          Buffer.byteLength(attempt.launchPacket, "utf8") <= MAX_TASK_PACKET_LENGTH &&
+          (!attempt.resumeWaitId || (
+            wait &&
+            wait.status === "triggered" &&
+            wait.continuationAttemptId === attempt.id
+          ));
+        if (!ownsReservedAttempt) continue;
+        if (!valid || this.active) {
+          this.updateTaskForAttempt(
+            attempt,
+            "orphaned",
+            this.active
+              ? "The daemon recovered another Attempt first; this reserved Attempt was blocked without launching a second worker."
+              : "A reserved Fresh Executor Attempt could not be safely reconstructed; the Task was blocked and no replacement Attempt was allocated.",
+          );
+          continue;
+        }
+        try {
+          recovered.push(await this.launchAttempt({
+            task,
+            attemptId: attempt.id,
+            number: attempt.number,
+            model: { provider: configuredProvider, id: configuredModelId },
+            thinkingLevel: configuredThinkingLevel,
+            packet: attempt.launchPacket,
+            priorState: attempt.cause ?? "recovered",
+            priorDetail: "The daemon recovered the same durable Attempt after a pre-spawn crash.",
+            role: attempt.role,
+            reviewWorktree: attempt.reviewWorktree,
+            reviewWorktreeRoot: attempt.reviewWorktreeRoot,
+            reviewCandidateSha: attempt.role === "reviewer" ? task.finalRevision : null,
+          }));
+        } catch (error) {
+          recovered.push({ attemptId: attempt.id, error });
+        }
+      }
+      return recovered;
+    })();
+    try {
+      return await this.recoveryPromise;
+    } finally {
+      this.recoveryPromise = null;
     }
   }
 
@@ -2789,8 +3226,237 @@ export class RuntimeStore {
     );
   }
 
+  #withControlMutation(action) {
+    this.#assertNotShuttingDown();
+    const previous = this.controlMutationTail;
+    let release;
+    const current = new Promise((resolveMutation) => {
+      release = resolveMutation;
+    });
+    this.controlMutationTail = current;
+    const execute = async () => {
+      try {
+        // A failed control request must not poison the serialized tail; the
+        // next request still needs to run after its durable effects settle.
+        if (previous) await previous.catch(() => {});
+        return await action();
+      } finally {
+        release();
+        if (this.controlMutationTail === current)
+          this.controlMutationTail = null;
+      }
+    };
+    return execute();
+  }
+
+  async #trackRuntimeOperation(action) {
+    this.#assertNotShuttingDown();
+    const run = Promise.resolve().then(action);
+    this.runtimeOperationRuns.add(run);
+    try {
+      return await run;
+    } finally {
+      this.runtimeOperationRuns.delete(run);
+    }
+  }
+
+  async #waitForRuntimeOperations() {
+    while (this.runtimeOperationRuns.size > 0)
+      await Promise.allSettled([...this.runtimeOperationRuns]);
+  }
+
+  async #trackRemotePublication(taskId, action) {
+    const runs = this.remotePublicationRuns.get(taskId) ?? new Set();
+    const run = Promise.resolve().then(action);
+    runs.add(run);
+    this.remotePublicationRuns.set(taskId, runs);
+    try {
+      return await run;
+    } finally {
+      runs.delete(run);
+      if (runs.size === 0 && this.remotePublicationRuns.get(taskId) === runs)
+        this.remotePublicationRuns.delete(taskId);
+    }
+  }
+
+  async #waitForRemotePublications(taskId = null) {
+    if (taskId != null) {
+      const runs = this.remotePublicationRuns.get(taskId);
+      if (!runs || runs.size === 0) return;
+      await Promise.allSettled([...runs]);
+      return;
+    }
+    while (true) {
+      const runs = [...this.remotePublicationRuns.values()].flatMap((items) => [...items]);
+      if (runs.length === 0) return;
+      await Promise.allSettled(runs);
+    }
+  }
+
   #taskRow(id) {
     return this.db.prepare(`${TASK_SELECT} WHERE id = ?`).get(id);
+  }
+
+  #pendingAttemptRecord(fields) {
+    const pending = {
+      operation: fields.operation,
+      attemptId: fields.attemptId,
+      priorAttemptId: fields.priorAttemptId ?? null,
+      number: fields.number,
+      cause: fields.cause,
+      priorState: fields.priorState ?? null,
+      priorDetail: fields.priorDetail ?? null,
+      packet: fields.packet,
+      provider: fields.provider,
+      modelId: fields.modelId,
+      thinkingLevel: fields.thinkingLevel,
+      controlVersion: fields.controlVersion,
+      contractVersion: fields.contractVersion,
+    };
+    const encoded = JSON.stringify(pending);
+    if (Buffer.byteLength(encoded, "utf8") > MAX_PENDING_ATTEMPT_LENGTH)
+      throw new Error("Pending Attempt recovery state exceeds the bounded size limit.");
+    return { pending, encoded };
+  }
+
+  #pendingAttemptValue(taskRow) {
+    if (typeof taskRow?.pendingAttempt !== "string" || !taskRow.pendingAttempt)
+      return null;
+    const pending = parsed(taskRow.pendingAttempt, null);
+    if (!pending || typeof pending !== "object" || Array.isArray(pending))
+      return null;
+    return pending;
+  }
+
+  #validPendingAttempt(pending) {
+    return Boolean(
+      pending &&
+      ["correction", "retry"].includes(pending.operation) &&
+      typeof pending.attemptId === "string" &&
+      pending.attemptId.length > 0 &&
+      (pending.priorAttemptId == null || typeof pending.priorAttemptId === "string") &&
+      Number.isInteger(pending.number) &&
+      pending.number > 0 &&
+      ["initial", "retry"].includes(pending.cause) &&
+      (pending.priorState == null || typeof pending.priorState === "string") &&
+      (pending.priorDetail == null || typeof pending.priorDetail === "string") &&
+      typeof pending.packet === "string" &&
+      Buffer.byteLength(pending.packet, "utf8") <= MAX_TASK_PACKET_LENGTH &&
+      Buffer.byteLength(JSON.stringify(pending), "utf8") <= MAX_PENDING_ATTEMPT_LENGTH &&
+      typeof pending.provider === "string" &&
+      pending.provider.length > 0 &&
+      typeof pending.modelId === "string" &&
+      pending.modelId.length > 0 &&
+      typeof pending.thinkingLevel === "string" &&
+      pending.thinkingLevel.length > 0 &&
+      Number.isInteger(pending.controlVersion) &&
+      pending.controlVersion > 0 &&
+      Number.isInteger(pending.contractVersion) &&
+      pending.contractVersion > 0
+    );
+  }
+
+  #allocatePendingAttempt(taskId, expectedEncoded) {
+    this.#assertNotShuttingDown();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.#taskRow(taskId);
+      const pending = this.#pendingAttemptValue(current);
+      const prior = pending?.priorAttemptId
+        ? this.db
+            .prepare(`${ATTEMPT_SELECT} WHERE id = ? AND task_id = ?`)
+            .get(pending.priorAttemptId, taskId)
+        : null;
+      if (
+        !current ||
+        !pending ||
+        !this.#validPendingAttempt(pending) ||
+        (pending.priorAttemptId != null && !prior) ||
+        (prior && ACTIVE_ATTEMPT_STATES.has(prior.state)) ||
+        current.pendingAttempt !== expectedEncoded ||
+        current.state !== "accepted" ||
+        current.latestAttemptId !== (pending.priorAttemptId ?? null) ||
+        Number(current.controlVersion) !== pending.controlVersion ||
+        Number(current.contractVersion) !== pending.contractVersion
+      )
+        throw new Error(`Task ${taskId} changed before its pending Attempt could be allocated.`);
+      this.#assertCommitmentActive(current);
+      const timestamp = now();
+      this.db
+        .prepare(`INSERT INTO attempts (
+          id, task_id, number, provider, model_id, thinking_level, launch_phase, launch_packet,
+          launch_provider, launch_model_id, launch_thinking_level,
+          control_version, contract_version, state, started_at, worker_terminated, cause
+        ) VALUES (?, ?, ?, NULL, NULL, NULL, 'reserved', ?, ?, ?, ?, ?, ?, 'starting', ?, 0, ?)`)
+        .run(
+          pending.attemptId,
+          taskId,
+          pending.number,
+          pending.packet,
+          pending.provider,
+          pending.modelId,
+          pending.thinkingLevel,
+          pending.controlVersion,
+          pending.contractVersion,
+          timestamp,
+          pending.cause,
+        );
+      const latestPredicate = pending.priorAttemptId == null
+        ? "latest_attempt_id IS NULL"
+        : "latest_attempt_id = ?";
+      const taskParams = pending.priorAttemptId == null
+        ? [pending.attemptId, timestamp, taskId, pending.controlVersion, pending.contractVersion, expectedEncoded]
+        : [pending.attemptId, timestamp, taskId, pending.priorAttemptId, pending.controlVersion, pending.contractVersion, expectedEncoded];
+      const taskUpdate = this.db
+        .prepare(`UPDATE tasks SET latest_attempt_id = ?, pending_attempt = NULL, updated_at = ?
+          WHERE id = ? AND state = 'accepted' AND ${latestPredicate}
+            AND control_version = ? AND contract_version = ? AND pending_attempt = ?`)
+        .run(...taskParams);
+      if (taskUpdate.changes !== 1)
+        throw new Error(`Task ${taskId} pending Attempt allocation fence was lost.`);
+      this.db
+        .prepare(`INSERT INTO attempt_runs (
+          attempt_id, sequence, kind, control_version, contract_version, prompt_digest, state, evidence_refs, started_at
+        ) VALUES (?, 1, 'initial', ?, ?, ?, 'pending', '[]', ?)`)
+        .run(
+          pending.attemptId,
+          pending.controlVersion,
+          pending.contractVersion,
+          promptDigest(pending.packet),
+          timestamp,
+        );
+      this.db.exec("COMMIT");
+      return {
+        pending,
+        task: {
+          id: current.id,
+          sourceRepoRoot: current.sourceRepoRoot,
+          baseCommit: current.baseCommit,
+          taskBranch: current.taskBranch,
+          taskWorktree: current.taskWorktree,
+          goal: current.goal,
+          contractVersion: pending.contractVersion,
+          controlVersion: pending.controlVersion,
+        },
+      };
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+
+  #hasCurrentLaunchableAttempt(taskRow) {
+    if (!taskRow?.latestAttemptId) return false;
+    const attempt = this.db
+      .prepare(`SELECT state, control_version AS controlVersion, contract_version AS contractVersion
+        FROM attempts WHERE id = ? AND task_id = ?`)
+      .get(taskRow.latestAttemptId, taskRow.id);
+    return Boolean(
+      attempt &&
+      ACTIVE_ATTEMPT_STATES.has(attempt.state) &&
+      Number(attempt.controlVersion) === Number(taskRow.controlVersion) &&
+      Number(attempt.contractVersion) === Number(taskRow.contractVersion),
+    );
   }
 
   #taskAttemptRows(id) {
@@ -2904,7 +3570,18 @@ export class RuntimeStore {
           "The transmitted remote effect could not be reconciled at its exact endpoint.",
         );
       }
-      if (authority.remoteUrlDigest !== effect.remoteUrlDigest) {
+      if (!authority) {
+        throw this.#remotePublicationFailure(
+          effect.id,
+          "remote_readback_unknown",
+          "The transmitted remote effect has no current exact endpoint authority.",
+        );
+      }
+      if (
+        authority.remote !== effect.remote ||
+        authority.repositoryId !== effect.repository ||
+        authority.remoteUrlDigest !== effect.remoteUrlDigest
+      ) {
         this.#updateRemoteEffect(effect.id, "conflict", {
           detail: "The transmitted remote effect endpoint changed before readback.",
           transmitted: false,
@@ -3007,11 +3684,20 @@ export class RuntimeStore {
     return candidate.toLowerCase();
   }
 
-  async publishTask({ id, candidateSha }) {
+  async publishTask(options) {
+    const taskId = String(options?.id ?? "").trim();
+    if (!taskId) return this.#publishTask(options);
+    this.open();
+    this.#assertNotShuttingDown();
+    return this.#trackRemotePublication(taskId, () => this.#publishTask(options));
+  }
+
+  async #publishTask({ id, candidateSha }) {
     this.ensureSupported();
     if (typeof id !== "string" || !id.trim())
       throw new Error("Remote publication requires a Task id.");
     this.open();
+    this.#assertNotShuttingDown();
     const taskId = id.trim();
     let taskRow = this.#taskRow(taskId);
     if (!taskRow) throw new Error(`Task ${taskId} was not found.`);
@@ -3023,6 +3709,12 @@ export class RuntimeStore {
     if (!REMOTE_PUBLICATION_TASK_STATES.has(taskRow.state)) {
       throw Object.assign(
         new Error("Remote publication requires an accepted or running Task."),
+        { code: "remote_task_ineligible" },
+      );
+    }
+    if (!this.#hasCurrentLaunchableAttempt(taskRow)) {
+      throw Object.assign(
+        new Error("Remote publication requires the current control version's active Attempt."),
         { code: "remote_task_ineligible" },
       );
     }
@@ -3055,9 +3747,15 @@ export class RuntimeStore {
     const latestConfirmed = this.db
       .prepare(`${REMOTE_EFFECT_SELECT}
         WHERE task_id = ? AND ref = ? AND state = 'confirmed'
-          AND control_version = ? AND contract_version = ?
+          AND remote = ? AND repository = ? AND remote_url_digest = ?
         ORDER BY confirmed_at DESC, created_at DESC, id DESC LIMIT 1`)
-      .get(taskId, ref, capturedControlVersion, capturedContractVersion);
+      .get(
+        taskId,
+        ref,
+        authority.remote,
+        authority.repositoryId,
+        authority.remoteUrlDigest,
+      );
     const priorEffect = this.db
       .prepare(`${REMOTE_EFFECT_SELECT}
         WHERE task_id = ? AND ref = ? AND new_oid = ?
@@ -3239,6 +3937,7 @@ export class RuntimeStore {
         !remoteStillAuthorized ||
         !taskRow ||
         !REMOTE_PUBLICATION_TASK_STATES.has(taskRow.state) ||
+        !this.#hasCurrentLaunchableAttempt(taskRow) ||
         !currentAuthority ||
         !snapshotsEqual(currentAuthority, authority) ||
         Number(taskRow.controlVersion) !== capturedControlVersion ||
@@ -3332,6 +4031,7 @@ export class RuntimeStore {
     if (
       !transmitTask ||
       !REMOTE_PUBLICATION_TASK_STATES.has(transmitTask.state) ||
+      !this.#hasCurrentLaunchableAttempt(transmitTask) ||
       Number(transmitTask.controlVersion) !== capturedControlVersion ||
       Number(transmitTask.contractVersion) !== capturedContractVersion ||
       !transmitEffect ||
@@ -3372,9 +4072,12 @@ export class RuntimeStore {
       this.#updateRemoteEffect(effect.id, "transmitted_unknown", {
         detail: "Remote Git readback failure.",
       });
-      throw new Error("Remote publication outcome is unknown; exact readback failed.", {
-        cause: error,
-      });
+      throw Object.assign(
+        new Error("Remote publication outcome is unknown; exact readback failed.", {
+          cause: error,
+        }),
+        { code: "remote_readback_unknown", remoteEffect: remoteEffectSnapshot(this.#remoteEffectRow(effect.id)) },
+      );
     }
 
     // A control mutation may commit while the transport is in flight. Never
@@ -3393,9 +4096,12 @@ export class RuntimeStore {
         this.#updateRemoteEffect(effect.id, "transmitted_unknown", {
           detail: "Remote Git readback failed after a control mutation.",
         });
-        throw new Error("Remote publication outcome remains unknown; exact readback failed after control mutation.", {
-          cause: error,
-        });
+        throw Object.assign(
+          new Error("Remote publication outcome remains unknown; exact readback failed after control mutation.", {
+            cause: error,
+          }),
+          { code: "remote_readback_unknown", remoteEffect: remoteEffectSnapshot(this.#remoteEffectRow(effect.id)) },
+        );
       }
       if (readback === newOid) {
         this.#updateRemoteEffect(effect.id, "confirmed", {
@@ -3815,7 +4521,15 @@ export class RuntimeStore {
     }
   }
 
-  async registerWaitSubscription({
+  async registerWaitSubscription(options = {}) {
+    this.open();
+    this.#assertNotShuttingDown();
+    return this.#trackRuntimeOperation(() =>
+      this.#registerWaitSubscription(options),
+    );
+  }
+
+  async #registerWaitSubscription({
     id,
     taskId,
     task_id,
@@ -3846,6 +4560,7 @@ export class RuntimeStore {
     if (!targetTaskId)
       throw new Error("Wait registration requires a Task id.");
     this.open();
+    this.#assertNotShuttingDown();
 
     const taskRow = this.#taskRow(targetTaskId);
     if (!taskRow)
@@ -4119,13 +4834,15 @@ export class RuntimeStore {
     // been proven. In particular, a live local gate must remain unresolved in
     // durable state when cancellation is ambiguous.
     const active = this.active?.attemptId === latestAttemptId ? this.active : null;
-    let gateRetired = true;
-    if (active) gateRetired = this.#cancelLocalGate(active);
-    if (!gateRetired) {
+    let gateRetired = active
+      ? this.#cancelLocalGate(active)
+      : this.#reconcileGate(attemptRow) !== "ambiguous";
+    if (gateRetired) {
       const gateAttempt = this.db
         .prepare(`${ATTEMPT_SELECT} WHERE id = ? AND task_id = ?`)
         .get(latestAttemptId, targetTaskId);
-      gateRetired = this.#reconcileGate(gateAttempt) === "terminated";
+      if (this.#gateUnresolved(gateAttempt))
+        gateRetired = this.#reconcileGate(gateAttempt) !== "ambiguous";
     }
     if (!gateRetired) {
       this.markBlocked(
@@ -4169,6 +4886,7 @@ export class RuntimeStore {
       );
     }
 
+    this.#assertNotShuttingDown();
     let generation;
     try {
       this.db.exec("BEGIN IMMEDIATE");
@@ -5044,6 +5762,7 @@ export class RuntimeStore {
       ? resultTimestamp(() => nowOverride)
       : now();
 
+    this.#assertNotShuttingDown();
     let taskToLaunch = null;
     let newAttemptId = null;
     let newAttemptNumber = null;
@@ -5053,6 +5772,7 @@ export class RuntimeStore {
     let repairDetail = null;
     let reviewWorktree = null;
     let reviewWorktreeRoot = null;
+    let reviewCandidateSha = null;
     let reviewPacket = null;
     let reviewAttemptId = null;
     let reviewAttemptNumber = null;
@@ -5266,12 +5986,13 @@ export class RuntimeStore {
           const reviewerCount = this.#getTaskReviewerAttemptsCount(taskRow.id);
           if (reviewerCount >= normalizeBudget(taskRow.budget).maxReviewerAttempts)
             throw new Error("Task semantic reviewer budget exhausted.");
-          reviewWorktree = this.#reviewWorktree(taskRow, waitRow.revisionSha);
+          reviewCandidateSha = waitRow.revisionSha;
+          reviewWorktree = this.#reviewWorktree(taskRow, reviewCandidateSha);
           reviewWorktreeRoot = this.#reviewWorktreeRoot(taskRow);
           reviewPacket = buildSemanticReviewContext({
             task: taskRow,
-            candidateSha: waitRow.revisionSha,
-            deterministicEvidence: this.#reviewDeterministicEvidence(taskRow, waitRow.revisionSha, allEvidenceIds),
+            candidateSha: reviewCandidateSha,
+            deterministicEvidence: this.#reviewDeterministicEvidence(taskRow, reviewCandidateSha, allEvidenceIds),
             remainingReviewerAttempts: normalizeBudget(taskRow.budget).maxReviewerAttempts - reviewerCount - 1,
           });
           const reviewerSource = this.db.prepare("SELECT applied_provider AS provider, applied_model_id AS modelId, applied_thinking_level AS thinkingLevel FROM attempts WHERE task_id = ? AND role = 'executor' AND applied_provider IS NOT NULL ORDER BY number DESC LIMIT 1").get(taskRow.id);
@@ -5293,8 +6014,10 @@ export class RuntimeStore {
             .run(timestamp, `Exact CI evidence passed; semantic review required (${reviewTrigger}).`, waitRow.revisionSha, waitRow.createdByAttemptId, taskRow.id);
           if (parkedAttemptUpdate.changes !== 1)
             throw new Error("Parked Attempt CAS failed when allocating semantic reviewer after CI.");
-          this.db.prepare("INSERT INTO attempts (id, task_id, number, role, review_worktree, review_worktree_root, control_version, contract_version, state, started_at, worker_terminated, cause) VALUES (?, ?, ?, 'reviewer', ?, ?, ?, ?, 'starting', ?, 0, 'review')")
-            .run(reviewAttemptId, taskRow.id, reviewAttemptNumber, reviewWorktree, reviewWorktreeRoot, taskRow.controlVersion, taskRow.contractVersion, timestamp);
+          this.db.prepare("INSERT INTO attempts (id, task_id, number, role, review_worktree, review_worktree_root, provider, model_id, thinking_level, launch_phase, launch_packet, launch_provider, launch_model_id, launch_thinking_level, control_version, contract_version, state, started_at, worker_terminated, cause) VALUES (?, ?, ?, 'reviewer', ?, ?, NULL, NULL, NULL, 'reserved', ?, ?, ?, ?, ?, ?, 'starting', ?, 0, 'review')")
+            .run(reviewAttemptId, taskRow.id, reviewAttemptNumber, reviewWorktree, reviewWorktreeRoot,
+              reviewPacket, effectiveModel.provider, effectiveModel.id, effectiveThinkingLevel,
+              taskRow.controlVersion, taskRow.contractVersion, timestamp);
           this.db.prepare("INSERT INTO attempt_runs (attempt_id, sequence, kind, control_version, contract_version, prompt_digest, state, evidence_refs, started_at) VALUES (?, 1, 'review', ?, ?, ?, 'pending', ?, ?)")
             .run(reviewAttemptId, taskRow.controlVersion, taskRow.contractVersion, promptDigest(reviewPacket), evidenceRefsJson, timestamp);
           const taskUpdate = this.db.prepare("UPDATE tasks SET latest_attempt_id = ?, state = 'running', updated_at = ? WHERE id = ? AND state = 'waiting' AND latest_attempt_id = ? AND control_version = ? AND contract_version = ?")
@@ -5598,13 +6321,18 @@ export class RuntimeStore {
           .prepare(
             `INSERT INTO attempts (
               id, task_id, number, provider, model_id, thinking_level,
+              launch_phase, launch_packet, launch_provider, launch_model_id, launch_thinking_level,
               control_version, contract_version, state, started_at, worker_terminated, resume_wait_id, cause
-            ) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?, 'starting', ?, 0, ?, 'repair')`,
+            ) VALUES (?, ?, ?, NULL, NULL, NULL, 'reserved', ?, ?, ?, ?, ?, ?, 'starting', ?, 0, ?, 'repair')`,
           )
           .run(
             freshAttemptId,
             taskRow.id,
             nextNumber,
+            launchPacket,
+            effectiveModel.provider,
+            effectiveModel.id,
+            effectiveThinkingLevel,
             taskRow.controlVersion,
             taskRow.contractVersion,
             timestamp,
@@ -5733,7 +6461,7 @@ export class RuntimeStore {
         role: "reviewer",
         reviewWorktree,
         reviewWorktreeRoot,
-        reviewCandidateSha: this.#taskRow(targetTaskId).finalRevision,
+        reviewCandidateSha,
       });
     }
     if (newAttemptId && taskToLaunch && !skipSpawn) {
@@ -6016,7 +6744,7 @@ export class RuntimeStore {
         FROM wait_subscriptions WHERE status = 'active'`)
       .get()?.nextReconcileAt;
     const nextTime = next ? new Date(next).getTime() : Number.NaN;
-    const delay = Number.isFinite(nextTime)
+    const delay = Number.isFinite(currentTime) && Number.isFinite(nextTime)
       ? Math.max(0, nextTime - currentTime)
       : WAIT_REACTOR_IDLE_INTERVAL_MS;
     this.waitReactorTimer = this.waitTimer.setTimeout(() => {
@@ -6060,6 +6788,7 @@ export class RuntimeStore {
 
   async startWaitReactor({ observer, skipSpawn = false, model, thinkingLevel } = {}) {
     this.open();
+    this.#assertNotShuttingDown();
     if (observer) this.waitObserver = observer;
     this.waitReactorEnabled = true;
     try {
@@ -6088,13 +6817,16 @@ export class RuntimeStore {
     const dueOnly = options.dueOnly === true;
     const nowValue = options.now ?? this.waitClock();
     const nowTime = new Date(nowValue).getTime();
-    const rows = dueOnly
+    const nowIso = Number.isFinite(nowTime)
+      ? new Date(nowTime).toISOString()
+      : null;
+    const rows = dueOnly && nowIso
       ? this.db
           .prepare(`SELECT id FROM wait_subscriptions
             WHERE status = 'active' AND
               (next_reconcile_at IS NULL OR next_reconcile_at <= ?)
             ORDER BY created_at, id`)
-          .all(new Date(nowTime).toISOString())
+          .all(nowIso)
       : this.db
           .prepare(
             "SELECT id FROM wait_subscriptions WHERE status = 'active' ORDER BY created_at, id",
@@ -6382,6 +7114,7 @@ export class RuntimeStore {
       throw new Error("/task requires an installed Pi 0.84.4 executable.");
 
     this.open();
+    this.#assertNotShuttingDown();
     if (this.hasCapacityConflict())
       throw new Error(
         "A Fresh Executor is already active or unresolved; v0.3 does not queue Tasks.",
@@ -6451,11 +7184,16 @@ export class RuntimeStore {
         );
       this.db
         .prepare(`INSERT INTO attempts (id, task_id, number, provider, model_id, thinking_level,
+          launch_phase, launch_packet, launch_provider, launch_model_id, launch_thinking_level,
           control_version, contract_version, state, started_at, worker_terminated, cause)
-        VALUES (?, ?, 1, NULL, NULL, NULL, ?, ?, 'starting', ?, 0, 'initial')`)
+        VALUES (?, ?, 1, NULL, NULL, NULL, 'reserved', ?, ?, ?, ?, ?, ?, 'starting', ?, 0, 'initial')`)
         .run(
           attemptId,
           taskId,
+          packet,
+          model.provider,
+          model.id,
+          thinkingLevel,
           COMMITMENT_CONTROL_VERSION,
           COMMITMENT_CONTRACT_VERSION,
           timestamp,
@@ -6507,11 +7245,20 @@ export class RuntimeStore {
     });
   }
 
+  #setAttemptLaunchPhase(attemptId, phase) {
+    const result = this.db
+      .prepare("UPDATE attempts SET launch_phase = ? WHERE id = ? AND state = 'starting'")
+      .run(phase, attemptId);
+    if (result.changes !== 1)
+      throw new Error("Fresh Executor launch phase could not be recorded.");
+  }
+
   #recordAttemptWorker(attemptId, worker) {
     const metadata = workerMetadata(worker);
     if (!metadata) return null;
     this.db
-      .prepare(`UPDATE attempts SET worker_pid = ?, worker_pgid = ?, worker_start_identity = ?, worker_boot_id = ?, worker_terminated = 0
+      .prepare(`UPDATE attempts SET worker_pid = ?, worker_pgid = ?, worker_start_identity = ?, worker_boot_id = ?, worker_terminated = 0,
+        launch_phase = 'recorded'
       WHERE id = ? AND state = 'starting'`)
       .run(
         metadata.workerPid,
@@ -6647,6 +7394,7 @@ export class RuntimeStore {
   }
 
   #assertAttemptLaunchCurrent(task, attemptId, controlVersion, contractVersion) {
+    this.#assertNotShuttingDown();
     const row = this.db
       .prepare(`SELECT 1 AS eligible FROM tasks AS t
         JOIN attempts AS a ON a.task_id = t.id AND a.id = t.latest_attempt_id
@@ -6662,6 +7410,7 @@ export class RuntimeStore {
         contractVersion,
       );
     if (!row) throw new Error("Fresh Executor Attempt is stale before launch.");
+    this.#assertCommitmentActive(this.#taskRow(task.id));
   }
 
   #reconcileInitialPromptStale(active, detail, { workerUnsafe = false } = {}) {
@@ -6796,6 +7545,7 @@ export class RuntimeStore {
     reviewWorktreeRoot = null,
     reviewCandidateSha = null,
   }) {
+    this.#assertNotShuttingDown();
     const taskPacket =
       packet ??
       buildTaskPacket({
@@ -6870,6 +7620,7 @@ export class RuntimeStore {
         active.controlVersion,
         active.contractVersion,
       );
+      this.#setAttemptLaunchPhase(attemptId, "spawning");
       assertTaskWorktreeIdentity(task);
       const workerFactory = active.role === "reviewer" ? this.reviewerFactory : this.workerFactory;
       const worker = await workerFactory({
@@ -6924,6 +7675,8 @@ export class RuntimeStore {
       if (metadata) {
         active.workerMetadata =
           this.#recordAttemptWorker(attemptId, metadata) ?? metadata;
+      } else {
+        this.#setAttemptLaunchPhase(attemptId, "recorded");
       }
       if (
         (worker?.pid != null || worker?.processGroupId != null) &&
@@ -7393,10 +8146,12 @@ export class RuntimeStore {
   }
 
   async #startFreshLocalRepair(active, task, gateResult, candidateSha, evidenceRefs = []) {
+    this.#assertNotShuttingDown();
     const budget = normalizeBudget(task.budget);
     const attemptsCount = this.#getTaskAttemptsCount(task.id);
     const codeAttemptsCount = this.#getTaskCodeAttemptsCount(task.id);
     const startupFailuresCount = this.#getTaskStartupFailuresCount(task.id);
+    this.#assertCommitmentActive(this.#taskRow(task.id));
     if (
       attemptsCount >= budget.maxTotalAttempts ||
       codeAttemptsCount >= budget.maxCodeProducingAttempts ||
@@ -7449,6 +8204,7 @@ export class RuntimeStore {
         Number(freshTask.contractVersion) !== Number(active.contractVersion)
       )
         throw new Error("Task changed before fresh local repair allocation.");
+      this.#assertCommitmentActive(freshTask);
 
       this.db
         .prepare(`UPDATE attempts SET state = 'failed', finished_at = ?, worker_terminated = 1,
@@ -7464,12 +8220,17 @@ export class RuntimeStore {
       this.db
         .prepare(`INSERT INTO attempts (
           id, task_id, number, provider, model_id, thinking_level,
+          launch_phase, launch_packet, launch_provider, launch_model_id, launch_thinking_level,
           control_version, contract_version, state, started_at, worker_terminated, cause
-        ) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?, 'starting', ?, 0, 'repair')`)
+        ) VALUES (?, ?, ?, NULL, NULL, NULL, 'reserved', ?, ?, ?, ?, ?, ?, 'starting', ?, 0, 'repair')`)
         .run(
           freshAttemptId,
           task.id,
           nextNumber,
+          repairPrompt,
+          active.provider,
+          active.modelId,
+          active.thinkingLevel,
           active.controlVersion,
           active.contractVersion,
           timestamp,
@@ -8070,10 +8831,12 @@ export class RuntimeStore {
   }
 
   async #startSemanticReview(active, task, candidateSha, evidenceIds) {
+    this.#assertNotShuttingDown();
     const trigger = semanticReviewTrigger(parsed(task.completionContract, {}), {
       goal: task.goal,
     });
     if (!trigger) return false;
+    this.#assertCommitmentActive(this.#taskRow(task.id));
     const budget = normalizeBudget(task.budget);
     const reviewerCount = Number(this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE task_id = ? AND role = 'reviewer'").get(task.id)?.count ?? 0);
     if (reviewerCount >= budget.maxReviewerAttempts) return false;
@@ -8103,6 +8866,7 @@ export class RuntimeStore {
           current.controlVersion !== active.controlVersion || current.contractVersion !== active.contractVersion ||
           current.finalRevision !== candidateSha)
         throw new Error("Semantic review became stale before allocation.");
+      this.#assertCommitmentActive(current);
       const currentReviewerCount = Number(this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE task_id = ? AND role = 'reviewer'").get(task.id)?.count ?? 0);
       if (currentReviewerCount >= budget.maxReviewerAttempts)
         throw new Error("Task semantic reviewer budget exhausted.");
@@ -8110,8 +8874,10 @@ export class RuntimeStore {
         .run(timestamp, implementationResult, candidateSha, `Deterministic gates passed; semantic review required (${trigger}).`, active.attemptId, task.id, active.controlVersion, active.contractVersion);
       if (executorAttemptUpdate.changes !== 1)
         throw new Error("Executor Attempt CAS failed when allocating semantic reviewer.");
-      this.db.prepare("INSERT INTO attempts (id, task_id, number, role, review_worktree, review_worktree_root, control_version, contract_version, state, started_at, worker_terminated, cause) VALUES (?, ?, ?, 'reviewer', ?, ?, ?, ?, 'starting', ?, 0, 'review')")
-        .run(reviewerAttemptId, task.id, number, reviewWorktree, reviewWorktreeRoot, active.controlVersion, active.contractVersion, timestamp);
+      this.db.prepare("INSERT INTO attempts (id, task_id, number, role, review_worktree, review_worktree_root, provider, model_id, thinking_level, launch_phase, launch_packet, launch_provider, launch_model_id, launch_thinking_level, control_version, contract_version, state, started_at, worker_terminated, cause) VALUES (?, ?, ?, 'reviewer', ?, ?, NULL, NULL, NULL, 'reserved', ?, ?, ?, ?, ?, ?, 'starting', ?, 0, 'review')")
+        .run(reviewerAttemptId, task.id, number, reviewWorktree, reviewWorktreeRoot,
+          context, active.provider, active.modelId, active.thinkingLevel,
+          active.controlVersion, active.contractVersion, timestamp);
       this.db.prepare("INSERT INTO attempt_runs (attempt_id, sequence, kind, control_version, contract_version, prompt_digest, state, evidence_refs, started_at) VALUES (?, 1, 'review', ?, ?, ?, 'pending', ?, ?)")
         .run(reviewerAttemptId, active.controlVersion, active.contractVersion, promptDigest(context), JSON.stringify(evidenceIds), timestamp);
       const taskUpdate = this.db.prepare("UPDATE tasks SET latest_attempt_id = ?, state = 'running', updated_at = ? WHERE id = ? AND latest_attempt_id = ? AND state = 'running' AND control_version = ? AND contract_version = ?")
@@ -8176,7 +8942,9 @@ export class RuntimeStore {
   }
 
   async #startFreshReviewRepair(active, task, receipt, candidateSha, evidenceIds) {
+    this.#assertNotShuttingDown();
     const budget = normalizeBudget(task.budget);
+    this.#assertCommitmentActive(this.#taskRow(task.id));
     this.#assertFreshAttemptBudget(task.id, { provider: active.provider, id: active.modelId }, active.thinkingLevel);
     const number = this.#getTaskAttemptsCount(task.id) + 1;
     const prompt = buildRepairPrompt({
@@ -8198,8 +8966,9 @@ export class RuntimeStore {
       const current = this.#taskRow(task.id);
       if (!current || current.latestAttemptId !== active.attemptId || current.state !== "running" || current.controlVersion !== active.controlVersion || current.contractVersion !== active.contractVersion || current.finalRevision !== candidateSha)
         throw new Error("Semantic repair became stale before allocation.");
+      this.#assertCommitmentActive(current);
       this.db.prepare("UPDATE attempts SET state = 'failed', finished_at = ?, worker_terminated = 1, terminal_detail = ?, final_branch_head = ? WHERE id = ? AND state = 'running' AND role = 'reviewer'").run(timestamp, "Semantic review requested a fresh repair Attempt.", candidateSha, active.attemptId);
-      this.db.prepare("INSERT INTO attempts (id, task_id, number, role, control_version, contract_version, state, started_at, worker_terminated, cause) VALUES (?, ?, ?, 'executor', ?, ?, 'starting', ?, 0, 'repair')").run(repairAttemptId, task.id, number, active.controlVersion, active.contractVersion, timestamp);
+      this.db.prepare("INSERT INTO attempts (id, task_id, number, role, provider, model_id, thinking_level, launch_phase, launch_packet, launch_provider, launch_model_id, launch_thinking_level, control_version, contract_version, state, started_at, worker_terminated, cause) VALUES (?, ?, ?, 'executor', NULL, NULL, NULL, 'reserved', ?, ?, ?, ?, ?, ?, 'starting', ?, 0, 'repair')").run(repairAttemptId, task.id, number, prompt, active.provider, active.modelId, active.thinkingLevel, active.controlVersion, active.contractVersion, timestamp);
       this.db.prepare("INSERT INTO attempt_runs (attempt_id, sequence, kind, control_version, contract_version, prompt_digest, state, evidence_refs, started_at) VALUES (?, 1, 'local_repair', ?, ?, ?, 'pending', ?, ?)").run(repairAttemptId, active.controlVersion, active.contractVersion, promptDigest(prompt), JSON.stringify(evidenceIds), timestamp);
       const updated = this.db.prepare("UPDATE tasks SET latest_attempt_id = ?, state = 'running', updated_at = ? WHERE id = ? AND latest_attempt_id = ? AND state = 'running' AND control_version = ? AND contract_version = ?").run(repairAttemptId, timestamp, task.id, active.attemptId, active.controlVersion, active.contractVersion);
       if (updated.changes !== 1) throw new Error("Task fence rejected semantic repair allocation.");
@@ -9202,6 +9971,10 @@ export class RuntimeStore {
 
   /** Request one explicitly supervised continuation in the current Attempt. */
   async continueAttempt(options = {}) {
+    return this.#trackRuntimeOperation(() => this.#continueAttempt(options));
+  }
+
+  async #continueAttempt(options = {}) {
     const id = options.id ?? options.taskId;
     if (typeof id !== "string" || !id.trim())
       throw new Error("Continuation requires a Task id.");
@@ -9212,6 +9985,7 @@ export class RuntimeStore {
     if (!active || active.taskId !== id.trim())
       throw new Error("Fresh Executor Attempt is not eligible for a continuation prompt.");
     this.open();
+    this.#assertNotShuttingDown();
     const prompt = options.prompt ?? options.message;
     const { task, nextSequence } = this.#assertContinuationSafe(active, {
       ...options,
@@ -9228,6 +10002,7 @@ export class RuntimeStore {
           prompt,
         });
       this.#currentWorkerIsSafe(active, this.getTask(active.taskId));
+      this.#assertNotShuttingDown();
     } catch (error) {
       this.#abortContinuationRun(active, error.message);
       throw error;
@@ -9517,20 +10292,29 @@ export class RuntimeStore {
     });
   }
 
-  markBlocked(taskId, attemptId, detail) {
+  markBlocked(taskId, attemptId, detail, { retainPending = false } = {}) {
     const timestamp = now();
     this.db.exec("BEGIN");
     try {
       this.db
         .prepare(
-          "UPDATE attempts SET state = 'orphaned', finished_at = ?, terminal_detail = ?, worker_terminated = 0 WHERE id = ? AND state IN ('starting', 'running', 'parked_wait', 'failed', 'stopped', 'interrupted')",
+          `UPDATE attempts SET state = 'orphaned', finished_at = ?, terminal_detail = ?,
+           worker_terminated = CASE WHEN ? = 1 AND worker_terminated = 1 THEN 1 ELSE 0 END
+           WHERE id = ? AND state IN ('starting', 'running', 'parked_wait', 'failed', 'stopped', 'interrupted', 'orphaned'${retainPending ? ", 'superseded'" : ""})`,
         )
-        .run(timestamp, boundedDetail(detail), attemptId);
+        .run(timestamp, boundedDetail(detail), retainPending ? 1 : 0, attemptId);
       this.db
         .prepare(
-          "UPDATE tasks SET state = 'blocked', updated_at = ?, terminal_detail = ?, terminal_reason = ? WHERE id = ? AND state IN ('accepted', 'running', 'waiting', 'failed', 'stopped', 'interrupted')",
+          `UPDATE tasks SET state = 'blocked', ${retainPending ? "" : "pending_attempt = NULL, "}updated_at = ?, terminal_detail = ?, terminal_reason = ?
+           WHERE id = ? AND state IN ('accepted', 'running', 'waiting', 'failed', 'stopped', 'interrupted', 'blocked')`,
         )
         .run(timestamp, boundedDetail(detail), boundedDetail(detail), taskId);
+      if (!retainPending) {
+        // A task may already have been blocked by startup reconciliation. Clear
+        // any pending replacement marker in that case as well, so a later boot
+        // cannot mistake a failed control mutation for a launchable Attempt.
+        this.db.prepare("UPDATE tasks SET pending_attempt = NULL WHERE id = ?").run(taskId);
+      }
       this.db
         .prepare(`UPDATE attempt_runs SET state = 'ambiguous', settled_outcome = COALESCE(settled_outcome, ?),
           settled_at = COALESCE(settled_at, ?) WHERE attempt_id = ? AND state IN ('pending', 'accepted')`)
@@ -9552,7 +10336,11 @@ export class RuntimeStore {
       this.active = null;
   }
 
-  async correctTask({
+  async correctTask(options) {
+    return this.#withControlMutation(() => this.#correctTask(options));
+  }
+
+  async #correctTask({
     id,
     taskId,
     objective,
@@ -9567,6 +10355,7 @@ export class RuntimeStore {
     const targetId = String(id ?? taskId ?? "").trim();
     if (!targetId) throw new Error("Task correction requires a Task id.");
     this.open();
+    this.#assertNotShuttingDown();
     const task = this.getTask(targetId);
     if (!task) throw new Error(`Task ${targetId} was not found.`);
     if (!["accepted", "running", "waiting"].includes(task.state))
@@ -9616,6 +10405,21 @@ export class RuntimeStore {
       priorState: "corrected",
       priorDetail: "The prior control version was superseded by an explicit correction.",
     });
+    const pendingAttempt = this.#pendingAttemptRecord({
+      operation: "correction",
+      attemptId: newAttemptId,
+      priorAttemptId: oldAttempt?.id ?? null,
+      number: nextNumber,
+      cause: "initial",
+      priorState: "corrected",
+      priorDetail: "The prior control version was superseded by an explicit correction.",
+      packet,
+      provider: selectedModel.provider,
+      modelId: selectedModel.id,
+      thinkingLevel: selectedThinkingLevel,
+      controlVersion: nextControlVersion,
+      contractVersion: nextContractVersion,
+    });
 
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -9627,7 +10431,7 @@ export class RuntimeStore {
       this.#assertCommitmentActive(current);
       const taskUpdate = this.db
         .prepare(`UPDATE tasks SET goal = ?, completion_contract = ?, control_version = ?,
-          contract_version = ?, state = 'accepted', latest_attempt_id = ?, final_result = NULL,
+          contract_version = ?, state = 'accepted', latest_attempt_id = ?, pending_attempt = ?, final_result = NULL,
           terminal_detail = NULL, final_branch_head = NULL, final_revision = NULL,
           completion_evidence_ref = NULL, terminal_reason = NULL, updated_at = ?
           WHERE id = ? AND state IN ('accepted', 'running', 'waiting')
@@ -9637,7 +10441,8 @@ export class RuntimeStore {
           serialized(nextContract, { objective: cleanObjective }),
           nextControlVersion,
           nextContractVersion,
-          newAttemptId,
+          oldAttempt?.id ?? null,
+          pendingAttempt.encoded,
           timestamp,
           targetId,
           oldControlVersion,
@@ -9674,17 +10479,6 @@ export class RuntimeStore {
           WHERE task_id = ? AND control_version = ? AND contract_version = ? AND state = 'prepared'`)
         .run("Prepared remote publication was superseded by a Task correction.", timestamp,
           targetId, oldControlVersion, oldContractVersion);
-      this.db
-        .prepare(`INSERT INTO attempts (
-          id, task_id, number, provider, model_id, thinking_level, control_version, contract_version,
-          state, started_at, worker_terminated, cause
-        ) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?, 'starting', ?, 0, 'initial')`)
-        .run(newAttemptId, targetId, nextNumber, nextControlVersion, nextContractVersion, timestamp);
-      this.db
-        .prepare(`INSERT INTO attempt_runs (
-          attempt_id, sequence, kind, control_version, contract_version, prompt_digest, state, evidence_refs, started_at
-        ) VALUES (?, 1, 'initial', ?, ?, ?, 'pending', '[]', ?)`)
-        .run(newAttemptId, nextControlVersion, nextContractVersion, promptDigest(packet), timestamp);
       this.db.exec("COMMIT");
     } catch (error) {
       try { this.db.exec("ROLLBACK"); } catch {}
@@ -9695,50 +10489,97 @@ export class RuntimeStore {
       active.stopRequested = true;
       this.#clearAttemptWatchdog(active);
     }
-    const gateStopped = active ? this.#cancelLocalGate(active) : true;
-    const workerStopped = !oldAttempt || (oldAttempt.state === "parked_wait" && oldAttempt.workerTerminated)
-      ? true
-      : await this.terminateOwnedWorker(oldAttempt);
+    let gateStopped = true;
+    let workerStopped = true;
+    try {
+      gateStopped = active
+        ? this.#cancelLocalGate(active)
+        : !oldAttempt || this.#reconcileGate(oldAttempt) !== "ambiguous";
+      if (gateStopped && oldAttempt) {
+        const currentAttempt = this.db
+          .prepare(`${ATTEMPT_SELECT} WHERE id = ? AND task_id = ?`)
+          .get(oldAttempt.id, targetId);
+        if (this.#gateUnresolved(currentAttempt))
+          gateStopped = this.#reconcileGate(currentAttempt) !== "ambiguous";
+      }
+      workerStopped = !oldAttempt || (oldAttempt.state === "parked_wait" && oldAttempt.workerTerminated)
+        ? true
+        : await this.terminateOwnedWorker(oldAttempt);
+    } catch (error) {
+      this.markBlocked(targetId, oldAttempt?.id, error.message, { retainPending: true });
+      throw error;
+    }
     if (!gateStopped || !workerStopped) {
       const detail = !gateStopped
         ? "Task correction could not safely terminate the prior local gate."
         : "Task correction could not safely terminate the prior worker.";
-      this.markBlocked(targetId, oldAttempt?.id, detail);
+      this.markBlocked(targetId, oldAttempt?.id, detail, { retainPending: true });
       throw new Error(`${detail} The correction fence was committed and no stale work may continue.`);
     }
     if (active) {
       this.#clearAttemptWatchdog(active);
       this.active = null;
     }
+    if (oldAttempt) {
+      try {
+        this.#finalizePendingRetirement(
+          oldAttempt,
+          pendingAttempt.pending,
+          "The prior Attempt was safely retired for the explicit Task correction.",
+        );
+      } catch (error) {
+        this.markBlocked(targetId, oldAttempt.id, error.message, { retainPending: true });
+        throw error;
+      }
+    }
+    await this.#waitForRemotePublications(targetId);
     try {
+      this.#assertCommitmentActive(this.getTask(targetId));
       if (this.#hasUnknownRemoteEffects(targetId))
         await this.#reconcileUnknownRemoteEffects(targetId);
+      this.#assertCommitmentActive(this.getTask(targetId));
     } catch (error) {
-      this.markBlocked(targetId, newAttemptId, error.message);
+      this.markBlocked(targetId, oldAttempt?.id, error.message);
+      throw error;
+    }
+
+    let allocation;
+    try {
+      allocation = this.#allocatePendingAttempt(targetId, pendingAttempt.encoded);
+    } catch (error) {
+      if (error.code === "commitment_expired")
+        this.markBlocked(targetId, oldAttempt?.id, error.message);
       throw error;
     }
     return this.launchAttempt({
-      task: {
-        id: targetId,
-        sourceRepoRoot: task.sourceRepoRoot,
-        baseCommit: task.baseCommit,
-        taskBranch: task.taskBranch,
-        taskWorktree: task.taskWorktree,
-        goal: cleanObjective,
-        contractVersion: nextContractVersion,
-        controlVersion: nextControlVersion,
-      },
-      attemptId: newAttemptId,
-      number: nextNumber,
-      model: selectedModel,
-      thinkingLevel: selectedThinkingLevel,
-      packet,
-      priorState: "corrected",
-      priorDetail: "The prior control version was superseded by an explicit correction.",
+      task: allocation.task,
+      attemptId: allocation.pending.attemptId,
+      number: allocation.pending.number,
+      model: { provider: allocation.pending.provider, id: allocation.pending.modelId },
+      thinkingLevel: allocation.pending.thinkingLevel,
+      packet: allocation.pending.packet,
+      priorState: allocation.pending.priorState,
+      priorDetail: allocation.pending.priorDetail,
     });
   }
 
   async stopTask(id) {
+    this.ensureSupported();
+    const taskId = typeof id === "string" ? id.trim() : "";
+    if (!taskId) throw new Error("/task-stop requires a Task id");
+    this.open();
+    this.#assertNotShuttingDown();
+    const current = this.getTask(taskId);
+    // Once the first stop has committed its fence, duplicate requests are
+    // cleanup-only idempotent operations. Let them prove worker retirement in
+    // parallel with the original request instead of queueing behind a caller
+    // that may be waiting on that same retirement proof.
+    if (current?.state === "stopped" && current.terminalReason === "user_stopped")
+      return this.#stopTask(taskId);
+    return this.#withControlMutation(() => this.#stopTask(taskId));
+  }
+
+  async #stopTask(id) {
     this.ensureSupported();
     if (typeof id !== "string" || !id.trim())
       throw new Error("/task-stop requires a Task id");
@@ -9747,8 +10588,23 @@ export class RuntimeStore {
     if (!task) throw new Error(`Task ${id} was not found.`);
     if (task.state === "stopped" && task.terminalReason === "user_stopped") {
       const stoppedAttempt = task.attempts.find(({ id: attemptId }) => attemptId === task.latestAttemptId);
-      if (stoppedAttempt && stoppedAttempt.workerTerminated !== true)
-        await this.terminateOwnedWorker(stoppedAttempt);
+      if (stoppedAttempt && stoppedAttempt.workerTerminated !== true) {
+        let retired = false;
+        try {
+          retired = await this.terminateOwnedWorker(stoppedAttempt);
+        } catch (error) {
+          this.markBlocked(task.id, stoppedAttempt.id, error.message);
+          throw error;
+        }
+        if (!retired) {
+          const detail = `Task ${id} worker could not be safely terminated; ownership or group liveness was not proven.`;
+          this.markBlocked(task.id, stoppedAttempt.id, detail);
+          throw new Error(`${detail} The cancellation fence was committed; no stale work may continue.`);
+        }
+        this.db
+          .prepare("UPDATE attempts SET worker_terminated = 1 WHERE id = ? AND task_id = ? AND state = 'stopped'")
+          .run(stoppedAttempt.id, task.id);
+      }
       return this.getTask(task.id);
     }
     if (!["accepted", "running", "waiting"].includes(task.state))
@@ -9851,7 +10707,11 @@ export class RuntimeStore {
     return this.getTask(task.id);
   }
 
-  async retryTask({ id, trusted, model, thinkingLevel }) {
+  async retryTask(options) {
+    return this.#withControlMutation(() => this.#retryTask(options));
+  }
+
+  async #retryTask({ id, trusted, model, thinkingLevel }) {
     this.ensureSupported();
     if (typeof id !== "string" || !id.trim())
       throw new Error("/task-retry requires a Task id");
@@ -9862,6 +10722,7 @@ export class RuntimeStore {
     if (!thinkingLevel)
       throw new Error("/task-retry requires a selected thinking level.");
     this.open();
+    this.#assertNotShuttingDown();
     const task = this.getTask(id.trim());
     if (!task) throw new Error(`Task ${id} was not found.`);
     if (!RETRYABLE_TASK_STATES.has(task.state))
@@ -9886,24 +10747,10 @@ export class RuntimeStore {
     );
     if (!prior || !RETRYABLE_TASK_STATES.has(prior.state))
       throw new Error(`Task ${id} previous Attempt is not terminal.`);
-    if (
-      prior.workerTerminated !== true &&
-      !(
-        (prior.workerPid == null && prior.workerPgid == null) ||
-        recordedWorkerIsGone(prior)
-      )
-    ) {
-      if (!(await this.terminateOwnedWorker(prior))) {
-        this.markBlocked(
-          task.id,
-          prior.id,
-          `Task ${id} previous worker is not safely gone; retry was not started.`,
-        );
-        throw new Error(
-          `Task ${id} previous worker is not safely gone; retry was not started.`,
-        );
-      }
-    }
+    // Persist retry intent before any worker or gate retirement. A daemon
+    // crash during the asynchronous retirement proof must leave a durable
+    // pending mutation for startup recovery, never a terminal Attempt whose
+    // live worker is no longer represented by the Task state.
     this.#assertFreshAttemptBudget(task.id, model, thinkingLevel);
     const compatibility = checkFreshExecutorCompatibility({
       command: this.piCommand,
@@ -9918,6 +10765,7 @@ export class RuntimeStore {
     let number;
     let retryTask;
     let retryPacket;
+    let pendingAttempt;
     let nextControlVersion;
     const timestamp = now();
     try {
@@ -9964,14 +10812,28 @@ export class RuntimeStore {
         priorState: currentPrior.state,
         priorDetail: currentPrior.terminalDetail,
       });
+      pendingAttempt = this.#pendingAttemptRecord({
+        operation: "retry",
+        attemptId,
+        priorAttemptId: prior.id,
+        number,
+        cause: "retry",
+        priorState: currentPrior.state,
+        priorDetail: currentPrior.terminalDetail,
+        packet: retryPacket,
+        provider: model.provider,
+        modelId: model.id,
+        thinkingLevel,
+        controlVersion: nextControlVersion,
+        contractVersion: Number(current.contractVersion),
+      });
 
       // Retry is an explicit control mutation, not a replay of the prior
-      // authority. Advance the Task fence in the same transaction as the new
-      // Attempt allocation, and retire any old rights without rewriting
-      // terminal Attempt history.
+      // authority. Advance the Task fence first and retire any old rights
+      // without allocating a new Attempt until remote ambiguity is settled.
       const taskUpdate = this.db
         .prepare(
-          `UPDATE tasks SET state = 'accepted', control_version = ?, latest_attempt_id = ?,
+          `UPDATE tasks SET state = 'accepted', control_version = ?, latest_attempt_id = ?, pending_attempt = ?,
           terminal_detail = NULL, final_result = NULL, final_branch_head = NULL,
           final_revision = NULL, completion_evidence_ref = NULL, terminal_reason = NULL,
           updated_at = ?
@@ -9980,7 +10842,8 @@ export class RuntimeStore {
         )
         .run(
           nextControlVersion,
-          attemptId,
+          prior.id,
+          pendingAttempt.encoded,
           timestamp,
           task.id,
           prior.id,
@@ -10026,31 +10889,6 @@ export class RuntimeStore {
           task.controlVersion,
           task.contractVersion,
         );
-      this.db
-        .prepare(
-          "INSERT INTO attempts (id, task_id, number, provider, model_id, thinking_level, control_version, contract_version, state, started_at, worker_terminated, cause) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?, 'starting', ?, 0, 'retry')",
-        )
-        .run(
-          attemptId,
-          task.id,
-          number,
-          nextControlVersion,
-          retryTask.contractVersion,
-          timestamp,
-        );
-      this.db
-        .prepare(`INSERT INTO attempt_runs (
-          attempt_id, sequence, kind, control_version, contract_version,
-          prompt_digest, state, evidence_refs, started_at
-        ) VALUES (?, ?, 'initial', ?, ?, ?, 'pending', '[]', ?)`)
-        .run(
-          attemptId,
-          INITIAL_ATTEMPT_RUN_SEQUENCE,
-          nextControlVersion,
-          retryTask.contractVersion,
-          promptDigest(retryPacket),
-          timestamp,
-        );
       this.db.exec("COMMIT");
     } catch (error) {
       try {
@@ -10058,58 +10896,129 @@ export class RuntimeStore {
       } catch {}
       throw error;
     }
+
+    let gateStopped = true;
+    let workerStopped = true;
     try {
+      gateStopped = !this.#gateUnresolved(prior) || this.#reconcileGate(prior) !== "ambiguous";
+      workerStopped = prior.workerTerminated === true
+        ? true
+        : await this.terminateOwnedWorker(prior);
+    } catch (error) {
+      this.markBlocked(task.id, prior.id, error.message, { retainPending: true });
+      throw error;
+    }
+    if (!gateStopped || !workerStopped) {
+      const detail = !gateStopped
+        ? `Task ${id} previous local gate is not safely gone; retry was not started.`
+        : `Task ${id} previous worker is not safely gone; retry was not started.`;
+      this.markBlocked(task.id, prior.id, detail, { retainPending: true });
+      throw new Error(`${detail} The retry fence was committed and no stale work may continue.`);
+    }
+    try {
+      this.#finalizePendingRetirement(
+        prior,
+        pendingAttempt.pending,
+        "The prior Attempt was safely retired for the explicit Task retry.",
+      );
+    } catch (error) {
+      this.markBlocked(task.id, prior.id, error.message, { retainPending: true });
+      throw error;
+    }
+    await this.#waitForRemotePublications(task.id);
+    try {
+      this.#assertCommitmentActive(this.getTask(task.id));
       if (this.#hasUnknownRemoteEffects(task.id))
         await this.#reconcileUnknownRemoteEffects(task.id);
+      this.#assertCommitmentActive(this.getTask(task.id));
     } catch (error) {
-      this.markBlocked(task.id, attemptId, error.message);
+      this.markBlocked(task.id, prior.id, error.message);
+      throw error;
+    }
+
+    let allocation;
+    try {
+      allocation = this.#allocatePendingAttempt(task.id, pendingAttempt.encoded);
+    } catch (error) {
+      if (error.code === "commitment_expired")
+        this.markBlocked(task.id, prior.id, error.message);
       throw error;
     }
     return this.launchAttempt({
-      task: retryTask,
-      attemptId,
-      number,
-      model,
-      thinkingLevel,
-      packet: retryPacket,
-      priorState: prior.state,
-      priorDetail: prior.terminalDetail,
+      task: allocation.task,
+      attemptId: allocation.pending.attemptId,
+      number: allocation.pending.number,
+      model: { provider: allocation.pending.provider, id: allocation.pending.modelId },
+      thinkingLevel: allocation.pending.thinkingLevel,
+      packet: allocation.pending.packet,
+      priorState: allocation.pending.priorState,
+      priorDetail: allocation.pending.priorDetail,
     });
   }
 
   /** Stop the active daemon-owned worker before releasing DB/socket ownership. */
   async shutdown(reason = DAEMON_SHUTDOWN_REASON) {
+    if (this.shutdownPromise) return this.shutdownPromise;
     this.open();
     if (this.shuttingDown) return;
     this.shuttingDown = true;
-    const active = this.active;
-    if (active) {
-      active.stopRequested = true;
-      this.#clearAttemptWatchdog(active);
-      let gateStopped = this.#cancelLocalGate(active);
-      const attempt = this.db
-        .prepare(`${ATTEMPT_SELECT} WHERE id = ?`)
-        .get(active.attemptId);
-      if (attempt && !gateStopped)
-        gateStopped = this.#reconcileGate(attempt) !== "ambiguous";
-      let outcome =
-        attempt && ["starting", "running"].includes(attempt.state)
-          ? this.reconcileAttempt(attempt, { reason })
-          : "orphaned";
-      if (attempt && !gateStopped) {
-        this.#markGateBlocked(attempt, { reason });
-        outcome = "orphaned";
+    this.shutdownPromise = (async () => {
+      // Stop admission first, then let already-started lifecycle operations
+      // finish against the still-open database. In particular, a publication
+      // or recovery pass must not be using SQLite after release() closes it.
+      this.stopWaitReactor();
+      const reactor = this.waitReactorPromise;
+      if (reactor) await reactor.catch(() => {});
+      const recovery = this.recoveryPromise;
+      if (recovery) await recovery.catch(() => {});
+      const controlMutation = this.controlMutationTail;
+      if (controlMutation) await controlMutation.catch(() => {});
+      await this.#waitForRuntimeOperations();
+      await this.#waitForRemotePublications();
+
+      const active = this.active;
+      let outcome;
+      if (active) {
+        active.stopRequested = true;
+        this.#clearAttemptWatchdog(active);
+        let gateStopped = this.#cancelLocalGate(active);
+        const attempt = this.db
+          .prepare(`${ATTEMPT_SELECT} WHERE id = ?`)
+          .get(active.attemptId);
+        if (attempt && gateStopped && this.#gateUnresolved(attempt))
+          gateStopped = this.#reconcileGate(attempt) !== "ambiguous";
+        else if (attempt && !gateStopped)
+          gateStopped = this.#reconcileGate(attempt) !== "ambiguous";
+        const taskRow = attempt ? this.#taskRow(active.taskId) : null;
+        const pending = this.#pendingAttemptValue(taskRow);
+        if (
+          attempt &&
+          pending &&
+          taskRow.latestAttemptId === attempt.id &&
+          pending.priorAttemptId === attempt.id
+        ) {
+          outcome = this.#reconcilePendingRetirement(attempt, pending, { reason });
+        } else {
+          outcome = attempt && ["starting", "running"].includes(attempt.state)
+            ? this.reconcileAttempt(attempt, { reason })
+            : "orphaned";
+        }
+        if (attempt && !gateStopped) {
+          this.#markGateBlocked(attempt, { reason });
+          outcome = "orphaned";
+        }
+        // FreshExecutor.close() is itself a signal operation. Never invoke it
+        // after an uncertain ownership result; the orphan path leaves durable
+        // metadata and any surviving worker untouched for next startup.
+        this.active = null;
       }
-      // FreshExecutor.close() is itself a signal operation. Never invoke it
-      // after an uncertain ownership result; the orphan path leaves durable
-      // metadata and any surviving worker untouched for next startup.
-      this.active = null;
+      // This also handles a graceful boundary after the in-memory handle was
+      // lost: reconcile durable metadata rather than declaring capacity free.
+      this.reconcilePriorGates({ reason });
+      this.reconcilePriorAttempts({ reason });
       return outcome;
-    }
-    // This also handles a graceful boundary after the in-memory handle was
-    // lost: reconcile durable metadata rather than declaring capacity free.
-    this.reconcilePriorGates({ reason });
-    this.reconcilePriorAttempts({ reason });
+    })();
+    return this.shutdownPromise;
   }
 
   release() {

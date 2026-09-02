@@ -185,6 +185,268 @@ test("expired total commitment fences explicit correction and retry without allo
   }
 });
 
+test("correction rechecks the total commitment deadline after retiring the prior Attempt", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-commitment-race-"));
+  const source = await repository(parent);
+  const piCommand = await versionCommand(parent);
+  let clock = Date.now();
+  const runtime = new RuntimeStore({
+    dbPath: join(parent, "runtime.sqlite"),
+    piCommand,
+    worktreeRoot: join(parent, "worktrees"),
+    attemptClock: () => clock,
+    workerFactory: async () => ({ callbacksAttached: true, close() {} }),
+  });
+  try {
+    const started = await runtime.createTask({
+      ...taskOptions(source),
+      budget: { totalCommitmentWallClockDeadlineMs: 1 },
+    });
+    const accepted = runtime.getTask(started.id);
+    runtime.terminateOwnedWorker = async () => {
+      clock = Date.parse(accepted.acceptedAt) + 2;
+      return true;
+    };
+
+    await assert.rejects(
+      () => runtime.correctTask({ id: started.id, objective: "late after retirement", model, thinkingLevel: "high" }),
+      (error) => error.code === "commitment_expired",
+    );
+    const after = runtime.getTask(started.id);
+    assert.equal(after.state, "blocked");
+    assert.equal(after.attempts.length, 1);
+    assert.equal(after.latestAttemptId, after.attempts[0].id);
+  } finally {
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("a crash after correction fencing resumes the durable replacement Attempt", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-commitment-recovery-"));
+  const source = await repository(parent);
+  const dbPath = join(parent, "runtime.sqlite");
+  const piCommand = await versionCommand(parent);
+  let releaseTermination;
+  const terminationGate = new Promise((resolve) => {
+    releaseTermination = resolve;
+  });
+  let terminationStarted;
+  const terminationStartedPromise = new Promise((resolve) => {
+    terminationStarted = resolve;
+  });
+  const runtime = new RuntimeStore({
+    dbPath,
+    piCommand,
+    worktreeRoot: join(parent, "worktrees"),
+    workerFactory: async () => ({ callbacksAttached: true, close() {} }),
+  });
+  let restarted;
+  let correction;
+  try {
+    const started = await runtime.createTask({ ...taskOptions(source) });
+    runtime.terminateOwnedWorker = async () => {
+      terminationStarted();
+      await terminationGate;
+      return true;
+    };
+    correction = runtime.correctTask({
+      id: started.id,
+      objective: "resume the corrected commitment",
+      model,
+      thinkingLevel: "high",
+    });
+    await terminationStartedPromise;
+    const pending = runtime.db
+      .prepare("SELECT pending_attempt AS pendingAttempt FROM tasks WHERE id = ?")
+      .get(started.id);
+    assert.ok(pending.pendingAttempt);
+    const priorAttempt = runtime.getTask(started.id).attempts[0];
+    assert.equal(runtime.getTask(started.id).attempts.length, 1);
+
+    // Model the recorded prior worker belonging to the crashed boot. The
+    // pending control marker is the only durable replacement intent; no
+    // replacement Attempt has been inserted yet.
+    runtime.db
+      .prepare("UPDATE attempts SET worker_pid = 999999, worker_pgid = 999999, worker_boot_id = 'prior-boot', worker_terminated = 0 WHERE id = ?")
+      .run(priorAttempt.id);
+    runtime.release();
+
+    restarted = new RuntimeStore({
+      dbPath,
+      piCommand,
+      worktreeRoot: join(parent, "worktrees"),
+      workerFactory: async () => ({ callbacksAttached: true, close() {} }),
+    });
+    restarted.open();
+    const recovered = await restarted.recoverPersistedAttempts();
+    assert.equal(recovered.length, 1);
+    const task = restarted.getTask(started.id);
+    assert.equal(task.state, "running");
+    assert.equal(task.attempts.length, 2);
+    assert.equal(task.latestAttemptId, task.attempts[1].id);
+    assert.equal(task.attempts[0].state, "superseded");
+    assert.equal(task.attempts[0].workerTerminated, true);
+    assert.equal(task.attempts[1].launchPhase, "recorded");
+    assert.equal(
+      restarted.db.prepare("SELECT pending_attempt FROM tasks WHERE id = ?").get(started.id).pending_attempt,
+      null,
+    );
+  } finally {
+    releaseTermination?.();
+    await correction?.catch(() => {});
+    restarted?.close();
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("a crash after retry fencing resumes the durable replacement Attempt", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-retry-recovery-"));
+  const source = await repository(parent);
+  const dbPath = join(parent, "runtime.sqlite");
+  const piCommand = await versionCommand(parent);
+  let releaseTermination;
+  const terminationGate = new Promise((resolveTermination) => {
+    releaseTermination = resolveTermination;
+  });
+  let terminationStarted;
+  const terminationStartedPromise = new Promise((resolveStarted) => {
+    terminationStarted = resolveStarted;
+  });
+  const runtime = new RuntimeStore({
+    dbPath,
+    piCommand,
+    worktreeRoot: join(parent, "worktrees"),
+    workerFactory: async () => ({ callbacksAttached: true, close() {} }),
+  });
+  let restarted;
+  let retry;
+  try {
+    const started = await runtime.createTask({ ...taskOptions(source) });
+    const stopped = await runtime.stopTask(started.id);
+    const priorId = stopped.attempts[0].id;
+    runtime.db
+      .prepare("UPDATE attempts SET worker_pid = 999999, worker_pgid = 999999, worker_boot_id = 'prior-boot', worker_terminated = 0 WHERE id = ?")
+      .run(priorId);
+    runtime.terminateOwnedWorker = async () => {
+      terminationStarted();
+      await terminationGate;
+      return true;
+    };
+
+    retry = runtime.retryTask({
+      id: started.id,
+      trusted: true,
+      model,
+      thinkingLevel: "high",
+    });
+    await terminationStartedPromise;
+    const pendingTask = runtime.getTask(started.id);
+    assert.equal(pendingTask.state, "accepted");
+    assert.equal(pendingTask.attempts.length, 1);
+    assert.ok(
+      runtime.db.prepare("SELECT pending_attempt FROM tasks WHERE id = ?").get(started.id)
+        .pending_attempt,
+    );
+
+    runtime.release();
+    restarted = new RuntimeStore({
+      dbPath,
+      piCommand,
+      worktreeRoot: join(parent, "worktrees"),
+      workerFactory: async () => ({ callbacksAttached: true, close() {} }),
+    });
+    restarted.open();
+    const recovered = await restarted.recoverPersistedAttempts();
+    assert.equal(recovered.length, 1);
+    const task = restarted.getTask(started.id);
+    assert.equal(task.state, "running");
+    assert.equal(task.attempts.length, 2);
+    assert.equal(task.attempts[0].state, "stopped");
+    assert.equal(task.attempts[0].workerTerminated, true);
+    assert.equal(task.latestAttemptId, task.attempts[1].id);
+    assert.equal(task.attempts[1].launchPhase, "recorded");
+    assert.equal(
+      restarted.db.prepare("SELECT pending_attempt FROM tasks WHERE id = ?").get(started.id)
+        .pending_attempt,
+      null,
+    );
+  } finally {
+    releaseTermination?.();
+    await retry?.catch(() => {});
+    restarted?.close();
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("failed correction retirement retains its recovery marker across restart", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-correction-retirement-"));
+  const source = await repository(parent);
+  const dbPath = join(parent, "runtime.sqlite");
+  const piCommand = await versionCommand(parent);
+  const runtime = new RuntimeStore({
+    dbPath,
+    piCommand,
+    worktreeRoot: join(parent, "worktrees"),
+    workerFactory: async () => ({ callbacksAttached: true, close() {} }),
+  });
+  let restarted;
+  try {
+    const started = await runtime.createTask({ ...taskOptions(source) });
+    const priorId = started.attempts[0].id;
+    runtime.db
+      .prepare("UPDATE attempts SET worker_pid = 999999, worker_pgid = 999999, worker_boot_id = 'prior-boot', worker_terminated = 0 WHERE id = ?")
+      .run(priorId);
+    runtime.terminateOwnedWorker = async () => false;
+
+    await assert.rejects(
+      () => runtime.correctTask({
+        id: started.id,
+        objective: "retain the failed retirement proof",
+        model,
+        thinkingLevel: "high",
+      }),
+      /correction fence was committed/,
+    );
+    const blocked = runtime.getTask(started.id);
+    assert.equal(blocked.state, "blocked");
+    assert.equal(blocked.attempts.length, 1);
+    assert.equal(blocked.attempts[0].state, "orphaned");
+    assert.equal(blocked.attempts[0].workerTerminated, false);
+    assert.ok(
+      runtime.db.prepare("SELECT pending_attempt FROM tasks WHERE id = ?").get(started.id)
+        .pending_attempt,
+    );
+
+    runtime.release();
+    restarted = new RuntimeStore({
+      dbPath,
+      piCommand,
+      worktreeRoot: join(parent, "worktrees"),
+      workerFactory: async () => ({ callbacksAttached: true, close() {} }),
+    });
+    restarted.open();
+    const recovered = await restarted.recoverPersistedAttempts();
+    assert.deepEqual(recovered, []);
+    const after = restarted.getTask(started.id);
+    assert.equal(after.state, "blocked");
+    assert.equal(after.attempts.length, 1);
+    assert.equal(after.attempts[0].state, "superseded");
+    assert.equal(after.attempts[0].workerTerminated, true);
+    assert.equal(
+      restarted.db.prepare("SELECT pending_attempt FROM tasks WHERE id = ?").get(started.id)
+        .pending_attempt,
+      null,
+    );
+  } finally {
+    restarted?.close();
+    runtime.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
 test("healthy initial settlement persists one AttemptRun without completing the Task", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-sand-v04-commitment-"));
   const source = await repository(parent);

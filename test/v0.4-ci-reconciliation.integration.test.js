@@ -82,9 +82,11 @@ function makeTransport(expectedEndpoint) {
       return pushCount;
     },
     readRef: ({ endpoint, ref }) => {
+      assert.equal(endpoint, expectedEndpoint);
       return remoteRef(endpoint, ref);
     },
     push: ({ cwd, endpoint, ref, expectedOldOid, newOid }) => {
+      assert.equal(endpoint, expectedEndpoint);
       pushCount += 1;
       execFileSync(
         "git",
@@ -278,6 +280,96 @@ test("default GitHub adapter follows Link pagination beyond the old page cap", a
     assert.equal(statuses.length, 101);
     assert.equal(statuses.at(-1).id, 2101);
     assert.deepEqual(requestedUrls.map((url) => new URL(url).searchParams.get("page")), ["1", "21"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("default GitHub adapter rejects a pagination link for another repository", async () => {
+  const originalFetch = globalThis.fetch;
+  const revisionSha = "0123456789abcdef0123456789abcdef01234567";
+  const requestedUrls = [];
+  globalThis.fetch = async (url) => {
+    requestedUrls.push(String(url));
+    return {
+      ok: true,
+      headers: {
+        get(name) {
+          return name.toLowerCase() === "link"
+            ? `<https://api.github.com/repos/other/repository/commits/${revisionSha}/status?per_page=100&page=2>; rel="next"`
+            : null;
+        },
+      },
+      async json() {
+        return { statuses: Array.from({ length: 100 }, () => ({ context: "other", state: "success" })) };
+      },
+    };
+  };
+  try {
+    await assert.rejects(
+      () => defaultGitHubAdapter.fetchCommitStatuses({
+        repository: "fixture/repository",
+        sha: revisionSha,
+      }),
+      (error) => error.code === "provider_error" && /exact repository/i.test(error.message),
+    );
+    assert.equal(requestedUrls.length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("default GitHub adapter rejects pagination links that change the SHA, endpoint, or query contract", async () => {
+  const originalFetch = globalThis.fetch;
+  const revisionSha = "0123456789abcdef0123456789abcdef01234567";
+  const links = [
+    `https://api.github.com/repos/fixture/repository/commits/${revisionSha.slice(0, -1)}0/status?per_page=100&page=2`,
+    `https://api.github.com/repos/fixture/repository/commits/${revisionSha}/check-runs?per_page=100&page=2`,
+    `https://api.github.com/repos/fixture/repository/commits/${revisionSha}/status?per_page=100&page=2&evil=1`,
+    `https://api.github.com/repos/fixture/repository/commits/${revisionSha}/status?per_page=100`,
+    `https://api.github.com/repos/fixture/repository/commits/${revisionSha}/status?per_page=100&page=1`,
+  ];
+  try {
+    for (const link of links) {
+      globalThis.fetch = async () => ({
+        ok: true,
+        headers: { get(name) { return name.toLowerCase() === "link" ? `<${link}>; rel="next"` : null; } },
+        async json() { return { statuses: Array.from({ length: 100 }, () => ({ context: "other", state: "success" })) }; },
+      });
+      await assert.rejects(
+        () => defaultGitHubAdapter.fetchCommitStatuses({ repository: "fixture/repository", sha: revisionSha }),
+        (error) => error.code === "provider_error",
+      );
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("default GitHub adapter carries a successful rate-limit reset into provider guidance", async () => {
+  const originalFetch = globalThis.fetch;
+  const reset = Math.floor(Date.now() / 1000) + 30;
+  globalThis.fetch = async () => ({
+    ok: true,
+    headers: {
+      get(name) {
+        const normalized = name.toLowerCase();
+        if (normalized === "x-ratelimit-remaining") return "0";
+        if (normalized === "x-ratelimit-reset") return String(reset);
+        return null;
+      },
+    },
+    async json() {
+      return { statuses: [] };
+    },
+  });
+  try {
+    const statuses = await defaultGitHubAdapter.fetchCommitStatuses({
+      repository: "fixture/repository",
+      sha: "0123456789abcdef0123456789abcdef01234567",
+    });
+    assert.ok(statuses.providerGuidanceMs >= 29_000);
+    assert.ok(statuses.providerGuidanceMs <= 30_000);
   } finally {
     globalThis.fetch = originalFetch;
   }

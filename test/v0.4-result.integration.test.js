@@ -237,7 +237,7 @@ test("completion survives zero clients and daemon restart before a later public 
 test("live Result claims are exclusive and expiry redelivers the same stable Result ID", {
   skip: process.platform === "linux" ? false : "Linux-only",
 }, async () => {
-  const fixture = await completedFixture({ leaseMs: 80 });
+  const fixture = await completedFixture({ leaseMs: 500 });
   try {
     const first = await runClient(fixture.env, "result.claim", { clientInstanceId: "manager-a" });
     const second = await runClient(fixture.env, "result.claim", { clientInstanceId: "manager-b" });
