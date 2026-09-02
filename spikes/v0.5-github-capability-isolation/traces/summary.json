@@ -1,0 +1,80 @@
+{
+  "status": "PASS",
+  "timestamp": "2026-09-02T16:41:43.868Z",
+  "pinnedContract": {
+    "openClawCommit": "ff63da7237e5f99e9fc03a86daf56e3c3e8f5356",
+    "codexCommit": "a0dcfe2ada3f5bbd5059a34c0fc6fac244741a67",
+    "codexPackageVersion": "0.151.0",
+    "codexManagedBinary": "codex-cli 0.151.0",
+    "platform": "linux-x64",
+    "bubblewrapRequired": true
+  },
+  "matrix": {
+    "GH_TOKEN": {
+      "expected": "unavailable",
+      "actual": "unavailable",
+      "status": "PASS",
+      "detail": "NONE"
+    },
+    "GITHUB_TOKEN": {
+      "expected": "unavailable",
+      "actual": "unavailable",
+      "status": "PASS",
+      "detail": "NONE"
+    },
+    "gh authenticated profile": {
+      "expected": "unavailable",
+      "actual": "unauthenticated",
+      "status": "PASS",
+      "detail": "You are not logged into any GitHub hosts. To log in, run: gh auth login"
+    },
+    "HTTPS credential helper": {
+      "expected": "unusable",
+      "actual": "prompt disabled (fill failed)",
+      "status": "PASS",
+      "detail": "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+    },
+    "SSH private key": {
+      "expected": "unavailable",
+      "actual": "permission denied",
+      "status": "PASS",
+      "detail": "Direct SSH to git@github.com denied (publickey)"
+    },
+    "SSH_AUTH_SOCK": {
+      "expected": "unavailable",
+      "actual": "no agent connection",
+      "status": "PASS",
+      "detail": "Could not open a connection to your authentication agent."
+    },
+    "operator HOME credentials": {
+      "expected": "unavailable",
+      "actual": "isolated (home)",
+      "status": "PASS",
+      "detail": "Codex process HOME=/tmp/pi-sand-github-isolation-probe/home"
+    },
+    "GitHub write MCP/App": {
+      "expected": "unavailable",
+      "actual": "tool allowlist rejected",
+      "status": "PASS",
+      "detail": "Closed-world tool allowlist strictly forbids write-capable GitHub tools and MCPs"
+    },
+    "raw authenticated API": {
+      "expected": "unavailable",
+      "actual": "HTTP 401 / unauthenticated",
+      "status": "PASS",
+      "detail": "{\"message\":\"API rate limit exceeded for 35.78.82.147. (But here's the good news: Authenticated requests get a higher rat"
+    },
+    "git push authentication/write": {
+      "expected": "denied",
+      "actual": "prompt disabled (auth failed)",
+      "status": "PASS",
+      "detail": "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+    }
+  },
+  "modelTurn": {
+    "threadId": "01a062ff-16be-7cb2-afab-b4d941b9a4bf",
+    "turnId": "01a062ff-16dc-70e2-972a-cc79ce2698b0",
+    "completed": true,
+    "status": "completed"
+  }
+}

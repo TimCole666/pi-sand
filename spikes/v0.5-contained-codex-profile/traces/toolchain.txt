@@ -1,0 +1,13 @@
+pi-sand base commit: ebe66d58dc7639f7a46e10f36f32e65e4ff53e8a
+OpenClaw commit: ff63da7237e5f99e9fc03a86daf56e3c3e8f5356
+Codex commit: a0dcfe2ada3f5bbd5059a34c0fc6fac244741a67
+codex-cli / package version: @openai/codex@0.151.0-linux-x64 (binary: /home/tiancaijb/tmp/pi-sand-openclaw/node_modules/.pnpm/@openai+codex@0.151.0-linux-x64/node_modules/@openai/codex/vendor/x86_64-unknown-linux-musl/bin/codex)
+Linux distribution: EndeavourOS Linux x86_64
+Linux kernel: 7.1.11-arch1-1 #1 SMP PREEMPT_DYNAMIC Fri, 28 Aug 2026 03:36:07 +0000 x86_64 GNU/Linux
+Container / sandbox runtime: Bubblewrap 0.12.0 (/usr/bin/bwrap) via codex-linux-sandbox
+Node runtime: v26.8.1
+npm version: 12.0.2
+Model provider: codex_local_access (wire_api: responses, model: gpt-5.6-sol)
+Exact containment profile: workspace-write (sandboxPolicy: { type: "workspaceWrite", writableRoots: [workspace], networkAccess: false })
+Uncontained negative control profile: danger-full-access (sandboxPolicy: { type: "dangerFullAccess" })
+Containment mechanism: Linux PID namespace (CLONE_NEWPID) and Mount namespace (CLONE_NEWNS) isolation managed by Bubblewrap and codex-linux-sandbox. All descendant processes remain trapped in the dedicated PID namespace; when the supervisor / PID 1 terminates upon T1 teardown, the Linux kernel unconditionally sends SIGKILL to all processes in the namespace, preventing escaped sessions (setsid), process groups (setpgid), or double-forked daemons from surviving.
